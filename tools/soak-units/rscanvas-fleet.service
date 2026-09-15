@@ -1,0 +1,16 @@
+[Unit]
+Description=RSCanvas soak: mock SNMP fleet (400 devices x 25 interfaces)
+PartOf=rscanvas-demo.target
+Before=rscanvas-app.service
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/lab
+Environment=FLEET_SIZE=400 IFACES_PER=25 BASE_PORT=16100
+ExecStart=/usr/bin/node /home/user/lab/mock-fleet.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=rscanvas-demo.target

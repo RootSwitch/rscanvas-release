@@ -1,0 +1,20 @@
+[Unit]
+Description=RSCanvas soak: syslog volume feeder (100/s)
+PartOf=rscanvas-demo.target
+After=rscanvas-app.service
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/rscanvas
+# DURATION_S is a very long horizon rather than infinity: the generator's own
+# exit is the backstop if this unit is ever forgotten on a machine nobody
+# watches. Restart=always renews it, so the soak does not stop at the horizon.
+Environment=RATE=100 BURST_RATE=100 DURATION_S=2592000
+Environment=TARGET=127.0.0.1 TARGET_PORT=5514 RUN_TAG=soak
+ExecStart=/usr/bin/node tools/udp-load.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=rscanvas-demo.target

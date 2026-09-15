@@ -1,0 +1,25 @@
+-- The sensors slice: one column, and the column is the design.
+--
+-- `extra` is the per-entity POLLING INSTRUCTION, decided once at discovery
+-- and executed verbatim by the poller - the parent's proven shape
+-- (SNMPCanvas entities carry the same thing across its whole vendor zoo).
+-- Discovery is where the judgement lives: which OIDs, what style, what
+-- divisor, which enum values mean ok. The poller re-derives NOTHING, which
+-- is what keeps a vendor quirk a discovery-time fact instead of a poll-time
+-- branch.
+--
+--   interfaces        extra IS NULL - their polling derives from ifIndex
+--                     exactly as before; nothing changes for them.
+--   cpu               { style: 'gauge-avg', oids: [per-core hrProcessorLoad] }
+--   mem, fs           { style: 'hr-storage', allocUnits, usedOid, sizeOid }
+--                     or { style: 'used-free', usedOid, freeOid }
+--   temp, fan, ...    { style: 'div'|'tenthF'|'extend'|'asrock-str',
+--                       valueOid, div }
+--   state             { style: 'state', valueOid, okValues, unknownValues,
+--                       okText, alarmText }
+--
+-- Value semantics per kind are the parent's, recorded in
+-- SLICE-SENSORS-PLAN.md's table: used/total BYTES for mem and fs (pct is
+-- derived at render, never stored), degrees C for temp, 0/1/null for state.
+
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS extra jsonb;

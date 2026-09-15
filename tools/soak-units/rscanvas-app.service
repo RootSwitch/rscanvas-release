@@ -1,0 +1,26 @@
+[Unit]
+Description=RSCanvas soak: the application
+PartOf=rscanvas-demo.target
+After=postgresql.service network-online.target
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/rscanvas
+# These MUST stay identical to tools/demo-lab.sh. They are duplicated here
+# only because a unit cannot source a script; if they ever disagree, the
+# script is authoritative and this file is the bug.
+Environment=DATABASE_URL=postgres://rscanvas:rscanvas@localhost:5432/rscanvas_demo
+Environment=COLLECTOR_ENABLED=1 JOBS_ENABLED=1 SNMP_COMMUNITY=public
+Environment=HTTP_PORT=18080 SYSLOG_PORT=5514 TRAP_PORT=15162
+Environment=ALERT_SCAN_INTERVAL_MS=5000
+Environment=MESSAGE_RETENTION_DAYS=9 RAW_RETENTION_DAYS=8
+Environment=ALERT_SYSLOG_HOST=127.0.0.1 ALERT_SYSLOG_PORT=5514
+Environment=RETENTION_DRY_RUN=0
+ExecStart=/usr/bin/node src/main.ts
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=rscanvas-demo.target

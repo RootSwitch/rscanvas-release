@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# runtime data - databases, feeds, uploaded boards, anything the app writes
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# secrets and local config
+.env
+*.pem
+*.key
+
+# local tooling that should not travel: dev servers, launch configs, scratch
+# files. NOTE: this is exactly how the suite's two hero diagrams ended up
+# existing on one machine only. If something in here turns out to matter,
+# move it out of .claude/ rather than un-ignoring the directory.
+.claude/
+
+# deployment bundles. Build OUTPUT, never input: make-bundle.sh stamps the
+# artifact name from `git status`, so a leftover tarball in the tree made the
+# next bundle call itself "-dirty" and claim it was not reproducible from git.
+# A provenance stamp that cries wolf is worse than none.
+rscanvas-*.tar.gz
+
+# OS noise
+Thumbs.db
+.DS_Store

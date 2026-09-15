@@ -1,0 +1,31 @@
+-- Speed trust: the advertised interface speed is a CLAIM, and traffic can
+-- disprove it.
+--
+-- PORTED FROM SNMPCANVAS (server/db.js entities, server/poller.js
+-- speedTrustAndClamp), rule and margin verbatim, because the parent already
+-- paid for this decision with the "133% utilization at replication time" bug
+-- class and RSCanvas met it on its first real estate: a TrueNAS virtio NIC
+-- advertising ~1.41 Gbps and moving more, which produced a crit utilization
+-- alert of 218% that could never clear.
+--
+-- virtio, netvsc and most paravirtual NICs advertise a number the hypervisor
+-- made up. Utilization computed against it is a percentage of fiction, and a
+-- clamp against it silently discards the FASTEST real samples - the parent's
+-- measured failure was replication traffic vanishing from the graphs.
+--
+--   speed_untrusted     flips true when a measured rate exceeds the claim by
+--                       more than 10% - timing jitter, not fiction. Only a
+--                       64-bit counter may convict (RSCanvas polls ifHC only,
+--                       so this precondition is structural here). Flips back
+--                       when the advertised speed itself changes, because a
+--                       re-negotiated link gets a fresh trial.
+--   speed_override_bps  the operator's honest number. Outranks both the
+--                       advertised speed and the conviction, and is never
+--                       second-guessed by the poller.
+--
+-- Utilization is SUSPENDED for an untrusted speed, not computed against
+-- nothing: the alert says "unrated" and stops, rather than reporting 218%
+-- forever or 0% and lying the other way.
+
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS speed_untrusted boolean NOT NULL DEFAULT false;
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS speed_override_bps bigint;

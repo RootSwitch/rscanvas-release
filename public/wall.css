@@ -1,0 +1,317 @@
+/* The wall's stylesheet. Split out of wall.html 2026-08-31 so the pages can
+   carry a Content-Security-Policy without 'unsafe-inline' (independent review
+   S2) - it was the ONLY inline style in either page, and the client was
+   otherwise already CSP-clean: no inline <script>, no on* handlers, no style=
+   attributes. Kept separate from style.css rather than merged into it because
+   the block opens by saying why: the wall is a different design problem from
+   the app and inherits the palette, not the layout. Every rule below is
+   unchanged by the move. */
+/* The wall is a DIFFERENT DESIGN PROBLEM from the app, and inherits the
+   palette rather than the layout.
+
+   Read from across a room, by nobody: there is no pointer, no scrolling and
+   no one to click a thing that looks wrong. So: no hover states, no controls,
+   large type, and every piece of state carried by something visible from ten
+   feet - fill and a border, not a small coloured dot.
+
+   It also runs for months on a machine nobody logs into, which is why the
+   staleness banner below is not decoration. A wall showing a confident green
+   board from a feed that died on Tuesday is the single worst thing this page
+   could do, and it is the default behaviour of every naive dashboard. */
+html, body { height: 100%; margin: 0; overflow: hidden; }
+#wall {
+    position: relative;
+    width: 100vw; height: 100vh;
+    background: var(--se-panel-2);
+    color: var(--se-txt);
+}
+#wall-head {
+    position: absolute; top: 0; left: 0; right: 0; height: 44px;
+    display: flex; align-items: center; gap: 14px; padding: 0 16px;
+    font-size: 17px; font-weight: 500;
+    border-bottom: 1px solid var(--se-border);
+    background: var(--se-panel);
+}
+#wall-name { flex: 1; }
+/* Slice 26: the counts footer, in the header - "33 up" is half the glance,
+   the half that lets somebody close the tab. */
+#wall-counts { font-size: 14px; font-weight: 500; color: var(--se-txt-dim); white-space: nowrap; }
+#wall-age { font-size: 14px; font-weight: 400; color: var(--se-txt-dim); }
+/* --gw-banner is the height of the outliers bar when the GRID mode shows one,
+   set from JS because the text wraps at narrow widths and a magic constant
+   would overlap the first section header on exactly the screens least able to
+   afford it. 0 when there is no banner, which is the drawn mode's unchanged
+   behaviour - its shapes are fitted inside the canvas and the bar floats over
+   the margin rather than over content. */
+#wall-canvas { position: absolute; top: calc(44px + var(--gw-banner, 0px)); left: 0; right: 0; bottom: 0; }
+
+/* Slice 26: the glance grid. RENDERING, not layout - CSS wrap at the board's
+   declared column count, tiles in label order, no coordinates. Tiles are
+   UNIFORM by construction: the field set is per-board, so every tile carries
+   the same line slots and the same height, and a missing value is a blank
+   slot rather than a collapsed one. */
+/* Slice 31: every dial the control panel turns is a CSS CUSTOM PROPERTY, so
+   changing one costs a style recalculation rather than a re-render - the
+   wall stays smooth while an operator drags a slider in front of a TV. */
+#wall {
+    --gw-gap: 8px;
+    --gw-pad: 6px;
+    --gw-minh: 0px;
+    --gw-scale: 1;
+}
+#wall-canvas.gwall {
+    display: grid; gap: var(--gw-gap); padding: 12px;
+    grid-auto-rows: min-content;
+    overflow-y: auto;
+    align-content: start;
+    /* The gutter is reserved whether or not the scrollbar is present, so a
+       wall that grows past the fold cannot shrink its own width and feed a
+       narrower canvas into the next render's column choice - the oscillation
+       every auto-fitting grid invents for itself eventually. */
+    scrollbar-gutter: stable;
+}
+/* Slice 27: the sectioned grid - a scrolling column of section headers and
+   per-section grids, all sharing ONE column count (per-section counts were
+   CrossCanvas's tower trap). */
+#wall-canvas.gwall-outer { overflow-y: auto; padding: 12px; scrollbar-gutter: stable; }
+/* The dial, not a constant: this hardcoded 8px is why "space between tiles"
+   did nothing on any sectioned board - the flat grid honoured the var and
+   the sectioned one silently kept its own opinion. The height model always
+   assumed the dial applied here; now the stylesheet agrees with it. */
+.gwall-sec { display: grid; gap: var(--gw-gap, 8px); margin-bottom: 14px; }
+.gsection-head {
+    font-size: 14px; font-weight: 700; letter-spacing: .04em;
+    color: var(--se-txt-dim); margin: 2px 2px 6px;
+    border-bottom: 1px solid var(--se-border); padding-bottom: 3px;
+}
+.node.gtile {
+    position: relative;
+    display: flex; flex-direction: column; align-items: stretch;
+    justify-content: flex-start;
+    padding: var(--gw-pad) calc(var(--gw-pad) + 2px);
+    min-height: var(--gw-minh);
+}
+/* Text-first card, chosen on its looks by the person who looks at walls:
+   bold, larger, centered name at the top, fields beneath. */
+.gtile .glabel {
+    display: block; text-align: center; font-weight: 700;
+    font-size: calc(16px * var(--gw-scale));
+    line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* THE READINGS ARE A GRID (slice 33), not a stack of rows, and that one
+   change answers both of the operator's findings:
+   - `--gw-fcols` lays the fields across N columns, so a tile with a dozen
+     fields stops being a tall thin ribbon that dwarfs its icon.
+   - centred mode becomes a pair of auto columns with the ROW ITSELF
+     dissolved (display:contents), so names and values still align in two
+     tidy columns while the block as a whole sits centred. The first attempt
+     centred each row independently, which paired the label to its number
+     and destroyed the alignment down the tile - the odd behaviour reported
+     from a real wall. */
+.gtile .glines {
+    display: grid;
+    grid-template-columns: repeat(var(--gw-fcols, 1), minmax(0, 1fr));
+    column-gap: 16px;
+}
+.gtile .gfield {
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: calc(12.5px * var(--gw-scale)); line-height: 1.35; font-weight: 400;
+    min-width: 0;
+}
+/* Slice 31: the operator's own observation - at wide tiles the label and its
+   number end up at opposite edges and the eye has to travel. Centred pairs
+   them; split stays the default because it aligns numbers into a column,
+   which is what makes a grid scannable. Both are right for different walls. */
+.gwall-center .gtile .glines {
+    grid-template-columns: repeat(var(--gw-fcols, 1), auto auto);
+    justify-content: center; column-gap: 10px;
+}
+.gwall-center .gtile .gfield { display: contents; }
+.gwall-center .gtile .gfname { text-align: right; }
+.gwall-center .gtile .gfval { text-align: left; }
+/* Slice 32: the icon sits BESIDE the readings (the operator's mockup), so the
+   tile keeps one centred title line and gains a column rather than a row. */
+/* Slice 40: the icon centres on the TILE, not on the readings.
+   Reported from a real wall with three screenshots, and the two symptoms
+   looked opposite because they had different causes:
+   - an AP with three readings had its icon LOW, because gbody took only its
+     content height and sat under the title, so the title's height pushed the
+     centre down;
+   - a firewall stretched taller by a busier neighbour had its icon HIGH,
+     because the leftover height all landed below gbody, which never grew.
+   A tile whose content happened to fill it looked correct, which is why this
+   survived slice 32 - it is invisible until the row heights disagree, and
+   slice 37's hide-the-blank-line rule is what MADE them disagree. The
+   operator spotted that connection themselves.
+   gbody now takes the leftover height (flex: 1) and the two children are
+   placed independently: readings stay tucked under the title, the icon
+   centres against the whole body. */
+.gtile .gbody {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 1fr auto;   /* readings take the slack, badge its own height */
+    flex: 1;
+}
+.gtile .glines { grid-column: 2; grid-row: 1; min-width: 0; align-self: start; }
+/* The badge spans BOTH columns, so it stays on the tile's centre line rather
+   than centring inside the text column and drifting right of the icon. */
+.gtile .gbody .count { grid-column: 1 / -1; grid-row: 2; }
+.gtile .gicon {
+    /* Spanning both rows is what makes the centring exact: the icon is
+       centred against the body's whole height, badge included, so an alert
+       tile and a quiet one place their icons identically. The 8px gutter is
+       a margin rather than a grid `gap` because a gap applies between tracks
+       whether or not they hold anything, which would indent tiles that have
+       no icon at all. */
+    grid-column: 1; grid-row: 1 / -1; margin-right: 8px;
+    align-self: center;
+    width: var(--gw-icon, 40px); height: var(--gw-icon, 40px);
+    color: var(--se-txt-dim);
+    display: flex; align-items: center; justify-content: center;
+}
+.gtile .gicon svg { width: 100%; height: 100%; display: block; }
+/* Icon above the name (the operator's all-values proposal): a direct child
+   of the tile's flex column, so it stacks icon / name / readings and the
+   reading columns get the tile's full width. The base class's grid
+   placement and right gutter are meaningless outside gbody and reset here;
+   the state colours below match .gicon either way. */
+.gtile .gicon.gicon-top { margin: 0 auto 4px; align-self: center; }
+/* The icon takes the STATE colour, which is the whole reason it is
+   currentColor: a down tile's icon goes red with the rest of it rather than
+   sitting in a palette of its own. */
+.node.down .gicon { color: var(--se-down); }
+.node.warn .gicon { color: var(--se-warn); }
+.node.up .gicon { color: var(--se-up); }
+.node.off .gicon, .node.unknown .gicon { color: var(--se-txt-dim); }
+/* Centred mode: the columns must SHRINK to their content before
+   justify-content has anything to centre - a 1fr text column would eat the
+   slack and leave the pair pinned left. */
+.gwall-center .gtile .gbody { grid-template-columns: auto auto; justify-content: center; }
+.gwall-center .gtile .glines { min-width: 0; }
+.gtile .gfname { color: var(--se-txt-dim); }
+.gtile .gfval { font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gtile .count { display: block; text-align: center; font-size: calc(12px * var(--gw-scale)); font-weight: 600; }
+
+/* --- the control panel (slice 31) ------------------------------------------
+   Reachable because this page has a CURSOR, unlike PingCanvas's kiosk - and
+   that is a deliberate difference the operator named: a token-bearing
+   display is one somebody meant to open, not a URL stumbled onto. The
+   cursor still auto-hides when idle, so an unattended wall shows no arrow. */
+#wall.idle, #wall.idle * { cursor: none; }
+#wall-gear {
+    cursor: pointer; user-select: none; font-size: 15px; opacity: .75;
+    padding: 0 4px; border: 1px solid transparent; border-radius: 4px;
+}
+#wall-gear:hover { opacity: 1; border-color: var(--se-border); }
+#wall-panel {
+    position: absolute; top: 46px; right: 8px; z-index: 20;
+    width: 320px; max-height: calc(100vh - 60px); overflow-y: auto;
+    background: var(--se-panel); border: 1px solid var(--se-border);
+    border-radius: 8px; padding: 12px 14px;
+    font-size: 13px; line-height: 1.5;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+}
+#wall-panel h4 {
+    margin: 12px 0 6px; font-size: 11px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--se-txt-dim); font-weight: 600;
+}
+#wall-panel h4:first-child { margin-top: 0; }
+#wall-panel label { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+#wall-panel label.stack { display: block; }
+#wall-panel select, #wall-panel input[type=range] { width: 100%; }
+#wall-panel select {
+    background: var(--se-panel-2); color: var(--se-txt);
+    border: 1px solid var(--se-border); border-radius: 4px; padding: 3px 5px;
+}
+#wall-panel .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+#wall-panel .note { color: var(--se-txt-dim); font-size: 11.5px; margin-top: 4px; }
+#wall-panel .row2 { display: flex; gap: 8px; margin-top: 10px; }
+#wall-panel button {
+    flex: 1; background: var(--se-panel-2); color: var(--se-txt);
+    border: 1px solid var(--se-border); border-radius: 4px;
+    padding: 5px 8px; cursor: pointer; font-size: 12.5px;
+}
+#wall-panel button:hover { border-color: var(--se-txt-dim); }
+#wall-copied { color: var(--se-up); font-size: 12px; margin-top: 6px; }
+
+.node {
+    position: absolute;
+    display: flex; align-items: center; justify-content: center;
+    text-align: center;
+    border: 2px solid var(--se-border);
+    border-radius: 6px;
+    background: var(--se-panel-2);
+    font-size: 15px; line-height: 1.2;
+    padding: 4px; overflow: hidden;
+    box-sizing: border-box;
+}
+/* Status carried by FILL, not by a badge. At distance a badge is a smudge. */
+.node.up   { border-color: var(--se-up);   background: color-mix(in srgb, var(--se-up) 14%, var(--se-panel-2)); }
+.node.down { border-color: var(--se-down); background: color-mix(in srgb, var(--se-down) 26%, var(--se-panel-2)); font-weight: 600; }
+.node.warn { border-color: var(--se-warn); background: color-mix(in srgb, var(--se-warn) 20%, var(--se-panel-2)); }
+/* Unknown is DELIBERATELY NOT GREY-AND-QUIET. A shape bound to a device that
+   no longer exists is a question somebody has to answer, so it is drawn as a
+   dashed outline that reads as unfinished rather than as calm. */
+.node.unknown { border-style: dashed; color: var(--se-txt-dim); }
+/* Stale is a QUALIFIER on the status, not a replacement for it. The first
+   version dimmed to 0.55 and won outright, which meant a down device - which
+   is also unpolled if the collector has stopped - faded into the background.
+   Dotted border says "nobody has checked lately"; the fill still says what
+   was last true, because that is the best information available and hiding
+   it helps nobody. */
+/* Slice 45: a tile is an <a> only when the server said this viewer may follow
+   it, so [href] is the honest selector - it cannot be true on a kiosk. The
+   colour and underline are reset because a wall tile that suddenly rendered
+   as link-blue would read as a different STATE, and state is the one thing
+   these colours are for. The affordance is the cursor and the hover. */
+a.node[href] { color: inherit; text-decoration: none; cursor: pointer; }
+a.node[href]:hover { filter: brightness(1.18); }
+a.node[href]:focus-visible { outline: 2px solid var(--se-txt); outline-offset: 2px; }
+.node.stale { border-style: dotted; opacity: 0.8; }
+.node.down.stale { opacity: 1; }
+/* Slice 22: maintenance is visible state. Dashed border plus a corner tag,
+   layered UNDER status - a down device in a window still reads down. */
+.node.maint { border-style: dashed; }
+.node.maint::after {
+    content: 'maint'; position: absolute; top: 1px; right: 4px;
+    font-size: 9px; letter-spacing: .08em; opacity: .85;
+    color: var(--se-txt-dim, #999);
+}
+/* Slice 25: OFF is a state, not a fault - and not a blank. Dim like stale but
+   solid-bordered and tagged, so a powered-down transient device reads as
+   deliberate from across the room, and red keeps meaning red. */
+.node.off {
+    border-color: var(--se-txt-dim, #999); color: var(--se-txt-dim);
+    background: var(--se-panel-2); opacity: 0.65;
+}
+.node.off::before {
+    content: 'off'; position: absolute; bottom: 1px; right: 4px;
+    font-size: 9px; letter-spacing: .08em; opacity: .9;
+    color: var(--se-txt-dim, #999);
+}
+
+.node .addr { display: block; font-size: 12px; color: var(--se-txt-dim); }
+.node .count { display: block; font-size: 12px; font-weight: 600; }
+
+#wall-msg {
+    position: absolute; inset: 44px 0 0 0;
+    display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 40px; font-size: 20px; line-height: 1.5;
+}
+/* THE BANNER THAT MATTERS. Not a toast, not a corner badge - a bar across the
+   top of the wall, because the failure it reports is "what you are looking at
+   is not true any more" and that has to interrupt. */
+/* A quieter bar than the staleness one: a board needing a tidy is not an
+   outage, so it informs without shouting. */
+#wall-outliers {
+    position: absolute; top: 44px; left: 0; right: 0;
+    padding: 8px 16px; font-size: 14px;
+    background: var(--se-panel-2); color: var(--se-txt-dim);
+    border-bottom: 1px solid var(--se-border);
+}
+#wall-stale {
+    position: absolute; top: 44px; left: 0; right: 0;
+    padding: 10px 16px; font-size: 16px; font-weight: 600;
+    background: var(--se-down); color: #fff;
+}
+.hidden { display: none; }

@@ -1,0 +1,7 @@
+[Unit]
+# The soak instance as one thing you can start, stop and enable.
+Description=RSCanvas demo/soak instance (app + fleet + load)
+Wants=rscanvas-app.service rscanvas-fleet.service rscanvas-load.service
+
+[Install]
+WantedBy=multi-user.target

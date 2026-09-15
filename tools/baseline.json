@@ -1,0 +1,289 @@
+{
+  "recordedAt": "2026-07-27T04:02:45.838Z",
+  "database": "postgres://rscanvas:***@localhost:5432/rscanvas_spike",
+  "partitions": [
+    {
+      "parent": "messages",
+      "partition": "messages_20260711",
+      "estRows": 3466599,
+      "bytes": 1466843136,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260712",
+      "estRows": 3466356,
+      "bytes": 1466843136,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260713",
+      "estRows": 3466467,
+      "bytes": 1466712064,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260714",
+      "estRows": 3466049,
+      "bytes": 1466908672,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260715",
+      "estRows": 3466412,
+      "bytes": 1466646528,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260716",
+      "estRows": 3467156,
+      "bytes": 1467170816,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260717",
+      "estRows": 3466582,
+      "bytes": 1466810368,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260718",
+      "estRows": 3465899,
+      "bytes": 1466834944,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260719",
+      "estRows": 3466095,
+      "bytes": 1466810368,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260720",
+      "estRows": 3467014,
+      "bytes": 1466810368,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260721",
+      "estRows": 3466095,
+      "bytes": 1466777600,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260722",
+      "estRows": 3467145,
+      "bytes": 1466638336,
+      "pretty": "1399 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260723",
+      "estRows": 3466668,
+      "bytes": 1775075328,
+      "pretty": "1693 MB",
+      "hasTrgm": true
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260724",
+      "estRows": 3466666,
+      "bytes": 1774665728,
+      "pretty": "1692 MB",
+      "hasTrgm": true
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260725",
+      "estRows": 3467421,
+      "bytes": 1774911488,
+      "pretty": "1693 MB",
+      "hasTrgm": true
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260726",
+      "estRows": 1426541,
+      "bytes": 699940864,
+      "pretty": "668 MB",
+      "hasTrgm": true
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260727",
+      "estRows": 490376,
+      "bytes": 243048448,
+      "pretty": "232 MB",
+      "hasTrgm": true
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260728",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260729",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260730",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260731",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260801",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260802",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "messages",
+      "partition": "messages_20260803",
+      "estRows": -1,
+      "bytes": 40960,
+      "pretty": "40 kB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260720",
+      "estRows": 86400024,
+      "bytes": 12329041920,
+      "pretty": "11 GB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260721",
+      "estRows": 86400024,
+      "bytes": 12329000960,
+      "pretty": "11 GB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260722",
+      "estRows": 86400024,
+      "bytes": 12329009152,
+      "pretty": "11 GB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260723",
+      "estRows": 86400024,
+      "bytes": 12329041920,
+      "pretty": "11 GB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260724",
+      "estRows": 86400024,
+      "bytes": 12329017344,
+      "pretty": "11 GB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260725",
+      "estRows": 86400024,
+      "bytes": 12329041920,
+      "pretty": "11 GB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260726",
+      "estRows": 1202000,
+      "bytes": 173670400,
+      "pretty": "166 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples",
+      "partition": "samples_20260727",
+      "estRows": 109499,
+      "bytes": 15630336,
+      "pretty": "15 MB",
+      "hasTrgm": false
+    },
+    {
+      "parent": "samples_hourly",
+      "partition": "samples_hourly_pre_cutover",
+      "estRows": 64800060,
+      "bytes": 10900987904,
+      "pretty": "10 GB",
+      "hasTrgm": false
+    }
+  ],
+  "tables": [
+    {
+      "name": "devices",
+      "estRows": 700,
+      "bytes": 598016,
+      "pretty": "584 kB"
+    },
+    {
+      "name": "entities",
+      "estRows": 32160,
+      "bytes": 42565632,
+      "pretty": "41 MB"
+    }
+  ],
+  "totals": {
+    "partitions": 33,
+    "estRows": 638427237,
+    "bytes": 108934176768
+  }
+}

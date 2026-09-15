@@ -1,0 +1,22 @@
+-- Slice 7: procid gets its own column.
+--
+-- Additive, like every slice file. Applied by src/db/apply-schema.ts.
+--
+-- The parser read RFC 5424's APP-NAME and PROCID as separate fields and then
+-- CONCATENATED them back together (app = 'sshd[1234]'), and did the same with
+-- RFC 3164's tag[pid]. Structured data in hand, thrown away. The measured
+-- consequence on the demo corpus: 45,140 distinct app values instead of
+-- dozens, and - worse than the cardinality - `app:sshd` exact-matched only
+-- the lines logged WITHOUT a procid and silently missed every sshd[1234].
+-- SOME rows rather than zero, so the zero-result guidance could not fire and
+-- a partial answer read as a complete one. The parent's substring app: was
+-- immune; the fork's exact operator made the flattening a defect.
+--
+-- No index, deliberately: whether (app, ts) deserves a btree is decided by
+-- measurement against the CORRECTED column (SLICE-6-PLAN), not inherited
+-- from numbers taken while the column was polluted.
+--
+-- Rows written before this column existed keep their concatenated app and a
+-- NULL procid; the demo corpus turns over inside its 9-day retention, and the
+-- durable copy is raw, which a better parser makes retroactive.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS procid text;

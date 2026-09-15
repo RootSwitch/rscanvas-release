@@ -1,0 +1,467 @@
+/* RSCanvas - the Canvas Suite design language, ported from launchcanvas/
+   public/style.css (whose header says it in one line: dark panel chrome
+   driven by --se-* custom properties, system font stack, flat components
+   with 4-6px radii). themes.js recolors everything by setting the fifteen
+   variables on :root; Classic below is what you get without it.
+
+   The suite's rules travel with the chrome. The two that shape this file:
+   no literal colours in component CSS (a hex outside :root is a component
+   that will not theme), and state gets a SHAPE as well as a colour - pill,
+   dot, bordered badge - so it survives a colour-blind operator and a
+   photograph of a wall display. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+    --se-panel: #262a33;
+    --se-panel-2: #2d323d;
+    --se-input: #1b1e25;
+    --se-border: #3a4150;
+    --se-txt: #e6e9ef;
+    --se-txt-dim: #9aa3b2;
+    --se-accent: #4c8bf5;
+    --se-active: #0066cc;
+    /* status colors - tuned to sit on dark panels; themes may override */
+    --se-up: #2e9b57;
+    --se-down: #d64545;
+    --se-warn: #d9a92f;
+    --se-unknown: #8a8f98;
+    --se-series-out: #2e9b57;
+    --se-logo-a: #4c8bf5;
+    --se-logo-b: #2e9b57;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--se-panel-2);
+    color: var(--se-txt);
+    min-height: 100vh;
+    font-size: 14px;
+}
+
+a { color: var(--se-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.hidden { display: none !important; }
+.muted { color: var(--se-txt-dim); }
+.small { font-size: 12px; }
+.error-text { color: var(--se-down); font-size: 13px; min-height: 1.2em; }
+
+/* ===== Top bar ===== */
+#topbar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    height: 42px;
+    padding: 0 12px;
+    background: var(--se-panel);
+    border-bottom: 1px solid var(--se-border);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+.brand .logo { display: inline-flex; align-items: center; }
+.brand-name { letter-spacing: 0.2px; }
+.topbar-spacer { flex: 1; }
+#topbar label { color: var(--se-txt-dim); font-size: 12px; }
+
+#theme-select {
+    background: var(--se-input);
+    color: var(--se-txt);
+    border: 1px solid var(--se-border);
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: inherit;
+    padding: 3px 6px;
+}
+
+/* ===== Layout ===== */
+#main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 18px 16px 60px;
+}
+
+.panel {
+    background: var(--se-panel);
+    border: 1px solid var(--se-border);
+    border-radius: 6px;
+    padding: 14px;
+    margin-bottom: 16px;
+    overflow-x: auto; /* rule 7: a 48-port table scrolls here, not the page */
+}
+.panel h2 { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+.panel h2 .muted { font-weight: normal; font-size: 12px; }
+.panel h3 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--se-txt-dim);
+    margin: 16px 0 6px;
+}
+
+/* ===== Buttons & inputs (verbatim suite chrome) ===== */
+button, .btn {
+    font-family: inherit;
+    font-size: 13px;
+    padding: 5px 12px;
+    border-radius: 4px;
+    border: 1px solid var(--se-border);
+    background: var(--se-panel-2);
+    color: var(--se-txt);
+    cursor: pointer;
+}
+button:hover, .btn:hover { border-color: var(--se-accent); }
+button:disabled { opacity: 0.5; cursor: default; border-color: var(--se-border); }
+.btn-primary {
+    background: var(--se-accent);
+    border-color: var(--se-accent);
+    color: #fff;
+    font-weight: 500;
+}
+.btn-primary:hover { filter: brightness(1.1); }
+
+input[type="text"], input[type="password"], input[type="number"], select {
+    font-family: inherit;
+    font-size: 13px;
+    padding: 5px 8px;
+    background: var(--se-input);
+    border: 1px solid var(--se-border);
+    border-radius: 4px;
+    color: var(--se-txt);
+}
+input:focus, select:focus { outline: none; border-color: var(--se-accent); }
+label { font-size: 13px; }
+
+.form-grid {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 8px 12px;
+    align-items: center;
+    max-width: 600px;
+}
+.form-grid label { color: var(--se-txt-dim); }
+.form-actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* ===== Login panel ===== */
+#login .panel { max-width: 320px; margin: 18vh auto 0; }
+#login h1 { font-size: 18px; font-weight: 600; margin-bottom: 14px; }
+#login input { display: block; width: 100%; margin-bottom: 10px; }
+#login button { width: 100%; }
+
+/* ===== Tables ===== */
+table.list { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.list th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--se-txt-dim);
+    font-weight: 600;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--se-border);
+    white-space: nowrap;
+}
+table.list td {
+    padding: 7px 8px;
+    border-bottom: 1px solid var(--se-border);
+    vertical-align: middle;
+}
+table.list tbody tr:last-child td { border-bottom: none; }
+table.list td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.list th.num { text-align: right; }
+
+/* ===== State: a shape as well as a colour (rule 5) ===== */
+.sev {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    padding: 1px 8px;
+    border-radius: 9px;
+    border: 1px solid;
+}
+.sev.crit { color: var(--se-down); border-color: var(--se-down); }
+.sev.warn { color: var(--se-warn); border-color: var(--se-warn); }
+.sev.pending, .sev.clearing { color: var(--se-txt-dim); border-color: var(--se-border); }
+/* No .sev.active: active is the null value of state and renders as a blank
+   cell (see renderAlerts) - only the transitional states earn a shape. */
+.sev.cleared { color: var(--se-up); border-color: var(--se-up); }
+
+/* Charts - classes only, no inline colour, so a chart re-themes with
+   everything else. Two series is the maximum any RSCanvas chart draws:
+   in/out for an interface, used/total for a filesystem, one line for
+   everything else. */
+.chart-wrap {
+    border: 1px solid var(--se-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin: 10px 0;
+    background: var(--se-panel);
+}
+.chart-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 4px;
+}
+.chart-head .title { font-weight: 600; }
+.chart-svg { width: 100%; height: 220px; display: block; }
+.chart-grid-line { stroke: var(--se-border); stroke-width: 1; }
+.chart-axis-label { fill: var(--se-txt-dim); font-size: 10px; }
+.chart-cursor { stroke: var(--se-txt-dim); stroke-width: 1; stroke-dasharray: 3 3; }
+/* a/b are the TRAFFIC pair - accent and the out-series colour, the same two
+   the product uses for in/out everywhere. c/d are the TROUBLE pair, and
+   they borrow the severity palette the tables already speak: errors take
+   --se-down because a corrupted frame is a physical fault, discards take
+   --se-warn because a drop is usually congestion or policy. Green and blue
+   on a chart that only appears when something is wrong reads as reassuring,
+   which is the opposite of its job (operator, 2026-08-15). The table paints
+   a non-zero error cell with cell-warn already; this is the same
+   vocabulary, not a second one. */
+.chart-line-a { fill: none; stroke: var(--se-accent); stroke-width: 1.6; }
+.chart-line-b { fill: none; stroke: var(--se-series-out); stroke-width: 1.6; }
+.chart-line-c { fill: none; stroke: var(--se-down); stroke-width: 1.6; }
+.chart-line-d { fill: none; stroke: var(--se-warn); stroke-width: 1.6; }
+.chart-area-a { fill: var(--se-accent); opacity: 0.12; stroke: none; }
+.chart-area-b { fill: var(--se-series-out); opacity: 0.12; stroke: none; }
+.chart-area-c { fill: var(--se-down); opacity: 0.14; stroke: none; }
+.chart-area-d { fill: var(--se-warn); opacity: 0.14; stroke: none; }
+.chart-swatch-a { background: var(--se-accent); }
+.chart-swatch-b { background: var(--se-series-out); }
+.chart-swatch-c { background: var(--se-down); }
+.chart-swatch-d { background: var(--se-warn); }
+.chart-legend {
+    display: flex;
+    gap: 14px;
+    font-size: 11px;
+    color: var(--se-txt-dim);
+    margin-top: 2px;
+}
+.chart-legend .swatch {
+    display: inline-block;
+    width: 10px;
+    height: 3px;
+    border-radius: 2px;
+    margin-right: 5px;
+    vertical-align: middle;
+}
+.chart-tip {
+    position: absolute;
+    background: var(--se-panel);
+    border: 1px solid var(--se-border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    color: var(--se-txt);
+    pointer-events: none;
+    white-space: nowrap;
+}
+.card.clickable:hover, tr.clickable:hover { background: var(--se-hover, rgba(127,127,127,0.12)); }
+
+/* Sensor cards (the sensors slice) - the parent's device-page layout:
+   a responsive grid of small cards, each a name, a large current reading,
+   an optional context line, and a thin bar. The bar is the accent colour
+   except when the sensor itself says alarm, which borrows the down colour
+   the badges already use. */
+.cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+    margin: 10px 0;
+}
+.card {
+    border: 1px solid var(--se-border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    background: var(--se-panel);
+}
+.card .card-name {
+    font-size: 11px;
+    color: var(--se-txt-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.card .card-value {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 2px 0;
+}
+.card .card-sub {
+    font-size: 11px;
+    color: var(--se-txt-dim);
+}
+.card .bar {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--se-border);
+    margin-top: 6px;
+    overflow: hidden;
+}
+.card .bar-fill {
+    height: 100%;
+    background: var(--se-accent);
+}
+.card.alarm .card-value { color: var(--se-down); }
+.card.alarm .bar-fill { background: var(--se-down); }
+
+.badge {
+    display: inline-block;
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    border: 1px solid var(--se-border);
+    color: var(--se-txt-dim);
+}
+.badge.ok { color: var(--se-up); border-color: var(--se-up); }
+.badge.fail { color: var(--se-down); border-color: var(--se-down); }
+.badge.owed { color: var(--se-warn); border-color: var(--se-warn); }
+/* Slice 22: "in maintenance" is deliberate-and-quiet, not failing - dashed
+   and dim where owed is solid and warning-colored. */
+.badge.maint { color: var(--se-txt-dim); border-color: var(--se-txt-dim); border-style: dashed; }
+tr.maint-row td { opacity: .82; }
+/* Slice 25: a standing policy reads like maintenance - deliberate-and-quiet -
+   but dotted where a window is dashed, because "who declared this" and "when
+   does it end" are different next questions. */
+.badge.policy { color: var(--se-txt-dim); border-color: var(--se-txt-dim); border-style: dotted; }
+.badge.warn { color: var(--se-warn); border-color: var(--se-warn); }
+/* Aged-out facts: a ghost interface, an unrated speed. Warn-coloured because
+   the row deserves an eye, DASHED because nothing is alarming right now -
+   solid warn is owed (a debt), dim dashed is maint (a decision). This class
+   was referenced by the unrated pill before it was ever defined here, so
+   that pill silently wore the plain badge look; now both facts share one
+   deliberate rendering. */
+.badge.stale { color: var(--se-warn); border-color: var(--se-warn); border-style: dashed; }
+
+/* Slice 30: breathing room above the mint field. Even with rows present,
+   the form sat flush against the last table row - close enough that the
+   operator read the headers as belonging to the input. */
+.token-mint { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--se-border); }
+
+/* Status dot, sibling-standard 9px */
+.dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: baseline;
+    background: var(--se-unknown);
+}
+.dot.ok { background: var(--se-up); }
+.dot.bad { background: var(--se-down); }
+/* Slice 25: off is dim-and-deliberate, never red and never blank - a hollow
+   dot, so a powered-down transient device reads as a state, not a fault. */
+.dot.off { background: transparent; border: 1.5px solid var(--se-txt-dim); }
+
+.cell-warn { color: var(--se-warn); font-weight: 600; }
+.cell-crit { color: var(--se-down); font-weight: 600; }
+
+.allquiet { color: var(--se-txt-dim); padding: 10px 0; font-size: 13px; }
+
+/* ===== Search ===== */
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; min-width: 220px; }
+#search-form { margin-bottom: 4px; }
+
+/* Guidance, not an error: a zero-result search whose value is a substring of
+   something real. Bordered like a badge and coloured with --se-warn, which is
+   the suite's "look at this" without claiming anything broke. */
+.hints {
+    border: 1px solid var(--se-warn);
+    border-left-width: 3px;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 8px 0;
+    font-size: 13px;
+    color: var(--se-txt);
+}
+.hints div + div { margin-top: 4px; }
+
+/* A refusal names what to change, so it gets the same shape in --se-down. */
+.refusal {
+    border: 1px solid var(--se-down);
+    border-left-width: 3px;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 8px 0;
+    font-size: 13px;
+    color: var(--se-txt);
+}
+
+td.msg { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+td.ts { white-space: nowrap; color: var(--se-txt-dim); font-variant-numeric: tabular-nums; }
+
+/* U1: rows and headers you can act on. The pointer is the affordance; the
+   hover tint is what makes a 100-row table trackable across a wide screen. */
+tr.clickable, th.clickable { cursor: pointer; }
+table.list tbody tr.clickable:hover { background: var(--se-hover, rgba(127,127,127,0.12)); }
+th.clickable:hover { text-decoration: underline; }
+
+/* The section nav. Tab-shaped rather than button-shaped: these select a view,
+   they do not perform an action, and giving them the same affordance as
+   "Delete" would be a small lie told constantly. The active one is marked by
+   an accent underline and full-strength text, so the inactive ones recede
+   without becoming unreadable - a nav whose current item is the only legible
+   one makes people hunt for where they can go next. */
+#nav {
+    gap: 2px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--se-border);
+    padding-bottom: 0;
+}
+.navbtn {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 7px 14px;
+    color: var(--se-txt-dim);
+    font-size: 13px;
+}
+.navbtn:hover { color: var(--se-txt); border-color: var(--se-border); }
+.navbtn.active {
+    color: var(--se-txt);
+    border-bottom-color: var(--se-accent);
+    font-weight: 500;
+}
+
+/* threshold control on a sensor card (SLICE-THRESHOLDS-PLAN) */
+.card-gear { float: right; background: none; border: none; cursor: pointer; opacity: .45; font-size: .9em; padding: 0 .2em; }
+.card-gear:hover { opacity: 1; }
+.th-form { margin-top: .5em; gap: .3em; flex-wrap: wrap; font-size: .85em; }
+.th-form input[type=number] { width: 4.5em; }
+
+/* Untracked entities: present but dimmed - "we saw this and chose not to
+ * watch it" must stay visible, or the untrack control has no way back. */
+tr.untracked td { opacity: 0.45; }
+tr.untracked td:last-child { opacity: 1; }
+.card.untracked { opacity: 0.55; }
+.btn-track {
+    font-size: 11px; padding: 1px 6px; margin-left: 6px;
+    background: transparent; border: 1px solid var(--border, #555);
+    border-radius: 3px; color: inherit; cursor: pointer;
+}
+.btn-track:hover { border-color: var(--accent, #888); }
+
+.entities input.bad, #entities input.bad { border-color: #c0504d; }
+
+/* Wide layout: the centred 1100px page is the identity default; wide is
+   the opt-in for many roster columns on a big screen. One rule, applied
+   as a body class so every view inherits it, same as the parent. */
+body.wide #main { max-width: none; padding-left: 28px; padding-right: 28px; }
+/* Long free text (location, application, credential) clips with an
+   ellipsis and carries the full value in its title, so one verbose
+   sysLocation cannot push nine other columns off the screen. */
+table.list td.clip { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#cols-list { display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 8px; align-items: center; margin-bottom: 8px; }
+#cols-list button { font-size: 11px; padding: 0 6px; }
+#cols-list .col-off { opacity: 0.55; }
+
+/* A hint is guidance beside a control, never a verdict: dimmer than a fact,
+ * present only when the machine noticed something a human must decide. */
+#alert-facts .hint { color: var(--se-txt-dim); font-size: 12px; max-width: 62ch; }

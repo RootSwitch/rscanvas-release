@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSCanvas wall</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/wall.css">
+</head>
+<body>
+<div id="wall">
+    <div id="wall-head">
+        <span id="wall-name">connecting...</span>
+        <span id="wall-counts"></span>
+        <span id="wall-age"></span>
+        <span id="wall-gear" title="Display settings for this screen (nothing is sent back)">settings</span>
+    </div>
+    <div id="wall-panel" class="hidden"></div>
+    <div id="wall-stale" class="hidden"></div>
+    <div id="wall-outliers" class="hidden"></div>
+    <div id="wall-msg"></div>
+    <div id="wall-canvas"></div>
+</div>
+<script src="/themes.js"></script>
+<script src="/stencils.js"></script>
+<script type="module" src="/wall.js"></script>
+</body>
+</html>

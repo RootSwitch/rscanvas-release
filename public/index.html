@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSCanvas</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<!--
+  The thin read-only shell: login, then two live tables, in the Canvas Suite
+  design language (style.css carries the chrome, themes.js the 29 palettes).
+  Deliberately the SMALLEST page that exercises the whole stack - session
+  cookie, role enforcement, routing, and store reads through the interactive
+  lane. No framework, matching the parent apps.
+-->
+<div id="topbar">
+    <span class="brand">
+        <span class="logo" aria-hidden="true">
+            <svg width="17" height="17" viewBox="0 0 16 16" fill="none">
+                <rect x="1" y="1" width="6" height="6" rx="1.2" stroke="var(--se-logo-a)" stroke-width="1.6"/>
+                <rect x="9" y="9" width="6" height="6" rx="1.2" stroke="var(--se-logo-b)" stroke-width="1.6"/>
+                <path d="M7 4h3a2 2 0 0 1 2 2v3" stroke="var(--se-accent)" stroke-width="1.6" stroke-linecap="round"/>
+            </svg>
+        </span>
+        <span class="brand-name">RSCanvas</span>
+    </span>
+    <span class="topbar-spacer"></span>
+    <span id="whoami" class="muted small"></span>
+    <span id="refreshed" class="muted small"></span>
+    <button id="logout" class="hidden">Sign out</button>
+    <label for="theme-select">Theme</label>
+    <select id="theme-select"></select>
+</div>
+
+<div id="main">
+    <div id="login" class="hidden">
+        <div class="panel">
+            <h1>Sign in</h1>
+            <form id="login-form">
+                <input type="text" id="username" placeholder="username" autocomplete="username" required>
+                <input type="password" id="password" placeholder="password" autocomplete="current-password" required>
+                <button type="submit" class="btn-primary">Sign in</button>
+                <div id="login-error" class="error-text"></div>
+            </form>
+        </div>
+    </div>
+
+    <div id="app" class="hidden">
+        <!--
+          SECTIONS, not one scroll. Four panels was already a long page and
+          admin would have been a sixth; more to the point, "search", "the
+          alert board" and "user management" are different JOBS, and a
+          layout that makes you scroll past two of them to reach the third
+          is answering none of them well. Each nav button shows one section.
+          Admin is hidden entirely unless the signed-in role can use it -
+          the server enforces that regardless, this only stops the page
+          advertising a door that will not open.
+        -->
+        <div id="nav" class="row">
+            <button type="button" data-section="alerts" class="navbtn active">Alerts</button>
+            <button type="button" data-section="devices" class="navbtn">Devices</button>
+            <!-- "Logs", not "Syslog search": one word like its siblings, and
+                 honest about scope - traps land in the same store and the
+                 same grammar searches them (proto:trap). Operator's call,
+                 2026-08-14. -->
+            <button type="button" data-section="search" class="navbtn">Logs</button>
+            <button type="button" data-section="system" class="navbtn">System</button>
+        </div>
+
+        <div class="panel" data-section="search">
+            <h2>Search</h2>
+            <form id="search-form" class="row">
+                <input type="text" id="q" class="grow"
+                       placeholder="error  host:core-sw  host~core  app:sshd  sev:&lt;=3  fac:daemon  ip:10.0.0.  proto:trap  -noise  &quot;link down&quot;"
+                       autocomplete="off">
+                <select id="hours">
+                    <option value="1">1 hour</option>
+                    <option value="6">6 hours</option>
+                    <option value="24" selected>24 hours</option>
+                    <option value="168">7 days</option>
+                    <option value="336">14 days</option>
+                    <option value="custom">custom range...</option>
+                </select>
+                <button type="submit" class="btn-primary">Search</button>
+                <button type="button" id="grammar-toggle">?</button>
+            </form>
+            <div class="row hidden" id="custom-window">
+                <label for="from">from</label>
+                <input type="datetime-local" id="from">
+                <label for="to">to</label>
+                <input type="datetime-local" id="to">
+            </div>
+            <div class="row">
+                <button type="button" id="fields-toggle">Filter by field</button>
+                <span id="fields-note" class="muted small"></span>
+            </div>
+            <div class="hidden" id="fields">
+                <div class="row">
+                    <label for="f-host">host</label>
+                    <input type="text" id="f-host" placeholder="exact, e.g. sw-0274" autocomplete="off">
+                    <label for="f-ip">source IP</label>
+                    <input type="text" id="f-ip" placeholder="10.0.0. or 10.0.0.0/24" autocomplete="off">
+                    <label for="f-app">app</label>
+                    <input type="text" id="f-app" placeholder="exact, e.g. sshd" autocomplete="off">
+                </div>
+                <div class="row">
+                    <label for="f-sev">severity at most</label>
+                    <select id="f-sev">
+                        <option value="">any</option>
+                        <option value="0">0 emerg</option>
+                        <option value="1">1 alert</option>
+                        <option value="2">2 crit</option>
+                        <option value="3">3 err</option>
+                        <option value="4">4 warn</option>
+                        <option value="5">5 notice</option>
+                        <option value="6">6 info</option>
+                        <option value="7">7 debug</option>
+                    </select>
+                    <label for="f-fac">facility</label>
+                    <input type="text" id="f-fac" placeholder="number, e.g. 3" autocomplete="off" size="8">
+                    <label for="f-msg">message contains</label>
+                    <input type="text" id="f-msg" class="grow" placeholder="plain substring, no operators" autocomplete="off">
+                    <button type="button" id="fields-clear">Clear</button>
+                </div>
+            </div>
+            <div id="grammar-help" class="hints hidden"></div>
+            <div id="search-msg" class="allquiet hidden"></div>
+            <div id="search-hints" class="hints hidden"></div>
+            <div class="row hidden" id="export-row">
+                <button id="export-btn">Export these results to CSV</button>
+                <span id="export-msg" class="muted small"></span>
+            </div>
+            <table class="list hidden" id="exports">
+                <thead><tr>
+                    <th>export</th><th>state</th><th class="num">rows</th>
+                    <th class="num">size</th><th>started</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <table class="list hidden" id="results">
+                <thead><tr>
+                    <th>time</th><th>severity</th><th>host</th><th>app</th><th>message</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="panel" data-section="alerts" id="alerts-panel">
+            <h2>Alerts <span id="alert-counts" class="muted"></span></h2>
+            <div class="row">
+                <input type="text" id="alert-filter" class="grow"
+                       placeholder="filter by device, kind or label" autocomplete="off">
+                <select id="alert-scope">
+                    <option value="open" selected>open, worst first</option>
+                    <option value="crit">crit only</option>
+                    <option value="undelivered">undelivered only</option>
+                    <option value="pending">pending only (not yet raised)</option>
+                </select>
+            </div>
+            <div id="alerts-msg" class="allquiet hidden"></div>
+            <table class="list" id="alerts">
+                <thead><tr>
+                    <th>severity</th><th>state</th><th>alert</th><th class="num">value</th>
+                    <th class="num">peak</th><th class="num">threshold</th>
+                    <th>raised</th><th>last seen</th><th>delivery</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-alerts" class="allquiet hidden">all quiet - and the watchdog is what makes that different from not looking</div>
+
+            <!-- Flap radar (easy-win E11): a raise/clear cycle repeated all
+                 day never sits in "open" long enough to be seen, and each
+                 clear reads as a success. The pattern only exists across
+                 rows, so the page has a place that looks across rows. -->
+            <div id="alert-flaps" class="hints hidden"></div>
+
+            <h3>Recently cleared</h3>
+            <table class="list" id="cleared">
+                <thead><tr>
+                    <th>severity</th><th>alert</th><th class="num">peak</th><th class="num">duration</th><th>cleared</th><th>reason</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+
+            <h3>Reachability <span id="reach-counts" class="muted"></span></h3>
+            <table class="list" id="reach-events">
+                <thead><tr>
+                    <th>when</th><th>device</th><th>transition</th><th class="num">rtt ms</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-reach-events" class="allquiet hidden">no transitions recorded - a fleet that holds its state writes nothing here</div>
+
+            <!-- Slice 10: event rules. Admin-edited because a pattern runs on
+                 the ingest thread per message - authoring one is a hot-path
+                 change. Operators see the list read-only via the API; this
+                 block is the EDITOR and follows the onboarding panel's
+                 admin-only pattern. -->
+            <div class="admin-only hidden" id="rules-block">
+                <h3>Event rules <span class="muted small">a match raises an alert the moment the line arrives; no match for the TTL clears it</span></h3>
+                <table class="list" id="rules-table">
+                    <thead><tr>
+                        <th>rule</th><th>pattern</th><th>source</th><th>severity</th>
+                        <th class="num">clears after</th><th>enabled</th><th></th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+                <div class="row">
+                    <input type="text" id="rule-name" placeholder="name" size="14" autocomplete="off">
+                    <input type="text" id="rule-pattern" class="grow" autocomplete="off"
+                           placeholder="substring to match - e.g. link state changed, or 1.3.6.1.6.3.1.1.5.3 for linkDown traps">
+                    <label><input type="checkbox" id="rule-regex"> regex</label>
+                    <select id="rule-source">
+                        <option value="any" selected>any</option>
+                        <option value="syslog">syslog</option>
+                        <option value="trap">trap</option>
+                    </select>
+                    <select id="rule-severity">
+                        <option value="warn" selected>warn</option>
+                        <option value="crit">crit</option>
+                    </select>
+                    <input type="text" id="rule-ttl" value="300" size="5" autocomplete="off"
+                           title="seconds without a match before the alert clears">
+                    <button type="button" id="rule-add" class="btn-primary">Add rule</button>
+                </div>
+                <div id="rules-msg" class="muted small"></div>
+            </div>
+        </div>
+
+        <div class="panel hidden" data-section="alerts" id="alert-panel">
+            <h2><span id="alert-title"></span>
+                <span id="alert-sub" class="muted"></span></h2>
+            <div class="row">
+                <button id="alert-back">Back to alerts</button>
+            </div>
+            <div id="alert-facts" class="hints"></div>
+            <!-- The note sits BELOW the heading, not inside it: h3 is
+                 uppercased by the stylesheet, and a sentence swept up into
+                 that runs straight on from the title as one shouted line. -->
+            <h3>Delivery log</h3>
+            <div id="alert-history-note" class="muted small"></div>
+            <table class="list" id="alert-history">
+                <thead><tr>
+                    <th>when</th><th>event</th><th>channel</th><th>result</th><th>detail</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-history" class="allquiet hidden"></div>
+        </div>
+
+        <div class="panel" data-section="system">
+            <h2>Health <span id="health-verdict" class="muted"></span></h2>
+            <div id="health-problems" class="hints hidden"></div>
+            <div class="row">
+                <table class="list" id="hb-threads">
+                    <thead><tr>
+                        <th>thread</th><th class="num">worst gap</th><th class="num">p99</th>
+                        <th class="num">over 50ms</th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+                <table class="list" id="lanes">
+                    <thead><tr>
+                        <th>lane</th><th class="num">in flight</th><th class="num">capacity</th>
+                        <th class="num">queued</th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div id="db-health" class="muted small"></div>
+            <!-- Notify channel health (easy-win E6): "configured and dead"
+                 made visible - failures since the last successful delivery,
+                 per channel, straight from the jobs worker's ledger. -->
+            <div id="notify-health" class="small hidden"></div>
+            <!-- Slowest agents (easy-win E9): from the roster already
+                 fetched. Answers "which agents should I look at", and a slow
+                 agent is often the early symptom of a dying device. -->
+            <div id="slow-agents" class="small hidden"></div>
+        </div>
+
+        <div class="panel" data-section="devices" id="roster-panel">
+            <h2>Devices <span id="device-counts" class="muted"></span></h2>
+            <div class="row">
+                <input type="text" id="device-filter" class="grow"
+                       placeholder="filter by name or address" autocomplete="off">
+                <select id="device-scope">
+                    <option value="problems" selected>problems first</option>
+                    <option value="only-problems">problems only</option>
+                    <option value="down">down only</option>
+                    <option value="name">all, by name</option>
+                </select>
+                <button type="button" id="cols-btn" title="Choose and order the columns this table shows - a per-browser preference">Columns</button>
+            </div>
+            <!-- THE COLUMN PANEL. SNMPCanvas's Columns menu, plus the thing it
+                 deliberately left out: ORDER. The parent renders in registry
+                 order whatever you ticked; here the preference is an ordered
+                 list with up/down controls, because a roster tuned for one
+                 operator's eye reads in that operator's order. Per-browser
+                 (localStorage) like the sort: it changes what YOU see. -->
+            <div id="cols-panel" class="hints hidden">
+                <div id="cols-list"></div>
+                <label class="small"><input type="checkbox" id="wide-cb"> wide layout - let the page use the whole window width (for many columns on a big screen)</label>
+                <button type="button" id="cols-reset" class="small"
+                        title="Forget this browser's column order and visibility - back to the out-of-the-box table">Reset to default</button>
+            </div>
+            <div id="roster-msg" class="allquiet hidden"></div>
+            <div class="row hidden" id="roster-actions">
+                <span id="roster-selected" class="muted small"></span>
+                <button type="button" id="roster-disable">Stop watching</button>
+                <button type="button" id="roster-enable">Resume watching</button>
+                <!-- Two buttons because they are two decisions. Rediscover is
+                     additive and safe; "reset tracking" discards manual
+                     selections, so it says so on the button rather than hiding
+                     behind a checkbox nobody reads. -->
+                <input type="text" id="roster-cred" list="ob-cred-list" class="admin-only" size="18"
+                       placeholder="profile or env var" autocomplete="off"
+                       title="Point the selected devices at a credential profile or environment variable name. The picker offers what exists.">
+                <button type="button" id="roster-setcred" class="admin-only">Set credential</button>
+                <!-- Slice 30: transient for a SELECTION. A parlor of guest PCs
+                     is declared as a set; visiting six device pages to flip
+                     one boolean six times was the page being pedantic about
+                     where a fact is entered. -->
+                <button type="button" id="roster-transient">Mark transient</button>
+                <button type="button" id="roster-untransient">Not transient</button>
+                <button type="button" id="roster-rediscover" class="admin-only">Rediscover</button>
+                <!-- Rediscover PRESERVES manual tracking choices; the second
+                     button resets every entity on the selected devices to the
+                     current policy defaults (ifType, name list,
+                     ifConnectorPresent) - without it the discovery fixes can
+                     never reach an already-onboarded device. There was briefly
+                     ALSO a checkbox here, sharing this button's id: the
+                     operator's click handler landed on the checkbox
+                     (getElementById returns the first match), so TICKING THE
+                     BOX fired the rediscover and the button did nothing.
+                     Found by the operator mid-retrack. Two decisions, two
+                     buttons, two ids - and no third control. -->
+                <button type="button" id="roster-rediscover-reset" class="admin-only">Rediscover + reset tracking</button>
+                <button type="button" id="roster-delete" class="admin-only">Delete</button>
+                <button type="button" id="roster-clear">Clear selection</button>
+            </div>
+            <div id="roster-gate" class="hints hidden"></div>
+            <table class="list" id="devices">
+                <!-- The first two headers are the row's identity and never
+                     move; everything after them is rendered from the column
+                     preference (ROSTER_COLS in app.js). -->
+                <thead><tr>
+                    <th><input type="checkbox" id="roster-all" title="select all shown"></th>
+                    <th data-sort="name">device</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- Onboarding lives on the DEVICES section, because that is where
+             devices are managed, and is admin-only by the same admin-only
+             class the System panels use. The server enforces device.create
+             regardless; this stops the page advertising a door that will not
+             open. -->
+        <!-- SINGLE DEVICE FIRST, bulk behind a button - the parent's shape,
+             adopted at the operator's direction 2026-08-14. Adding one device
+             is the common case, and a four-row textarea greeting everyone who
+             opens the Devices page prices the page for the rare case. Both
+             modes feed the same probe-then-add flow: a single address is a
+             one-line paste as far as the machinery cares. -->
+        <div class="panel hidden admin-only" data-section="devices" id="onboard-panel">
+            <div class="row">
+                <button type="button" id="ob-open" class="btn-primary">+ Add device</button>
+                <span id="onboard-sub" class="muted"></span>
+            </div>
+            <div id="ob-form" class="hidden">
+            <h2 id="ob-title">Add device</h2>
+            <!-- Slice 35: ping-only devices. An ISP handoff or the internet
+                 itself answers ICMP and has no agent, so there is nothing to
+                 probe and nothing to review - the operator's typed name is
+                 the only identity it will ever have. A different flow, not a
+                 flag on this one. -->
+            <div class="row">
+                <label for="ob-monitor">monitor by</label>
+                <select id="ob-monitor">
+                    <option value="snmp" selected>SNMP (probe, then review what answered)</option>
+                    <option value="icmp">ping only (no agent - ISPs, the internet, appliances)</option>
+                </select>
+            </div>
+            <div id="ob-ping" class="hidden">
+                <div class="hints">
+                    One line per service: an IP address, then a space, then the name you want on
+                    the wall. These are watched by ICMP alone - up, down and latency, with alerts
+                    and maintenance windows like any other device.
+                </div>
+                <textarea id="ob-ping-hosts" rows="4" class="grow"
+                          placeholder="8.8.8.8 Internet&#10;198.51.100.1 ISP-A handoff"></textarea>
+                <div class="row">
+                    <label for="ob-ping-location">location</label>
+                    <input type="text" id="ob-ping-location" autocomplete="off" maxlength="120" list="group-values">
+                    <label for="ob-ping-application">application</label>
+                    <input type="text" id="ob-ping-application" autocomplete="off" maxlength="120"
+                           list="group-values" placeholder="e.g. External">
+                    <button type="button" id="ob-ping-add" class="btn-primary">Add these</button>
+                    <span id="ob-ping-msg" class="muted small"></span>
+                </div>
+            </div>
+            <div class="row" id="ob-single-row">
+                <label for="ob-host">address</label>
+                <input type="text" id="ob-host" class="grow" placeholder="IP or hostname" autocomplete="off">
+            </div>
+            <div class="row hidden" id="ob-bulk-row">
+                <label for="ob-hosts">hosts</label>
+                <!-- SCAN A SUBNET: the suite's install script seeded its first
+                     board from nmap -sn, and a demo without that step starts
+                     with an empty roster and a text box. This fills the text
+                     box from an fping sweep; the operator still reviews and
+                     probes. A host that pings is a candidate, not a device. -->
+                <div class="row">
+                    <input type="text" id="ob-scan-cidr" placeholder="scan a subnet, e.g. 192.0.2.0/24" size="26" autocomplete="off">
+                    <button type="button" id="ob-scan">Scan</button>
+                    <span id="ob-scan-msg" class="muted small"></span>
+                </div>
+                <textarea id="ob-hosts" rows="4" class="grow"
+                          placeholder="one address or hostname per line - or paste a CSV with an ip / address column - or scan a subnet above"></textarea>
+            </div>
+            <div class="row" id="ob-snmp-row">
+                <label for="ob-version">SNMP</label>
+                <select id="ob-version">
+                    <option value="2c" selected>v2c</option>
+                    <option value="1">v1</option>
+                    <option value="3">v3</option>
+                </select>
+                <label for="ob-port">port</label>
+                <input type="text" id="ob-port" value="161" size="6" autocomplete="off">
+                <!-- LABELLED AS A VARIABLE NAME, not "credential". A tooltip
+                     nobody hovers is not a label: an operator with a mixed
+                     estate typed the community string in here, it was read as
+                     a variable name, and the probe silently fell back to the
+                     fleet default. The backend refuses that now; this stops it
+                     being an easy mistake to make in the first place. -->
+                <label for="ob-cred">credential</label>
+                <!-- A PICKER over what exists, not a blank box. The blank box is
+                     what got a community string typed into it on 2026-08-16.
+                     Options come from /api/credentials: profiles and env names,
+                     each labelled with which kind it is. Free text still
+                     works, and an unknown name is refused per host by name. -->
+                <input type="text" id="ob-cred" value="SNMP_COMMUNITY" autocomplete="off" list="ob-cred-list"
+                       placeholder="pick a profile or env var"
+                       title="The NAME of a credential profile or of an environment variable - never the community itself. Profiles are managed under System > Credentials.">
+                <datalist id="ob-cred-list"></datalist>
+                <label for="ob-interval">poll every</label>
+                <input type="text" id="ob-interval" value="30" size="5" autocomplete="off">
+                <button type="button" id="ob-probe" class="btn-primary">Test &amp; discover</button>
+                <button type="button" id="ob-bulk-toggle">Bulk add...</button>
+                <button type="button" id="ob-cancel">Cancel</button>
+            </div>
+            <div id="ob-msg" class="muted small"></div>
+
+            <div id="ob-results" class="hidden">
+                <h3>What answered <span id="ob-counts" class="muted small"></span></h3>
+                <table class="list" id="ob-table">
+                    <thead><tr>
+                        <th></th><th>address</th><th>name</th><th class="num">interfaces</th>
+                        <th class="num">tracked</th><th class="num">sensors</th>
+                        <th>location reported</th><th>result</th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+
+                <div id="ob-locations" class="hidden">
+                    <h3>Locations these devices report</h3>
+                    <div id="ob-loc-summary" class="hints"></div>
+                    <table class="list" id="ob-loc-table">
+                        <thead><tr>
+                            <th>use</th><th>reported by the device</th><th class="num">devices</th>
+                            <th>save as</th>
+                        </tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+
+                <!-- Slice 30: APPLICATION, typed once for the batch. Location
+                     arrives suggested because devices report sysLocation;
+                     nothing on a device knows it serves Exchange, so this is
+                     the grouping the operator simply states - and stating it
+                     here beats tagging the batch one page at a time after. -->
+                <div class="row">
+                    <label for="ob-application">application</label>
+                    <input type="text" id="ob-application" class="grow" autocomplete="off" maxlength="120"
+                           list="group-values" placeholder="optional - applies to every device added now, e.g. Guest PCs">
+                </div>
+
+                <div class="row">
+                    <button type="button" id="ob-add" class="btn-primary">Add the selected devices</button>
+                    <span id="ob-add-msg" class="muted small"></span>
+                </div>
+            </div>
+            </div>
+        </div>
+
+        <div class="panel hidden" data-section="devices" id="device-panel">
+            <h2><span id="device-title"></span>
+                <span id="device-sub" class="muted"></span></h2>
+            <!-- The device's own state, on the page about that device. The
+                 roster showed down and this panel did not, so a dead device
+                 read as healthy here apart from an easily-missed "43m ago" on
+                 the readings. Blank when everything is up, per the same
+                 blank-not-placeholder rule the roster follows. -->
+            <div id="device-state" class="hints hidden"></div>
+            <!-- THE DEVICE'S OPEN ALERTS. The roster said "3 open alerts" and
+                 the page they clicked into said nothing about them - the one
+                 number that brought the operator here was the one thing the
+                 page did not show. Filtered client-side from the same open
+                 list the Alerts section renders (it is uncapped and refreshed
+                 every 10s), so no second query and no drift between the two
+                 views. Hidden when empty: blank, not placeholder. -->
+            <div id="device-alerts" class="hidden">
+                <h3 id="device-alerts-title"></h3>
+                <table class="list">
+                    <thead><tr>
+                        <th>severity</th><th>state</th><th>alert</th>
+                        <th class="num">value</th><th class="num">threshold</th><th>raised</th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="row">
+                <button id="device-back">Back to devices</button>
+                <input type="text" id="entity-filter" class="grow"
+                       placeholder="filter interfaces" autocomplete="off">
+            </div>
+            <!-- Grouping is OPTIONAL and the form says so. Empty is a valid,
+                 fully supported state - the product monitors devices, not
+                 groups, and a deployment that never fills these in is not a
+                 degraded one. -->
+            <!-- Rename lives here rather than on the roster because the name
+                 is a fact about ONE device and the page about that device is
+                 where an operator has just confirmed which one it is. -->
+            <form id="rename-form" class="row admin-only">
+                <label for="dev-newname">rename to</label>
+                <input type="text" id="dev-newname" placeholder="new device name" autocomplete="off" maxlength="120">
+                <button type="submit">Rename</button>
+                <span id="rename-msg" class="muted small"></span>
+            </form>
+            <!-- A re-addressed device keeps its history: the alternative was
+                 delete and re-add, which threw it away. Polled at the new
+                 address on the next tick. -->
+            <form id="address-form" class="row admin-only">
+                <label for="dev-newhost">move to</label>
+                <input type="text" id="dev-newhost" placeholder="IP address" autocomplete="off" maxlength="64">
+                <input type="number" id="dev-newport" placeholder="port" min="1" max="65535">
+                <button type="submit">Move</button>
+                <span id="address-msg" class="muted small"></span>
+            </form>
+            <!-- "Maintenance for two hours" lives where the operator already
+                 is when they decide to work on something (slice 22). -->
+            <div id="dev-maint" class="hints hidden"></div>
+            <form id="maint-dev-form" class="row">
+                <label for="dev-maint-min">maintenance for</label>
+                <input type="number" id="dev-maint-min" value="120" min="1" max="43200"> minutes
+                <input type="text" id="dev-maint-note" placeholder="optional note" maxlength="500">
+                <button type="submit">Start window</button>
+                <span id="maint-dev-msg" class="muted small"></span>
+            </form>
+            <form id="grouping-form" class="row">
+                <label for="dev-location">location</label>
+                <input type="text" id="dev-location" placeholder="optional - e.g. HQ / Floor 2 / Rack 4"
+                       autocomplete="off" maxlength="120">
+                <label for="dev-application">application</label>
+                <input type="text" id="dev-application" placeholder="optional - e.g. PAM Prod"
+                       autocomplete="off" maxlength="120">
+                <button type="submit">Save</button>
+                <span id="grouping-msg" class="muted small"></span>
+            </form>
+            <!-- Slice 25 quiet 2: the transient declaration, beside grouping
+                 because it is the same posture - a fact about the device an
+                 operator states in advance, never derived from behavior.
+                 THE LABEL IS ONE WORD ON PURPOSE (operator finding,
+                 2026-08-28): the first version wrapped the whole explainer
+                 sentence in the label, so any casual click on the text
+                 toggled the declaration - and it saves on toggle, so a
+                 stray click silently re-armed device-down and the next
+                 reboot paged. The explainer is plain text now: readable,
+                 not clickable. -->
+            <div class="row">
+                <label class="small"><input type="checkbox" id="dev-transient"> transient</label>
+                <span class="muted small">a guest PC, parlor station, HTPC: off is a state, not a
+                    fault. While set, device-down never raises - the device renders "off"
+                    and keeps being polled. Saves when toggled.</span>
+                <span id="transient-msg" class="small"></span>
+            </div>
+            <div id="device-msg" class="allquiet hidden"></div>
+            <!-- Sensor cards (the sensors slice): current reading plus a bar,
+                 above the interface table - the parent's layout, which the
+                 operator named as the porting bar. -->
+            <div id="sensor-cards" class="cards hidden"></div>
+            <!-- The chart opens in place when a card or an interface row is
+                 clicked. One at a time, deliberately: a page of twenty
+                 charts is a dashboard, and this is a drill-down. -->
+            <div id="chart-wrap" class="chart-wrap hidden">
+                <div class="chart-head">
+                    <span class="title" id="chart-title"></span>
+                    <span class="muted small" id="chart-sub"></span>
+                    <span class="grow"></span>
+                    <select id="chart-range">
+                        <option value="6">6 hours</option>
+                        <option value="24" selected>24 hours</option>
+                        <option value="72">3 days</option>
+                        <option value="168">7 days</option>
+                        <option value="720">30 days</option>
+                    </select>
+                    <button type="button" id="chart-close">Close</button>
+                </div>
+                <div id="chart-body"></div>
+                <!-- Errors and discards get their OWN chart, sharing the x
+                     axis above rather than a second y axis on it: traffic is
+                     Gb/s and errors are fractions per second, so on one
+                     linear scale the error line is zero pixels tall - a
+                     chart that renders "fine" and "on fire" identically. Two
+                     honest scales, vertical alignment doing the correlating.
+                     Drawn only when something happened; the quiet line below
+                     is the information otherwise. -->
+                <div id="chart-errs-head" class="chart-head hidden">
+                    <span class="title">Errors and discards</span>
+                    <span class="muted small" id="chart-errs-sub"></span>
+                </div>
+                <div id="chart-errs"></div>
+                <div id="chart-errs-quiet" class="allquiet hidden"></div>
+            </div>
+            <table class="list" id="entities">
+                <thead><tr>
+                    <th>interface</th><th>description</th><th class="num">speed</th><th>state</th>
+                    <th class="num">in</th><th class="num">out</th>
+                    <th class="num">errors/s</th><th class="num">discards/s</th>
+                    <th>last reading</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- Maintenance windows (slice 22). Deliberately NOT admin-only: a
+             window is operational state like health, and every role may see
+             why the pager is quiet. Creating and cancelling are enforced
+             server-side at operator-and-up (alert.suppress). -->
+        <div class="panel" data-section="system" id="maint-panel">
+            <h2>Maintenance windows</h2>
+            <p class="muted small">A window withholds notification for a named set until it
+               ends. The alerts still raise, stay on every page and the wall marked
+               "in maintenance", and anything still active when the window closes is
+               delivered on the next pass. The watchdog is never suppressed.</p>
+            <table id="maint-table" class="hidden">
+                <thead><tr><th></th><th>covers</th><th>starts</th><th>ends</th>
+                       <th>note</th><th>by</th><th></th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-maint" class="muted small">none - notifications flow normally</div>
+            <form id="maint-form" class="row">
+                <select id="maint-scope">
+                    <option value="device">device</option>
+                    <option value="location">location</option>
+                    <option value="application">application</option>
+                    <option value="all">everything</option>
+                </select>
+                <input type="text" id="maint-target" placeholder="target name" autocomplete="off" maxlength="120"
+                       list="maint-targets">
+                <datalist id="maint-targets"></datalist>
+                <label for="maint-min">for</label>
+                <input type="number" id="maint-min" value="120" min="1" max="43200"> minutes
+                <input type="text" id="maint-note" placeholder="optional note" maxlength="500">
+                <button type="submit">Open window</button>
+                <span id="maint-msg" class="muted small"></span>
+            </form>
+        </div>
+        <!-- Notify policies (slice 25, quiet 1). The standing sibling of the
+             windows above, for the Dev/Test class: alerts raise, show on every
+             page and the wall, and never page while the policy stands. Same
+             visibility posture: every role may see why the pager is quiet;
+             creating and dropping are operator-and-up server-side. -->
+        <div class="panel" data-section="system" id="policy-panel">
+            <h2>Notify policies</h2>
+            <p class="muted small">A policy is standing: alerts for the named set still raise
+               and stay visible everywhere, marked "unpaged - policy", and are never
+               delivered while the policy exists. Use it for Dev/Test and Non-Prod
+               groups you watch but never want paged about. Dropping a policy delivers
+               anything still active on the next pass. The watchdog is never covered.</p>
+            <table id="policy-table" class="hidden">
+                <thead><tr><th>covers</th><th>note</th><th>by</th><th>since</th><th></th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-policy" class="muted small">none - every alert pages normally</div>
+            <form id="policy-form" class="row">
+                <select id="policy-scope">
+                    <option value="application">application</option>
+                    <option value="location">location</option>
+                    <option value="device">device</option>
+                </select>
+                <input type="text" id="policy-target" placeholder="target name" autocomplete="off" maxlength="120"
+                       list="policy-targets">
+                <datalist id="policy-targets"></datalist>
+                <input type="text" id="policy-note" placeholder="optional note" maxlength="500">
+                <button type="submit">Stand policy</button>
+                <span id="policy-msg" class="muted small"></span>
+            </form>
+        </div>
+        <div class="panel hidden admin-only" data-section="system" id="retention-panel">
+            <h2>Retention <span id="retention-sub" class="muted"></span></h2>
+            <div id="retention-msg" class="allquiet hidden"></div>
+
+            <h3>What happens next</h3>
+            <div class="row">
+                <button type="button" id="preview-messages">What would retention drop from messages?</button>
+                <button type="button" id="preview-samples">and from samples?</button>
+            </div>
+            <div id="preview-note" class="muted small"></div>
+            <div id="preview-out" class="hints hidden"></div>
+
+            <h3>What it did last</h3>
+            <table class="list" id="jobs-table">
+                <thead><tr>
+                    <th>job</th><th>last outcome</th><th>last run</th>
+                    <th>last success</th><th class="num">runs</th><th class="num">failures</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-jobs" class="allquiet hidden"></div>
+
+            <h3>Partitions <span id="part-sub" class="muted small"></span></h3>
+            <div class="row">
+                <input type="text" id="part-filter" class="grow"
+                       placeholder="filter partitions" autocomplete="off">
+            </div>
+            <table class="list" id="partitions">
+                <thead><tr>
+                    <th>partition</th><th>table</th><th class="num">rows (est)</th>
+                    <th class="num">size</th><th>free-text index</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+
+            <h3>Settings</h3>
+            <div class="muted small">Environment only - there is no config store, so these
+                change by editing the unit and restarting.</div>
+            <table class="list" id="settings">
+                <thead><tr><th>variable</th><th class="num">value</th><th>what it does</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="panel hidden admin-only" data-section="system" id="thresholds-panel">
+            <h2>Thresholds <span id="th-sub" class="muted"></span></h2>
+            <div class="hints">
+                The shipped defaults are a starting point. An override replaces them
+                for <b>one sensor</b> (by its code), for <b>one kind on one device</b>,
+                or for <b>that kind everywhere</b>. A muted override suspends the rule
+                without touching polling or history. Narrower always wins: sensor
+                beats device beats kind beats default. Set overrides from a sensor's
+                card on its device page; this is the fleet-wide view.
+            </div>
+            <div id="th-msg" class="allquiet hidden"></div>
+            <table class="list" id="thresholds">
+                <thead><tr>
+                    <th>scope</th><th>kind</th><th>target</th><th class="num">warn</th><th class="num">crit</th><th>state</th><th>note</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <h3>Defaults</h3>
+            <div id="th-defaults" class="muted small"></div>
+        </div>
+        <div class="panel hidden admin-only" data-section="system" id="credentials-panel">
+            <h2>Credentials <span id="cred-sub" class="muted"></span></h2>
+            <!-- READ-ONLY, said once and plainly at the point of entry. The
+                 argument is ARCHITECTURE 4a's about WMI applied here: a
+                 compromise of this store should be a compromise of visibility,
+                 never of control. -->
+            <div class="hints">
+                A profile is a named SNMP credential the collector sends to every
+                device that names it. Use <b>read-only</b> communities and users:
+                if this store is ever compromised, the attacker should be able to
+                read your devices, not change them. Secrets are encrypted at rest
+                and never shown again once saved.
+            </div>
+            <div id="cred-msg" class="allquiet hidden"></div>
+            <table class="list" id="credentials">
+                <thead><tr>
+                    <th>profile</th><th>version</th><th>secret</th><th class="num">devices</th><th>updated</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+
+            <h3>Create a profile</h3>
+            <form id="new-cred-form" class="row">
+                <input type="text" id="nc-name" placeholder="name, e.g. switches-ro" autocomplete="off" required
+                       title="Yours to choose. Letters, digits, dot, dash, underscore. Never derived from a device.">
+                <select id="nc-version">
+                    <option value="2c" selected>v2c</option>
+                    <option value="1">v1</option>
+                    <option value="3">v3</option>
+                </select>
+                <input type="password" id="nc-community" placeholder="community (read-only)" autocomplete="off" required>
+                <!-- SNMPv3 (slice 29). Shown only when v3 is chosen: six more
+                     fields on every v2c profile creation would be the common
+                     case paying for the rare one. The protocol lists are the
+                     server's own vocabulary, and the spelling is forgiving
+                     anyway - these are a convenience, not a gate. -->
+                <span id="nc-v3" class="row hidden">
+                    <input type="text" id="nc-v3user" placeholder="v3 user name" autocomplete="off"
+                           title="The name the AGENT was configured with (net-snmp: createUser &lt;name&gt;). Case-sensitive.">
+                    <select id="nc-v3level" title="Must match how the user was created on the agent">
+                        <option value="authPriv" selected>authPriv (auth + encryption)</option>
+                        <option value="authNoPriv">authNoPriv (auth only)</option>
+                        <option value="noAuthNoPriv">noAuthNoPriv</option>
+                    </select>
+                    <select id="nc-v3auth" title="SHA-256 where the agent allows it; MD5 is broken but accepted for devices that offer nothing else">
+                        <option value="sha256" selected>SHA-256</option>
+                        <option value="sha512">SHA-512</option>
+                        <option value="sha384">SHA-384</option>
+                        <option value="sha224">SHA-224</option>
+                        <option value="sha">SHA-1</option>
+                        <option value="md5">MD5 (weak)</option>
+                    </select>
+                    <input type="password" id="nc-v3authkey" placeholder="auth passphrase" autocomplete="off">
+                    <select id="nc-v3priv" title="AES where the agent allows it; DES is broken but accepted">
+                        <option value="aes" selected>AES-128</option>
+                        <option value="aes256b">AES-256 (Blumenthal)</option>
+                        <option value="aes256r">AES-256 (Reeder)</option>
+                        <option value="des">DES (weak)</option>
+                    </select>
+                    <input type="password" id="nc-v3privkey" placeholder="privacy passphrase" autocomplete="off">
+                </span>
+                <button type="submit" class="btn-primary">Create</button>
+            </form>
+            <div id="new-cred-msg" class="muted small"></div>
+        </div>
+        <div class="panel hidden admin-only" data-section="system" id="users-panel">
+            <h2>Users <span id="users-sub" class="muted"></span></h2>
+            <div id="users-msg" class="allquiet hidden"></div>
+            <table class="list" id="users">
+                <thead><tr>
+                    <th>username</th><th>role</th><th>created</th><th>last sign-in</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+
+            <h3>Add a user</h3>
+            <form id="new-user-form" class="row">
+                <input type="text" id="nu-name" placeholder="username" autocomplete="off" required>
+                <input type="password" id="nu-pass" placeholder="password" autocomplete="new-password" required>
+                <select id="nu-role">
+                    <option value="viewer">viewer</option>
+                    <option value="operator" selected>operator</option>
+                    <option value="admin">admin</option>
+                </select>
+                <button type="submit" class="btn-primary">Create</button>
+            </form>
+            <div id="new-user-msg" class="muted small"></div>
+        </div>
+
+        <div class="panel hidden admin-only" data-section="system" id="boards-panel">
+            <h2>Boards and displays <span id="boards-sub" class="muted"></span></h2>
+            <div id="boards-msg" class="allquiet hidden"></div>
+            <table class="list" id="boards">
+                <thead><tr>
+                    <th>board</th><th>collection</th><th>group</th>
+                    <th>drift</th><th>addresses</th><th class="num">displays</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <!-- The glance grid (slice 26). Rendering, not layout: a board
+                 with a column count draws as tiles wrapped at that count, in
+                 name order, coordinates ignored. The field checkboxes are the
+                 per-board exposure declaration - identity fields (names,
+                 addresses) are separate opt-ins from their values, so a board
+                 can show "top usage" without telling a corridor which port. -->
+            <div id="grid-editor" class="hints hidden">
+                <div class="row">
+                    <strong id="grid-title"></strong>
+                    <label class="small"><input type="checkbox" id="grid-auto"> auto columns</label>
+                    <label for="grid-cols">or exactly</label>
+                    <input type="number" id="grid-cols" min="1" max="24" placeholder="off">
+                    <span class="muted small">auto fits the display's own screen (the field set fixes the
+                        tile height, so the arithmetic is exact); a number forces it; both blank = drawn
+                        board from coordinates</span>
+                </div>
+                <div id="grid-checks" class="row wrap"></div>
+                <div class="row">
+                    <button type="button" id="grid-save" class="btn-primary">Save grid settings</button>
+                    <button type="button" id="grid-close">Close</button>
+                    <span id="grid-msg" class="muted small"></span>
+                </div>
+            </div>
+            <!-- The export that feeds CrossCanvas. RSCanvas builds no layout
+                 engine; this hands the inventory to the tool that already has
+                 one. Choosing the axis here is what decides whether the board
+                 comes out as a floor plan or an application health view. -->
+            <h3>Generate a board from a group</h3>
+            <div class="row">
+                <label for="inv-axis">group by</label>
+                <select id="inv-axis">
+                    <option value="location">location</option>
+                    <option value="application">application</option>
+                </select>
+                <input type="text" id="inv-value" placeholder="a group, or several with commas (a team board)"
+                       class="grow" autocomplete="off" list="group-values">
+                <datalist id="group-values"></datalist>
+                <!-- Slice 30: the ALL-FLEET board. Explicit rather than
+                     inferred from a blank field - "I meant everything" and
+                     "I left it empty" must not be the same request. -->
+                <label class="small"><input type="checkbox" id="inv-all"> every group (one board of the whole fleet)</label>
+                <select id="inv-board">
+                    <option value="">first generation (auto-place everything)</option>
+                </select>
+                <button type="button" id="inv-export" class="btn-primary">Generate</button>
+            </div>
+            <div id="inv-msg" class="muted small"></div>
+
+            <!-- The way home. CSV both directions: CrossCanvas's inventory
+                 export carries x/y/width/height and the device fields, so
+                 RSCanvas never parses .xcanvas and never couples to its file
+                 version. -->
+            <div class="row">
+                <label for="imp-board">import layout into</label>
+                <select id="imp-board"></select>
+                <input type="file" id="imp-file" accept=".csv,text/csv,text/tab-separated-values">
+                <button type="button" id="imp-go">Import layout</button>
+            </div>
+            <div id="imp-msg" class="muted small"></div>
+            <div id="imp-unmatched" class="hints hidden"></div>
+
+            <form id="new-board-form" class="row">
+                <input type="text" id="nb-name" autocomplete="off" required
+                       placeholder="new EMPTY board name - boards from your groups come from Generate above">
+                <select id="nb-collection">
+                    <option value="wall">wall (live, shown on displays)</option>
+                    <option value="diagram">diagram (stored and shared)</option>
+                </select>
+                <button type="submit" class="btn-primary">Create</button>
+            </form>
+
+            <div id="tokens-for" class="hidden">
+                <h3>Displays for <span id="token-board-name"></span></h3>
+                <table class="list" id="tokens">
+                    <thead><tr>
+                        <th>label</th><th>created</th><th>last used</th><th>state</th><th></th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+                <div id="no-tokens" class="muted small hidden">no displays yet - mint a token below and
+                    open its URL on the screen that should show this board</div>
+                <form id="new-token-form" class="row token-mint">
+                    <input type="text" id="nt-label" class="grow"
+                           placeholder="which screen is this? e.g. NOC left panel" autocomplete="off" required>
+                    <button type="submit" class="btn-primary">Mint a display token</button>
+                </form>
+                <div id="token-once" class="hints hidden"></div>
+            </div>
+        </div>
+
+        <div class="panel hidden admin-only" data-section="system" id="audit-panel">
+            <h2>Audit <span id="audit-sub" class="muted"></span></h2>
+            <table class="list" id="audit">
+                <thead><tr>
+                    <th>when</th><th>who</th><th>action</th><th>target</th>
+                    <th>from</th><th>detail</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="no-audit" class="allquiet hidden"></div>
+        </div>
+    </div>
+</div>
+
+<script src="/themes.js"></script>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

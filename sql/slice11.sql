@@ -1,0 +1,114 @@
+-- Device grouping: location and application.
+--
+-- NUMBERING NOTE: this is not a build-plan slice. Slices 9 and 10 are spoken
+-- for (ping/reachability and event-driven alerting), so this takes 11 to sit
+-- after them in the apply order that src/db/apply-schema.ts derives from the
+-- filename. The loader only recognises slice<N>.sql and slice<N>-retention.sql,
+-- and adding a third pattern for one migration would be worse than a number.
+--
+-- WHAT THESE ARE FOR. Two optional, operator-assigned grouping axes:
+--
+--   location     where a device is - campus, building, floor, rack, or just
+--                "the cupboard". Also covers cloud-versus-on-premises, which
+--                is usually obvious from the hardware type anyway.
+--   application  what a device is FOR. Compound values are expected and
+--                encouraged: "PAM Prod" and "PAM Dev" carry the environment
+--                distinction without an environment axis, and the roster
+--                filter matches substrings so "PAM" still finds both.
+--
+-- THE ETHOS THEY MUST NOT BREAK: RSCanvas monitors and alerts on INDIVIDUAL
+-- DEVICES. These are nice-to-haves that only work if somebody does the
+-- tagging, so they are NULLABLE with no default and nothing anywhere may
+-- require them. A deployment where every one of these is empty has to be a
+-- fully working product.
+--
+-- WHY TWO NAMED COLUMNS RATHER THAN A LABELS BAG, since the bag was
+-- considered and is the more fashionable answer: the migration only runs one
+-- way. Columns to labels is one mechanical statement
+-- (jsonb_strip_nulls(jsonb_build_object('location', location, ...))), which
+-- drops unset keys cleanly. Labels to columns is not - it means deciding
+-- after the fact which keys were canonical and discarding the rest. Starting
+-- narrow costs no optionality; starting wide spends it. Promote the day a
+-- third axis is genuinely wanted.
+--
+-- THE INVARIANT, which is the load-bearing part and is enforced in code
+-- rather than here: THESE ARE OPERATOR-ASSIGNED AND NO MACHINE PATH MAY WRITE
+-- THEM. `sys_location` already exists on this table and is the obvious
+-- shortcut - it is also SNMP-reported, which means the monitored device
+-- controls it. No grouping that can gate an alert may be decided by the thing
+-- being monitored: a device compromised badly enough to lie about its
+-- location is exactly the one whose outage must not be folded into a summary.
+-- `devices.name` is the precedent - operator-assigned, which is why the
+-- hostile-render test had to be retargeted away from it.
+--
+-- tools/check-call-sites.mjs pins the single write path so this stays a
+-- property rather than a comment.
+--
+-- AND THE HALF THAT IS EASY TO LOSE AFTER A DAY OF THINKING ABOUT PROVENANCE:
+-- "operator-assigned" says who WROTE a value. It says nothing about what the
+-- value CONTAINS. An operator can type =HYPERLINK(...) into a location, or
+-- paste something out of a ticket they did not read, and it reaches a roster
+-- export exactly as a hostile ifAlias would. So these columns get the same
+-- treatment as any device string on the way out - the CSV formula guard in
+-- src/export/csv.ts and textContent-only rendering via public/dom.js, both of
+-- which are unconditional and ask nothing about origin. The two axes are
+-- orthogonal: provenance governs the WRITE side, escaping governs the READ
+-- side, and neither substitutes for the other.
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS location    text;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS application text;
+
+-- NO INDEXES, DELIBERATELY. `devices` holds 450 rows on the lab and about 600
+-- at the stated ceiling of 30,000 entities; a grouped scan of that is
+-- microseconds, and the roster's own filter runs client-side over an already
+-- fetched list. An index here would be cargo - added because grouping columns
+-- usually get one, not because anything measured wanted it. Revisit if a
+-- deployment ever makes `devices` large, which the architecture says it will
+-- not.
+
+-- --- boards remember which group they were generated from --------------------
+--
+-- The drift check ("3 devices at HQ are not on this board") needs to know what
+-- a board is a picture OF. The tempting version infers it - take the most
+-- common location among the board's devices and call that the board's group -
+-- and it is wrong for the reason this whole day keeps landing on: that is the
+-- machine manufacturing a claim nobody made, and it would be silently wrong
+-- for any board that legitimately spans two locations.
+--
+-- So it is RECORDED at generation time, by the operator who chose the group.
+-- Both columns NULL is the normal state for a hand-drawn board, and a board
+-- with no source gets NO drift check rather than a bad one: there is nothing
+-- it is supposed to contain, so nothing can be missing from it.
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS source_axis  text
+    CHECK (source_axis IS NULL OR source_axis IN ('location', 'application'));
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS source_value text;
+
+-- --- inventory attributes, read rarely --------------------------------------
+--
+-- SNMP carries two KINDS of value and this codebase had been treating them as
+-- one. Counters and status change every poll; the CPU model changes when
+-- somebody swaps hardware. Reading the second at the first one's cadence is
+-- pure waste, and it is the read-side twin of the write amplification this
+-- fork already removed.
+--
+-- WHY NOT READ IT ONCE AT DISCOVERY, which is the obvious answer and is the
+-- one the operator reached for first. Three ways it fails, and the third is
+-- the one that decides it:
+--   1. every device polled before this column existed would never get it, so
+--      the feature would need a backfill anyway;
+--   2. hardware does change - a VM migrated to a different host, a box
+--      replaced keeping its name and address - and a discovery-only read is
+--      wrong forever afterwards with nothing to correct it;
+--   3. A READ THAT FAILS ONCE FAILS PERMANENTLY. A slow agent, or an agent
+--      whose HOST-RESOURCES subtree is not up yet, would leave a device
+--      looking like "has no CPU" rather than "was never successfully asked" -
+--      the blind-instrument shape, where absence of data reads as data.
+--
+-- So: refreshed on a long cadence, and the timestamp records the ATTEMPT
+-- rather than the success. That distinction is load-bearing. A fleet whose
+-- agents do not expose HOST-RESOURCES at all - the lab's own mock fleet, for
+-- one - would otherwise be permanently stale and get re-asked on every single
+-- poll of every device, forever. Stamping the attempt means an unsupported
+-- device costs one cheap noSuchObject per day.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS cpu_model    text;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS inventory_ts timestamptz;

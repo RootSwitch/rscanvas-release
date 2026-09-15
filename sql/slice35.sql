@@ -1,0 +1,24 @@
+-- Slice 35: ping-only devices.
+--
+-- The operator's case is the external row at the top of a NOC wall: the
+-- internet itself, and each ISP handoff - things that answer ICMP and will
+-- never speak SNMP, watched so an outage is visible and alertable. Their
+-- Canvas Suite wall has had this for years; the fork could not express it,
+-- because every device was assumed to have an agent.
+--
+-- ONE COLUMN, because the reachability half already exists. reach_check has
+-- said 'icmp' since slice 12 and the sweep, the hysteresis, the degraded
+-- state, the transition log and the live RTT are all running today. What was
+-- missing is the ability to say "and there is no agent here" - so:
+--
+--   * the poll dispatcher skips these devices entirely (no session, no two
+--     five-second timeouts per cycle, no poll slot spent on a host that was
+--     never going to answer)
+--   * their status comes from REACH alone, through one shared expression
+--     rather than three copies
+--   * the collector-coverage watchdog stops counting them as unpolled, or a
+--     fleet of ping-only devices would read as "the collector has never
+--     polled anything" - which is the alarm that exists to catch a genuinely
+--     dead collector, and must not be fired by a deliberate configuration.
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS snmp_enabled boolean NOT NULL DEFAULT true;
