@@ -1,0 +1,47 @@
+{
+ "ok": true,
+ "events": [
+  {
+   "ts": "2026-09-24T13:07:13.779Z",
+   "name": "lab-node-16120",
+   "from_state": "unknown",
+   "to_state": "up",
+   "rtt_ms": 0.088
+  },
+  {
+   "ts": "2026-09-24T12:57:03.486Z",
+   "name": "lab-node-17974",
+   "from_state": "unknown",
+   "to_state": "up",
+   "rtt_ms": 0.336
+  },
+  {
+   "ts": "2026-09-24T12:57:03.486Z",
+   "name": "lab-node-17972",
+   "from_state": "unknown",
+   "to_state": "up",
+   "rtt_ms": 0.336
+  },
+  {
+   "ts": "2026-09-24T12:57:03.486Z",
+   "name": "lab-node-17973",
+   "from_state": "unknown",
+   "to_state": "up",
+   "rtt_ms": 0.336
+  },
+  {
+   "ts": "2026-09-24T12:57:03.486Z",
+   "name": "lab-node-17970",
+   "from_state": "unknown",
+   "to_state": "up",
+   "rtt_ms": 0.336
+  },
+  {
+   "ts": "2026-09-24T12:57:03.486Z",
+   "name": "lab-node-17971",
+   "from_state": "unknown",
+   "to_state": "up",
+   "rtt_ms": 0.336
+  }
+ ]
+}

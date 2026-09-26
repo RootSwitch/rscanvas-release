@@ -1,0 +1,352 @@
+{
+ "ok": true,
+ "partitions": [
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260924",
+   "est_rows": "53170712",
+   "bytes": "37410512896",
+   "pretty": "35 GB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260925",
+   "est_rows": "45742864",
+   "bytes": "32506961920",
+   "pretty": "30 GB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260926",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260927",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260928",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260929",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20260930",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20261001",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20261002",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "messages",
+   "partition_name": "messages_20261003",
+   "est_rows": "-1",
+   "bytes": "73728",
+   "pretty": "72 kB",
+   "has_trgm": true,
+   "has_host_trgm": true
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260924",
+   "est_rows": "34874292",
+   "bytes": "5197684736",
+   "pretty": "4957 MB",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260925",
+   "est_rows": "83144872",
+   "bytes": "11395301376",
+   "pretty": "11 GB",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260926",
+   "est_rows": "13656239",
+   "bytes": "1993695232",
+   "pretty": "1901 MB",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260927",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260928",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260929",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20260930",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20261001",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20261002",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples",
+   "partition_name": "samples_20261003",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples_hourly",
+   "partition_name": "samples_hourly_202609",
+   "est_rows": "1178436",
+   "bytes": "225263616",
+   "pretty": "215 MB",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples_hourly",
+   "partition_name": "samples_hourly_202610",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples_hourly",
+   "partition_name": "samples_hourly_202611",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  },
+  {
+   "parent": "samples_hourly",
+   "partition_name": "samples_hourly_202612",
+   "est_rows": "-1",
+   "bytes": "8192",
+   "pretty": "8192 bytes",
+   "has_trgm": false,
+   "has_host_trgm": false
+  }
+ ],
+ "jobs": [
+  {
+   "job": "partitions:monthly",
+   "through_ts": null,
+   "last_run_ts": "2026-09-26T03:54:34.572Z",
+   "last_ok_ts": "2026-09-26T03:54:34.572Z",
+   "runs": "49",
+   "failures": "0",
+   "detail": {
+    "last": "0 created"
+   }
+  },
+  {
+   "job": "retention:alerts",
+   "through_ts": null,
+   "last_run_ts": "2026-09-26T03:54:34.586Z",
+   "last_ok_ts": "2026-09-26T03:54:34.586Z",
+   "runs": "49",
+   "failures": "0",
+   "detail": {
+    "last": "pruned 0 cleared alert(s), 0 aged notification row(s), 0 expired window(s) past 90d, 0 ping sample(s) past 30d"
+   }
+  },
+  {
+   "job": "retention:corpses",
+   "through_ts": null,
+   "last_run_ts": "2026-09-26T03:54:34.567Z",
+   "last_ok_ts": "2026-09-26T03:54:34.567Z",
+   "runs": "49",
+   "failures": "0",
+   "detail": {
+    "last": "removed 0 superseded interface generation(s) untracked and stale past 7d"
+   }
+  },
+  {
+   "job": "retention:messages",
+   "through_ts": null,
+   "last_run_ts": "2026-09-26T03:54:34.579Z",
+   "last_ok_ts": "2026-09-26T03:54:34.579Z",
+   "runs": "49",
+   "failures": "45",
+   "detail": {
+    "last": "nothing expired"
+   }
+  },
+  {
+   "job": "retention:samples",
+   "through_ts": null,
+   "last_run_ts": "2026-09-26T03:54:34.566Z",
+   "last_ok_ts": "2026-09-26T03:54:34.566Z",
+   "runs": "49",
+   "failures": "45",
+   "detail": {
+    "last": "nothing expired"
+   }
+  },
+  {
+   "job": "rollup",
+   "through_ts": "2026-09-26T04:00:00.000Z",
+   "last_run_ts": "2026-09-26T04:14:19.420Z",
+   "last_ok_ts": "2026-09-26T04:14:19.420Z",
+   "runs": "504",
+   "failures": "0",
+   "detail": {
+    "last": "caught up: 1 chunk(s), 0 hours written"
+   }
+  },
+  {
+   "job": "trgm",
+   "through_ts": null,
+   "last_run_ts": "2026-09-26T03:54:34.581Z",
+   "last_ok_ts": "2026-09-26T03:54:34.581Z",
+   "runs": "20",
+   "failures": "0",
+   "detail": {
+    "last": "no change"
+   }
+  }
+ ],
+ "config": [
+  {
+   "name": "MESSAGE_RETENTION_DAYS",
+   "value": 7,
+   "means": "days of syslog and trap messages kept"
+  },
+  {
+   "name": "RAW_RETENTION_DAYS",
+   "value": 7,
+   "means": "days of raw samples kept (the rollup keeps the hourly summary longer)"
+  },
+  {
+   "name": "ALERT_RETENTION_DAYS",
+   "value": 90,
+   "means": "days a cleared alert and its delivery log are kept"
+  },
+  {
+   "name": "TRGM_RECENT_DAYS",
+   "value": 3,
+   "means": "days of message partitions carrying a trigram index, which is what free-text search can reach"
+  },
+  {
+   "name": "RETENTION_DRY_RUN",
+   "value": false,
+   "means": "when true the hourly job reports what it would drop and drops nothing"
+  },
+  {
+   "name": "RETENTION_MIN_KEEP_DAYS",
+   "value": 7,
+   "means": "floor: a keep_days below this is refused outright (guard 1)"
+  },
+  {
+   "name": "RETENTION_MAX_DROP_PER_RUN",
+   "value": 3,
+   "means": "most partitions one run may drop (guard 2)"
+  },
+  {
+   "name": "RETENTION_MIN_PARTITIONS",
+   "value": 2,
+   "means": "partitions that must survive whatever the horizon says (guard 3)"
+  },
+  {
+   "name": "RETENTION_MAX_SPAN_DAYS",
+   "value": 31,
+   "means": "a partition wider than this is never dropped (guard 4)"
+  },
+  {
+   "name": "RETENTION_INTERVAL_MS",
+   "value": 3600000,
+   "means": "how often the retention job runs"
+  }
+ ]
+}

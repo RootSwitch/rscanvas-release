@@ -1,0 +1,92 @@
+{
+ "ok": true,
+ "boards": [],
+ "gridFields": [
+  {
+   "key": "cpu",
+   "label": "CPU %",
+   "identity": false
+  },
+  {
+   "key": "mem",
+   "label": "memory %",
+   "identity": false
+  },
+  {
+   "key": "top",
+   "label": "top interface usage",
+   "identity": false
+  },
+  {
+   "key": "fs",
+   "label": "fullest filesystem %",
+   "identity": false
+  },
+  {
+   "key": "temp",
+   "label": "temperature",
+   "identity": false
+  },
+  {
+   "key": "errs",
+   "label": "interface errors/s",
+   "identity": false
+  },
+  {
+   "key": "uptime",
+   "label": "uptime",
+   "identity": false
+  },
+  {
+   "key": "ping",
+   "label": "ping rtt",
+   "identity": false
+  },
+  {
+   "key": "snmp",
+   "label": "SNMP rtt",
+   "identity": false
+  },
+  {
+   "key": "batt",
+   "label": "battery %",
+   "identity": false
+  },
+  {
+   "key": "runtime",
+   "label": "battery runtime",
+   "identity": false
+  },
+  {
+   "key": "stencil",
+   "label": "device type icon",
+   "identity": true
+  },
+  {
+   "key": "address",
+   "label": "IP address",
+   "identity": true
+  },
+  {
+   "key": "hardware",
+   "label": "hardware / CPU model",
+   "identity": true
+  },
+  {
+   "key": "topif",
+   "label": "top interface NAME",
+   "identity": true
+  },
+  {
+   "key": "fsname",
+   "label": "filesystem NAME",
+   "identity": true
+  }
+ ],
+ "gridDefaults": [
+  "cpu",
+  "mem",
+  "top",
+  "uptime"
+ ]
+}

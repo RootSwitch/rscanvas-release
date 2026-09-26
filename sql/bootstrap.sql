@@ -131,10 +131,17 @@ CREATE TABLE IF NOT EXISTS messages (
 ) PARTITION BY RANGE (ts);
 
 CREATE INDEX IF NOT EXISTS messages_ts_idx ON messages (ts DESC);
--- The fragment index. Partial addresses and partial interface names are what
--- people actually type into a syslog search, and a trigram GIN indexes exactly
--- that where a word tokenizer does not.
-CREATE INDEX IF NOT EXISTS messages_msg_trgm_idx ON messages USING gin (msg gin_trgm_ops);
+-- NO TRIGRAM INDEX ON THE PARENT (removed 2026-09-24). Partial addresses and
+-- interface names are what people type into a syslog search, and a trigram
+-- GIN serves them - but only on RECENT partitions, which the trigram sync
+-- builds and drops per partition (TRGM_RECENT_DAYS, slice 19). A partitioned
+-- index here gave EVERY partition a second, permanent msg GIN beside the
+-- sync's own, so the window never bounded message-text index storage and
+-- recent partitions paid two GIN inserts per row. Measured on the lab-5 ingest
+-- run: about a fifth of the write ceiling and 108 bytes a message
+-- (RESULTS-INGEST-2026-09-24.md). Existing databases lose it through
+-- slice53-retention.sql; search admission never counted it, because a day is
+-- covered only when host is indexed too, and host was always windowed.
 
 -- ensure_daily_partitions is NOT defined here. slice1.sql owns it, with the
 -- timezone pinning and SECURITY DEFINER that the spike's version lacks, and

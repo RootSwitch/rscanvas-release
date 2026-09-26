@@ -32,11 +32,26 @@ export function cell(text, cls) {
  */
 export function pill(text, cls) {
     const td = document.createElement('td');
+    td.appendChild(badge(text, cls));
+    return td;
+}
+
+/**
+ * The badge alone, for a cell that carries more than one thing.
+ *
+ * pill() returns a whole <td>, and appending one INSIDE another cell nests a
+ * table cell in a cell - which the browser wraps in an anonymous table of its
+ * own, with the cell padding again. The roster's transient row sat wider and
+ * taller than its neighbours that way (operator, 2026-09-25), and the speed
+ * column's "set" and "32-bit" badges, the rules' DISARMED and the
+ * credentials' "env var" did the same more quietly. A pill is a CELL; a
+ * badge is what goes inside one.
+ */
+export function badge(text, cls) {
     const span = document.createElement('span');
     span.className = cls;
     span.textContent = text ?? '';
-    td.appendChild(span);
-    return td;
+    return span;
 }
 
 /** A cell with a liveness dot before its label. */

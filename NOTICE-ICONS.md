@@ -1,5 +1,13 @@
 # Third-party artwork notices
 
+The RSCanvas mark (`public/favicon.svg`, the favicon and the header logo) is
+not third-party: it is the Canvas Suite mark, drawn by the author for the
+suite RSCanvas supersedes, and it is released with the project under the
+same licence. Nothing below applies to it. The same goes for its two raster
+copies, `public/favicon.ico` and `public/apple-touch-icon.png`: they are
+rendered from that SVG by `tools/make-favicons.mjs`, carry its hash, and are
+the same work at a fixed size.
+
 RSCanvas draws device-type icons on wall tiles. The artwork comes from two
 upstream sets, and `public/stencils.js` is generated from them by
 `tools/build-stencils.mjs`, which CLASSIFIES each icon by its own signature

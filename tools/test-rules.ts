@@ -136,6 +136,59 @@ console.log('alerting engine\n');
     } else bad('the reversal leaked past transient devices', JSON.stringify(srvIf));
 }
 
+// --- muted (slice 54) ---------------------------------------------------------
+//
+// A muted device emits NO condition of any kind - not null, not frozen: absent,
+// the way a muted interface rule is absent, so open alerts go missing and
+// retire as source-removed. Every rule family is fed something that WOULD
+// raise, and a byte-identical unmuted twin proves the data really does.
+
+{
+    const loud = (name: string, muted: boolean, transient = false): ScanDoc => ({
+        devices: [{ name, host: '10.0.0.20', status: 'down', transient, muted }],
+        interfaces: [{ id: `${name}:1`, code: `${name}-if`, name: 'eth0', device: { name },
+            adminStatus: 'up', operStatus: 'down', speedBps: 1e9, inBps: 9.5e8, inErrorsPerSec: 50 }],
+        metrics: [{ code: `${name}-cpu`, host: name, kind: 'cpu', value: 99 }],
+    });
+    const mutedDown = evaluate(loud('guest1', true), CONFIG);
+    if (mutedDown.length === 0) ok('a muted DOWN device emits nothing - no device-down, no interface, no metric condition');
+    else bad('a muted down device still emitted conditions', JSON.stringify(mutedDown.map((c) => c.key)));
+
+    // Up, so the interface and metric rules actually evaluate rather than
+    // being frozen behind device-down: the link is down, errors are high and
+    // the CPU is at 99 - three things that raise on the twin.
+    const upDoc = (name: string, muted: boolean): ScanDoc => {
+        const d = loud(name, muted);
+        (d.devices as NonNullable<ScanDoc['devices']>)[0]!.status = 'up';
+        return d;
+    };
+    const twin = evaluate(upDoc('guest2', false), CONFIG).filter((c) => c.severity !== null);
+    const mutedUp = evaluate(upDoc('guest2', true), CONFIG);
+    if (twin.length >= 3 && mutedUp.length === 0) {
+        ok(`a muted UP device emits nothing, where its unmuted twin raises ${twin.length} (link, errors, cpu...)`);
+    } else bad('muted up device', JSON.stringify({ twin: twin.map((c) => c.key), muted: mutedUp.map((c) => c.key) }));
+
+    if (evaluate(loud('guest3', true, true), CONFIG).length === 0) ok('muted wins over transient - nothing, not the quiet null');
+    else bad('muted + transient still emitted conditions');
+
+    // The embedded device block alone (older feed shape) mutes too, and a
+    // neighbour in the same document is untouched.
+    const mixed = evaluate({
+        interfaces: [
+            { id: 'g4:1', code: 'g4if', name: 'eth0', device: { name: 'g4', status: 'up', muted: true },
+                adminStatus: 'up', operStatus: 'down' },
+            { id: 'sw9:1', code: 'sw9if', name: 'Gi0/1', device: { name: 'sw9', status: 'up' },
+                adminStatus: 'up', operStatus: 'down' },
+        ],
+        metrics: [{ code: 'g4m', host: 'g4', kind: 'cpu', value: 99 }],
+    }, CONFIG);
+    const g4 = mixed.filter((c) => c.host === 'g4');
+    const sw9 = mixed.find((c) => c.key === 'if:sw9if:down');
+    if (g4.length === 0 && sw9?.severity === 'crit') {
+        ok('muted from an interface-embedded device block too, and the unmuted neighbour still raises');
+    } else bad('embedded-block mute or neighbour', JSON.stringify({ g4: g4.map((c) => c.key), sw9 }));
+}
+
 {
     // The half the ruling deliberately kept: a NIC that drops while its
     // transient device is PRESENT is information, and still alerts.

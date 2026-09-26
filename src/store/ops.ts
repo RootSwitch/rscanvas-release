@@ -16,7 +16,7 @@ import { pipeline } from 'node:stream/promises';
 import copyFrom from 'pg-copy-streams';
 import { CONFIG } from '../config.ts';
 import { laneQuery, onLane, type Outcome } from './pool.ts';
-import { copyLine, stripNul } from './copy.ts';
+import { copyChunks, copyLine, stripNul } from './copy.ts';
 import type { Clause } from '../search/grammar.ts';
 
 /**
@@ -62,9 +62,10 @@ export interface CopyResult {
 }
 
 /**
- * Bulk insert on the ingest lane. Rows are generated into the stream one at a
- * time rather than joined into one string, so a 2,000 row flush never
- * materialises as a single large buffer.
+ * Bulk insert on the ingest lane. Rows are generated into the stream in
+ * bounded chunks (copyChunks) rather than joined into one string, so a 2,000
+ * row flush never materialises as a single large buffer - and rather than one
+ * row per chunk, which cost two socket writes per message.
  */
 export async function copyMessages(rows: MessageRow[]): Promise<CopyResult> {
     let nulsStripped = 0;
@@ -73,30 +74,28 @@ export async function copyMessages(rows: MessageRow[]): Promise<CopyResult> {
         const sink = client.query(
             copyFrom.from(`COPY messages (${MESSAGE_COLUMNS.join(', ')}) FROM STDIN`),
         );
-        const source = Readable.from((function* () {
-            for (const r of rows) {
-                const msg = stripNul(r.msg);
-                const raw = stripNul(r.raw);
-                const host = r.host === null ? null : stripNul(r.host);
-                const app = r.app === null ? null : stripNul(r.app);
-                const procid = r.procid === null ? null : stripNul(r.procid);
-                nulsStripped += msg.stripped + raw.stripped
-                    + (host?.stripped ?? 0) + (app?.stripped ?? 0) + (procid?.stripped ?? 0);
-                yield copyLine([
-                    r.ts.toISOString(),
-                    r.msgTs === null ? null : r.msgTs.toISOString(),
-                    r.sourceIp,
-                    r.facility,
-                    r.severity,
-                    host === null ? null : host.text,
-                    app === null ? null : app.text,
-                    procid === null ? null : procid.text,
-                    r.proto,
-                    msg.text,
-                    raw.text,
-                ]);
-            }
-        })());
+        const source = Readable.from(copyChunks(rows, (r) => {
+            const msg = stripNul(r.msg);
+            const raw = stripNul(r.raw);
+            const host = r.host === null ? null : stripNul(r.host);
+            const app = r.app === null ? null : stripNul(r.app);
+            const procid = r.procid === null ? null : stripNul(r.procid);
+            nulsStripped += msg.stripped + raw.stripped
+                + (host?.stripped ?? 0) + (app?.stripped ?? 0) + (procid?.stripped ?? 0);
+            return copyLine([
+                r.ts.toISOString(),
+                r.msgTs === null ? null : r.msgTs.toISOString(),
+                r.sourceIp,
+                r.facility,
+                r.severity,
+                host === null ? null : host.text,
+                app === null ? null : app.text,
+                procid === null ? null : procid.text,
+                r.proto,
+                msg.text,
+                raw.text,
+            ]);
+        }));
 
         await pipeline(source, sink);
         return { rows: [] as never[], rowCount: rows.length };
@@ -138,17 +137,15 @@ export async function copySamples(rows: SampleRow[]): Promise<Outcome<never>> {
         const sink = client.query(
             copyFrom.from(`COPY samples (${SAMPLE_COLUMNS.join(', ')}) FROM STDIN`),
         );
-        const source = Readable.from((function* () {
-            for (const r of rows) {
-                yield copyLine([
-                    r.entityId,
-                    r.ts.toISOString(),
-                    r.status,
-                    r.rttMs,
-                    ...r.v,
-                ]);
-            }
-        })());
+        // In chunks, not a row at a time: see COPY_CHUNK_CHARS for the stall
+        // the per-row form put on the collector thread at 30k entities.
+        const source = Readable.from(copyChunks(rows, (r) => copyLine([
+            r.entityId,
+            r.ts.toISOString(),
+            r.status,
+            r.rttMs,
+            ...r.v,
+        ])));
         await pipeline(source, sink);
         return { rows: [] as never[], rowCount: rows.length };
     });
@@ -408,12 +405,14 @@ export type SearchRefusal = {
  * raised before the sync catches up. One fact, not a fact and a proxy.
  *
  * A partition is covered when a VALID, READY gin index exists on msg AND on
- * host - by indexed COLUMN, not by index name, because msg's index arrives
- * two ways (the parent's partitioned GIN gives every partition an auto child
- * at creation; the sync builds its own per-partition one) and host's only
- * arrives via the sync. Queried per search on the same lane the search runs
- * on: a ~15-row catalog join, and a cache would be another proxy with its
- * own drift.
+ * host - by indexed COLUMN, not by index name. Until 2026-09-24 msg's index
+ * arrived two ways (a partitioned GIN on the parent gave every partition an
+ * auto child, beside the sync's own); the parent index is gone now
+ * (slice53-retention.sql), so both columns arrive only via the sync - but a
+ * database that has not yet applied slice 53 still carries the inherited
+ * one, and checking by column keeps admission right on either. Queried per
+ * search on the same lane the search runs on: a ~15-row catalog join, and a
+ * cache would be another proxy with its own drift.
  */
 export interface TrgmCoverageDay { day: string; covered: boolean }
 
@@ -2629,6 +2628,13 @@ export const OPS = {
         UPDATE devices SET transient = $2
          WHERE name = ANY($1::text[]) RETURNING name`, [names, transient]),
 
+    /** Mute or unmute devices' alerts (slice 54): one device from its page,
+     *  a selection from the roster - the same statement either way. */
+    setMutedForDevices: (names: string[], muted: boolean) => laneQuery<{ name: string }>(
+        'interactive', `
+        UPDATE devices SET alerts_muted = $2
+         WHERE name = ANY($1::text[]) RETURNING name`, [names, muted]),
+
     /**
      * The write path reach_check waited for (DECISIONS-2026-09-01 ruling 6):
      * the column dispatched and alarmed since 2026-08-31 and could still
@@ -4632,6 +4638,164 @@ export const OPS = {
          WHERE e.code = $1 AND h.hour_ts >= $2 AND h.hour_ts < $3
          ORDER BY 1`, [code, from, to]),
 
+    // --- reporting: the Dashboard's top lists and the interface report --------
+    //
+    // All of it reads samples_hourly - the per-hour mean rates, their sample
+    // counts and the hourly peaks - so 24 hours is 24 narrow rows per entity
+    // (568 ms for all 23,788 interfaces of the 30k lab, previous window
+    // included). src/reports/traffic.ts turns the sums into bytes, counts,
+    // coverage and trend; these return the sums. Heavy lane: fleet-wide
+    // aggregation is exactly what that lane is for, and main caches the
+    // Dashboard's answer per window so open browsers do not multiply it.
+
+    /** The hour the rollup has consumed through: the end of every report
+     *  window, because the rollup writes only complete hours. */
+    rollupFrontier: () => laneQuery<{ through_ts: Date | null }>('interactive', `
+        SELECT through_ts FROM job_state WHERE job = 'rollup'`),
+
+    /**
+     * Top interfaces over [lo, hi) three ways - received, transmitted, and
+     * errors plus discards - each with the same interface's sums over the
+     * previous window [prevLo, lo) for the trend. One scan of the hourly
+     * rows serves all three lists.
+     *
+     * Coverage per hour is min(1, samples x poll interval / 3600): a fully
+     * polled hour counts 1, a missing one 0.
+     */
+    dashboardInterfaces: (prevLo: Date, lo: Date, hi: Date, limit: number) => laneQuery<{
+        list: 'rx' | 'tx' | 'errs'; rk: number;
+        device: string; code: string; name: string | null; alias: string | null; speed_bps: string | null;
+        in_s: number | null; out_s: number | null; pk_in: number | null; pk_out: number | null;
+        err_s: number | null; disc_s: number | null; cov_h: number | null;
+        p_in_s: number | null; p_out_s: number | null; p_ed_s: number | null; p_cov_h: number | null;
+    }>('heavy', `
+        WITH agg AS (
+            SELECT h.entity_id,
+                   sum(h.a0) FILTER (WHERE h.hour_ts >= $2) AS in_s,
+                   sum(h.a1) FILTER (WHERE h.hour_ts >= $2) AS out_s,
+                   max(h.m0) FILTER (WHERE h.hour_ts >= $2) AS pk_in,
+                   max(h.m1) FILTER (WHERE h.hour_ts >= $2) AS pk_out,
+                   sum(coalesce(h.a2, 0) + coalesce(h.a3, 0)) FILTER (WHERE h.hour_ts >= $2) AS err_s,
+                   sum(coalesce(h.a4, 0) + coalesce(h.a5, 0)) FILTER (WHERE h.hour_ts >= $2) AS disc_s,
+                   sum(least(1, coalesce(coalesce(h.n0, h.n) * d.poll_interval_s / 3600.0, 0)))
+                       FILTER (WHERE h.hour_ts >= $2) AS cov_h,
+                   sum(h.a0) FILTER (WHERE h.hour_ts < $2) AS p_in_s,
+                   sum(h.a1) FILTER (WHERE h.hour_ts < $2) AS p_out_s,
+                   sum(coalesce(h.a2, 0) + coalesce(h.a3, 0) + coalesce(h.a4, 0) + coalesce(h.a5, 0))
+                       FILTER (WHERE h.hour_ts < $2) AS p_ed_s,
+                   sum(least(1, coalesce(coalesce(h.n0, h.n) * d.poll_interval_s / 3600.0, 0)))
+                       FILTER (WHERE h.hour_ts < $2) AS p_cov_h
+              FROM samples_hourly h
+              JOIN entities e ON e.id = h.entity_id AND e.kind = 'if'
+              JOIN devices d ON d.id = e.device_id
+             WHERE h.hour_ts >= $1 AND h.hour_ts < $3
+             GROUP BY h.entity_id
+        ), ranked AS (
+            (SELECT 'rx' AS list, row_number() OVER (ORDER BY in_s DESC) AS rk, agg.*
+               FROM agg WHERE in_s > 0 ORDER BY in_s DESC LIMIT $4)
+            UNION ALL
+            (SELECT 'tx', row_number() OVER (ORDER BY out_s DESC), agg.*
+               FROM agg WHERE out_s > 0 ORDER BY out_s DESC LIMIT $4)
+            UNION ALL
+            (SELECT 'errs', row_number() OVER (ORDER BY err_s + disc_s DESC), agg.*
+               FROM agg WHERE err_s + disc_s > 0 ORDER BY err_s + disc_s DESC LIMIT $4)
+        )
+        SELECT r.list, r.rk::int AS rk, d.name AS device, e.code, e.name, e.alias,
+               coalesce(e.speed_override_bps, e.speed_bps)::text AS speed_bps,
+               r.in_s::float8 AS in_s, r.out_s::float8 AS out_s,
+               r.pk_in::float8 AS pk_in, r.pk_out::float8 AS pk_out,
+               r.err_s::float8 AS err_s, r.disc_s::float8 AS disc_s, r.cov_h::float8 AS cov_h,
+               r.p_in_s::float8 AS p_in_s, r.p_out_s::float8 AS p_out_s, r.p_ed_s::float8 AS p_ed_s,
+               r.p_cov_h::float8 AS p_cov_h
+          FROM ranked r
+          JOIN entities e ON e.id = r.entity_id
+          JOIN devices d ON d.id = e.device_id
+         ORDER BY r.list, r.rk`, [prevLo, lo, hi, limit]),
+
+    /**
+     * Highest CPU and memory over [lo, hi), by the window's mean, with the
+     * peak and the previous window's mean. CPU rows carry a percentage in
+     * a0; memory rows carry USED bytes in a0 and SIZE in a1, so memory is
+     * 100 x a0 / a1 per hour, and its peak 100 x m0 / a1. Means are
+     * weighted by each hour's sample count - averaging the hourly averages
+     * would mis-weight the hours the poller struggled.
+     */
+    dashboardSensors: (prevLo: Date, lo: Date, hi: Date, limit: number) => laneQuery<{
+        list: 'cpu' | 'mem'; rk: number; device: string; code: string; name: string | null;
+        mean_pct: number | null; peak_pct: number | null; cov_h: number | null; p_mean_pct: number | null;
+        p_cov_h: number | null;
+    }>('heavy', `
+        WITH hours AS (
+            SELECT h.entity_id, e.kind, h.hour_ts, coalesce(h.n0, h.n) AS n0, d.poll_interval_s,
+                   CASE WHEN e.kind = 'mem' THEN 100 * h.a0 / nullif(h.a1, 0) ELSE h.a0 END AS pct,
+                   CASE WHEN e.kind = 'mem' THEN 100 * h.m0 / nullif(h.a1, 0) ELSE h.m0 END AS peak
+              FROM samples_hourly h
+              JOIN entities e ON e.id = h.entity_id AND e.kind IN ('cpu', 'mem')
+              JOIN devices d ON d.id = e.device_id
+             WHERE h.hour_ts >= $1 AND h.hour_ts < $3
+        ), agg AS (
+            SELECT entity_id, kind,
+                   sum(pct * n0) FILTER (WHERE hour_ts >= $2)
+                       / nullif(sum(n0) FILTER (WHERE hour_ts >= $2 AND pct IS NOT NULL), 0) AS mean_pct,
+                   max(peak) FILTER (WHERE hour_ts >= $2) AS peak_pct,
+                   sum(least(1, coalesce(n0 * poll_interval_s / 3600.0, 0))) FILTER (WHERE hour_ts >= $2) AS cov_h,
+                   sum(pct * n0) FILTER (WHERE hour_ts < $2)
+                       / nullif(sum(n0) FILTER (WHERE hour_ts < $2 AND pct IS NOT NULL), 0) AS p_mean_pct,
+                   sum(least(1, coalesce(n0 * poll_interval_s / 3600.0, 0))) FILTER (WHERE hour_ts < $2) AS p_cov_h
+              FROM hours GROUP BY entity_id, kind
+        ), ranked AS (
+            SELECT agg.*, row_number() OVER (PARTITION BY kind ORDER BY mean_pct DESC) AS rk
+              FROM agg WHERE mean_pct IS NOT NULL
+        )
+        SELECT r.kind AS list, r.rk::int AS rk, d.name AS device, e.code, e.name,
+               r.mean_pct::float8 AS mean_pct, r.peak_pct::float8 AS peak_pct,
+               r.cov_h::float8 AS cov_h, r.p_mean_pct::float8 AS p_mean_pct, r.p_cov_h::float8 AS p_cov_h
+          FROM ranked r
+          JOIN entities e ON e.id = r.entity_id
+          JOIN devices d ON d.id = e.device_id
+         WHERE r.rk <= $4
+         ORDER BY r.kind, r.rk`, [prevLo, lo, hi, limit]),
+
+    /**
+     * The interface report: one row per chosen interface per calendar day in
+     * `tz`, from `fromDay` to `toDay` inclusive, for the days that had begun
+     * by the rollup frontier. A day with no hourly rows still returns (LEFT
+     * JOIN) with null sums and zero coverage, so a gap is a line saying so
+     * rather than a missing date. expected_h is the day's hours inside the
+     * rollup - 24, or 23 and 25 on DST days, or fewer on the current day.
+     */
+    trafficReport: (codes: string[], fromDay: string, toDay: string, tz: string, frontier: Date) => laneQuery<{
+        day: string; device: string; name: string | null; alias: string | null; code: string;
+        sum_in: number | null; sum_out: number | null; peak_in: number | null; peak_out: number | null;
+        covered_h: number | null; expected_h: number;
+    }>('heavy', `
+        WITH days AS (
+            SELECT g::date AS day,
+                   (g::date::timestamp AT TIME ZONE $4) AS lo,
+                   ((g::date + 1)::timestamp AT TIME ZONE $4) AS hi
+              FROM generate_series($2::date, $3::date, interval '1 day') AS g
+        ), ents AS (
+            SELECT e.id, e.code, e.name, e.alias, d.name AS device, d.poll_interval_s
+              FROM entities e JOIN devices d ON d.id = e.device_id
+             WHERE e.code = ANY($1::text[])
+        )
+        SELECT to_char(dy.day, 'YYYY-MM-DD') AS day, en.device, en.name, en.alias, en.code,
+               sum(h.a0)::float8 AS sum_in, sum(h.a1)::float8 AS sum_out,
+               max(h.m0)::float8 AS peak_in, max(h.m1)::float8 AS peak_out,
+               -- least() IGNORES NULLS: least(1, NULL) is 1, not NULL. A day with no
+               -- hourly rows reaches here as one LEFT JOIN row of NULLs, and the
+               -- bare form counted it as a covered hour - every empty day read
+               -- "4%" in the first rendered report. coalesce to 0 first.
+               sum(least(1, coalesce(coalesce(h.n0, h.n) * en.poll_interval_s / 3600.0, 0)))::float8 AS covered_h,
+               greatest(0, extract(epoch FROM least(dy.hi, $5) - dy.lo) / 3600.0)::float8 AS expected_h
+          FROM days dy
+         CROSS JOIN ents en
+          LEFT JOIN samples_hourly h
+            ON h.entity_id = en.id AND h.hour_ts >= dy.lo AND h.hour_ts < dy.hi AND h.hour_ts < $5
+         WHERE dy.lo < $5
+         GROUP BY dy.day, dy.lo, dy.hi, en.device, en.name, en.alias, en.code
+         ORDER BY en.device, en.name, dy.day`, [codes, fromDay, toDay, tz, frontier]),
+
     uiDevices: (limit: number = UI_PAGE_CAP) => laneQuery<{
         name: string; host: string; status: string; last_poll_ts: Date;
         last_seen_ts: Date | null; poll_interval_s: number;
@@ -4639,9 +4803,10 @@ export const OPS = {
         poll_lag_ms: number | null; ping_rtt_ms: number | null;
         snmp_rtt_ms: number | null;
         credential_ref: string; snmp_enabled: boolean;
-        entities: number; open_alerts: number; worst: string | null;
+        entities: number; tracked_ifs: number; tracked_sensors: number;
+        open_alerts: number; worst: string | null;
         location: string | null; application: string | null;
-        transient: boolean;
+        transient: boolean; alerts_muted: boolean;
         // The aggregate columns (SLICE-ROSTER-COLUMNS-PLAN): null means no
         // fresh reading of that kind, never zero.
         cpu_pct: number | null; mem_pct: number | null;
@@ -4690,6 +4855,14 @@ export const OPS = {
                CASE WHEN d.status = 'up' THEN d.snmp_rtt_ms END::float8 AS snmp_rtt_ms,
                d.credential_ref,
                coalesce(e.n, 0)::int AS entities,
+               -- The roster's "interfaces" column counted ALL tracked
+               -- entities, sensors included (operator, 2026-09-23: "seems to be
+               -- a count of tracked sensors rather than interfaces"). Split
+               -- inside the same grouped pass - no second scan - the way the
+               -- onboarding preview already split them. "entities" stays the
+               -- total for API callers that read it.
+               coalesce(e.n_if, 0)::int AS tracked_ifs,
+               coalesce(e.n - e.n_if, 0)::int AS tracked_sensors,
                coalesce(a.n, 0)::int AS open_alerts,
                a.worst,
                -- Two more columns on a statement whose whole history is about
@@ -4697,7 +4870,7 @@ export const OPS = {
                -- so they add no join, no scan and no per-device work. The
                -- query budget test pins that claim.
                d.location, d.application,
-               d.transient,
+               d.transient, d.alerts_muted,
                -- THE SUMMARY COLUMNS (slice 20), written by the collector at
                -- poll time and read here as plain columns: the aggregate form
                -- failed its budget at 450 devices (SLICE-ROSTER-COLUMNS-PLAN,
@@ -4728,7 +4901,8 @@ export const OPS = {
                CASE WHEN d.status = 'up' THEN d.uptime_s END::float8 AS uptime_s,
                d.cpu_cores, d.ram_kb::float8 AS ram_kb
           FROM devices d
-          LEFT JOIN (SELECT device_id, count(*) AS n
+          LEFT JOIN (SELECT device_id, count(*) AS n,
+                            count(*) FILTER (WHERE kind = 'if') AS n_if
                        FROM entities WHERE tracked GROUP BY device_id) e
                  ON e.device_id = d.id
           LEFT JOIN (SELECT host, count(*) AS n, min(severity) AS worst
@@ -4771,7 +4945,7 @@ export const OPS = {
      */
     alertScanDevices: () => laneQuery<{
         name: string; host: string; status: string; transient: boolean;
-        snmp_enabled: boolean;
+        alerts_muted: boolean; snmp_enabled: boolean;
         poll_age_s: number; poll_interval_s: number;
     }>('alerts', `
         -- EFFECTIVE status merges both instruments (slice 9): ICMP-down wins
@@ -4785,7 +4959,7 @@ export const OPS = {
         -- interface freeze downstream of it applies unchanged at ICMP speed.
         SELECT name, host(host) AS host,
                ${deviceStatusSql('devices')} AS status,
-               transient, snmp_enabled,
+               transient, alerts_muted, snmp_enabled,
                -- ONE CLOCK: the age is computed by POSTGRES, against the same
                -- now() that stamped last_poll_ts in recordDevicePoll. The scan
                -- previously compared the jobs worker's JS clock against these

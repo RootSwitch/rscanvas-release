@@ -223,21 +223,19 @@ async function retention(table: 'samples' | 'messages', keepDays: number): Promi
 // Raising TRGM_RECENT_DAYS is what makes this matter: it brings populated
 // partitions into the window all at once, and before this split every one of
 // them was a blocking GIN build against the live ingest path.
-// KNOWN, DECIDED, DEFERRED (2026-07-28): this job currently builds a
-// DUPLICATE msg gin on every populated partition, because the parent's
-// partitioned index (messages_msg_trgm_idx, spike schema) already gives each
-// partition an auto child and this sync checks for its OWN index name rather
-// than a gin on the column. A partitioned index cannot be windowed - children
-// appear on every partition, no exceptions - so TRGM_RECENT_DAYS has NEVER
-// bounded msg storage, only host's. The window's founding commit (f7bcf90)
-// is explicit that it exists for STORAGE ("nothing in this repo can choose
-// between 4.8GB of disk and two seconds on a rare query"), so the fix that
-// keeps faith with it is to DROP the parent partitioned index and let this
-// sync own msg exactly as it owns host - admission already reads coverage
-// from pg_index, so a windowed msg is a fact it sees, not an assumption.
-// Deferred until after the soak's judgement day: the load profile stays
-// constant while the plateau claim accrues, and the write-amplification
-// measurement describes the duplicate-index system it was taken on.
+// DONE 2026-09-24 (was KNOWN, DECIDED, DEFERRED since 2026-07-28): this job
+// used to build a DUPLICATE msg gin on every populated partition, because the
+// parent's partitioned index (messages_msg_trgm_idx, from the spike schema)
+// gave each partition an auto child and this sync checks for its OWN index
+// name rather than a gin on the column. A partitioned index cannot be
+// windowed, so TRGM_RECENT_DAYS never bounded msg storage, only host's. The
+// window's founding commit (f7bcf90) says it exists for STORAGE, and the fix
+// that kept faith with it was to drop the parent index and let this sync own
+// msg exactly as it owns host. The lab-5 ingest run measured the duplicate at
+// about a fifth of the ingest write ceiling and 108 bytes a message, and the
+// operator approved the drop: bootstrap.sql no longer creates it and
+// slice53-retention.sql removes it from existing databases. Admission reads
+// coverage from pg_index by column, so it sees the windowed msg as a fact.
 /**
  * Targets currently deferred, and since when.
  *

@@ -32,7 +32,10 @@ bundle built on one platform runs on another. Copy it to the target box.
     cd /opt/rscanvas
     sudo ./rscanvas-setup.sh --tls
 
-What it does, in order: installs packages; creates three database roles
+What it does, in order: installs packages; raises `net.core.rmem_max` to
+16 MB in `/etc/sysctl.d/60-rscanvas.conf` (never lowering a larger value), so
+the 8 MB receive buffers the syslog and trap sockets ask for are not clamped
+to the kernel's 208 KB default; creates three database roles
 (`rscanvas` for the application, `rscanvas_owner` for the schema,
 `rscanvas_admin` for maintenance DDL); creates the database and applies every
 schema slice; hardens the roles so the application role owns nothing it does

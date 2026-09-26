@@ -1,0 +1,82 @@
+{
+ "ok": true,
+ "from": "2026-09-24",
+ "to": "2026-09-25",
+ "tz": "America/Chicago",
+ "through": "2026-09-26T04:00:00.000Z",
+ "lines": [
+  {
+   "day": "2026-09-24",
+   "device": "lab-node-16100",
+   "iface": "Gi0/1",
+   "description": "link 1",
+   "inGB": 916.718,
+   "outGB": 320.851,
+   "totalGB": 1237.569,
+   "peakInMbps": 179.59,
+   "peakOutMbps": 62.86,
+   "coveragePct": 65
+  },
+  {
+   "day": "2026-09-25",
+   "device": "lab-node-16100",
+   "iface": "Gi0/1",
+   "description": "link 1",
+   "inGB": 1243.425,
+   "outGB": 435.199,
+   "totalGB": 1678.624,
+   "peakInMbps": 175.17,
+   "peakOutMbps": 61.31,
+   "coveragePct": 98
+  },
+  {
+   "day": "total 2026-09-24 to 2026-09-25",
+   "device": "lab-node-16100",
+   "iface": "Gi0/1",
+   "description": "link 1",
+   "inGB": 2160.143,
+   "outGB": 756.05,
+   "totalGB": 2916.193,
+   "peakInMbps": 179.59,
+   "peakOutMbps": 62.86,
+   "coveragePct": 82
+  },
+  {
+   "day": "2026-09-24",
+   "device": "lab-node-16100",
+   "iface": "Gi0/16",
+   "description": "link 16",
+   "inGB": 28147.176,
+   "outGB": 9851.512,
+   "totalGB": 37998.687,
+   "peakInMbps": 5805.54,
+   "peakOutMbps": 2031.94,
+   "coveragePct": 65
+  },
+  {
+   "day": "2026-09-25",
+   "device": "lab-node-16100",
+   "iface": "Gi0/16",
+   "description": "link 16",
+   "inGB": 38239.693,
+   "outGB": 13383.892,
+   "totalGB": 51623.585,
+   "peakInMbps": 5510.77,
+   "peakOutMbps": 1928.77,
+   "coveragePct": 98
+  },
+  {
+   "day": "total 2026-09-24 to 2026-09-25",
+   "device": "lab-node-16100",
+   "iface": "Gi0/16",
+   "description": "link 16",
+   "inGB": 66386.868,
+   "outGB": 23235.404,
+   "totalGB": 89622.272,
+   "peakInMbps": 5805.54,
+   "peakOutMbps": 2031.94,
+   "coveragePct": 82
+  }
+ ],
+ "missing": []
+}

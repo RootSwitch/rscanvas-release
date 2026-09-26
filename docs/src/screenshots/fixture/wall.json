@@ -1,0 +1,950 @@
+{
+ "ok": true,
+ "name": "Lab racks",
+ "collection": "wall",
+ "shapes": [
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 130,
+   "id": "g8",
+   "kind": "device",
+   "label": "lab-node-16107",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16107",
+   "fields": {
+    "cpu": 7,
+    "mem": 38,
+    "top": 3764958572.8649735,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 650,
+   "id": "g30",
+   "kind": "device",
+   "label": "lab-node-16129",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16129",
+   "fields": {
+    "cpu": 18,
+    "mem": 38,
+    "top": 3157403418.254764,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 260,
+   "id": "g12",
+   "kind": "device",
+   "label": "lab-node-16111",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16111",
+   "fields": {
+    "cpu": 22,
+    "mem": 38,
+    "top": 4320868203.367917,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 910,
+   "id": "g37",
+   "kind": "device",
+   "label": "lab-node-16136",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16136",
+   "fields": {
+    "cpu": 6,
+    "mem": 38,
+    "top": 3710992993.7792106,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 130,
+   "id": "g10",
+   "kind": "device",
+   "label": "lab-node-16109",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16109",
+   "fields": {
+    "cpu": 7,
+    "mem": 38,
+    "top": 3079015378.570505,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 910,
+   "id": "g40",
+   "kind": "device",
+   "label": "lab-node-16139",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16139",
+   "fields": {
+    "cpu": 10,
+    "mem": 38,
+    "top": 3757142308.233547,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 0,
+   "id": "g4",
+   "kind": "device",
+   "label": "lab-node-16103",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16103",
+   "fields": {
+    "cpu": 10,
+    "mem": 38,
+    "top": 3114142676.7987065,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 780,
+   "id": "g35",
+   "kind": "device",
+   "label": "lab-node-16134",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16134",
+   "fields": {
+    "cpu": 9,
+    "mem": 38,
+    "top": 3126984159.637775,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 390,
+   "id": "g16",
+   "kind": "device",
+   "label": "lab-node-16115",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16115",
+   "fields": {
+    "cpu": 14,
+    "mem": 38,
+    "top": 4166458669.253403,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 1040,
+   "id": "g44",
+   "kind": "device",
+   "label": "lab-node-17973",
+   "stale": false,
+   "alerts": 1,
+   "device": "lab-node-17973",
+   "fields": {
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "down",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 520,
+   "id": "g22",
+   "kind": "device",
+   "label": "lab-node-16121",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16121",
+   "fields": {
+    "cpu": 8,
+    "mem": 38,
+    "top": 3459843527.815468,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 390,
+   "id": "g18",
+   "kind": "device",
+   "label": "lab-node-16117",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16117",
+   "fields": {
+    "cpu": 8,
+    "mem": 38,
+    "top": 4123750075.598706,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 910,
+   "id": "g38",
+   "kind": "device",
+   "label": "lab-node-16137",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16137",
+   "fields": {
+    "cpu": 10,
+    "mem": 38,
+    "top": 3578416563.329234,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 130,
+   "id": "g9",
+   "kind": "device",
+   "label": "lab-node-16108",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16108",
+   "fields": {
+    "cpu": 24,
+    "mem": 38,
+    "top": 3543257229.4758625,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 780,
+   "id": "g31",
+   "kind": "device",
+   "label": "lab-node-16130",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16130",
+   "fields": {
+    "cpu": 16,
+    "mem": 38,
+    "top": 3732254568.15549,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 260,
+   "id": "g13",
+   "kind": "device",
+   "label": "lab-node-16112",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16112",
+   "fields": {
+    "cpu": 15,
+    "mem": 38,
+    "top": 3782734753.4414787,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 390,
+   "id": "g17",
+   "kind": "device",
+   "label": "lab-node-16116",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16116",
+   "fields": {
+    "cpu": 19,
+    "mem": 38,
+    "top": 3678181678.7042127,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 0,
+   "id": "g2",
+   "kind": "device",
+   "label": "lab-node-16101",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16101",
+   "fields": {
+    "cpu": 20,
+    "mem": 38,
+    "top": 3987008003.603604,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 910,
+   "id": "g36",
+   "kind": "device",
+   "label": "lab-node-16135",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16135",
+   "fields": {
+    "cpu": 6,
+    "mem": 38,
+    "top": 3524038402.9947076,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 1040,
+   "id": "g41",
+   "kind": "device",
+   "label": "lab-node-17970",
+   "stale": false,
+   "alerts": 1,
+   "device": "lab-node-17970",
+   "fields": {
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "down",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 390,
+   "id": "g20",
+   "kind": "device",
+   "label": "lab-node-16119",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16119",
+   "fields": {
+    "cpu": 8,
+    "mem": 38,
+    "top": 3244121819.394528,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 520,
+   "id": "g21",
+   "kind": "device",
+   "label": "lab-node-16120",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16120",
+   "fields": {
+    "cpu": 8,
+    "mem": 38,
+    "top": 3396828640.1398644,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 520,
+   "id": "g25",
+   "kind": "device",
+   "label": "lab-node-16124",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16124",
+   "fields": {
+    "cpu": 3,
+    "mem": 38,
+    "top": 4932928414.993047,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 910,
+   "id": "g39",
+   "kind": "device",
+   "label": "lab-node-16138",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16138",
+   "fields": {
+    "cpu": 23,
+    "mem": 38,
+    "top": 3049606698.6549406,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 650,
+   "id": "g27",
+   "kind": "device",
+   "label": "lab-node-16126",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16126",
+   "fields": {
+    "cpu": 10,
+    "mem": 38,
+    "top": 3779017743.3676934,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 650,
+   "id": "g28",
+   "kind": "device",
+   "label": "lab-node-16127",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16127",
+   "fields": {
+    "cpu": 15,
+    "mem": 38,
+    "top": 4218938151.019088,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 130,
+   "id": "g7",
+   "kind": "device",
+   "label": "lab-node-16106",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16106",
+   "fields": {
+    "cpu": 12,
+    "mem": 38,
+    "top": 4063590075.0323415,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 260,
+   "id": "g14",
+   "kind": "device",
+   "label": "lab-node-16113",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16113",
+   "fields": {
+    "cpu": 10,
+    "mem": 38,
+    "top": 3771891303.679297,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 390,
+   "id": "g19",
+   "kind": "device",
+   "label": "lab-node-16118",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16118",
+   "fields": {
+    "cpu": 9,
+    "mem": 38,
+    "top": 4581925707.225565,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 650,
+   "id": "g29",
+   "kind": "device",
+   "label": "lab-node-16128",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16128",
+   "fields": {
+    "cpu": 18,
+    "mem": 38,
+    "top": 3756438872.6007986,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 0,
+   "id": "g3",
+   "kind": "device",
+   "label": "lab-node-16102",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16102",
+   "fields": {
+    "cpu": 9,
+    "mem": 38,
+    "top": 3526980115.919629,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 260,
+   "id": "g11",
+   "kind": "device",
+   "label": "lab-node-16110",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16110",
+   "fields": {
+    "cpu": 9,
+    "mem": 38,
+    "top": 3476652614.5280333,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 780,
+   "id": "g33",
+   "kind": "device",
+   "label": "lab-node-16132",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16132",
+   "fields": {
+    "cpu": 12,
+    "mem": 38,
+    "top": 3558404709.480915,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 520,
+   "id": "g23",
+   "kind": "device",
+   "label": "lab-node-16122",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16122",
+   "fields": {
+    "cpu": 21,
+    "mem": 38,
+    "top": 3271570852.0591373,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 0,
+   "id": "g1",
+   "kind": "device",
+   "label": "lab-node-16100",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16100",
+   "fields": {
+    "cpu": 22,
+    "mem": 38,
+    "top": 3447099344.410681,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 780,
+   "id": "g32",
+   "kind": "device",
+   "label": "lab-node-16131",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16131",
+   "fields": {
+    "cpu": 4,
+    "mem": 38,
+    "top": 3253606502.7237353,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 210,
+   "y": 1040,
+   "id": "g42",
+   "kind": "device",
+   "label": "lab-node-17971",
+   "stale": false,
+   "alerts": 1,
+   "device": "lab-node-17971",
+   "fields": {
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "down",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 780,
+   "id": "g34",
+   "kind": "device",
+   "label": "lab-node-16133",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16133",
+   "fields": {
+    "cpu": 2,
+    "mem": 38,
+    "top": 3268125843.3576317,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 130,
+   "id": "g6",
+   "kind": "device",
+   "label": "lab-node-16105",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16105",
+   "fields": {
+    "cpu": 6,
+    "mem": 38,
+    "top": 4567629847.636916,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 420,
+   "y": 1040,
+   "id": "g43",
+   "kind": "device",
+   "label": "lab-node-17972",
+   "stale": false,
+   "alerts": 1,
+   "device": "lab-node-17972",
+   "fields": {
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "down",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 0,
+   "y": 650,
+   "id": "g26",
+   "kind": "device",
+   "label": "lab-node-16125",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16125",
+   "fields": {
+    "cpu": 9,
+    "mem": 38,
+    "top": 4292741132.246377,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 630,
+   "y": 520,
+   "id": "g24",
+   "kind": "device",
+   "label": "lab-node-16123",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16123",
+   "fields": {
+    "cpu": 5,
+    "mem": 38,
+    "top": 3249244673.677398,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 0,
+   "id": "g5",
+   "kind": "device",
+   "label": "lab-node-16104",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16104",
+   "fields": {
+    "cpu": 14,
+    "mem": 38,
+    "top": 3848527847.8289046,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 260,
+   "id": "g15",
+   "kind": "device",
+   "label": "lab-node-16114",
+   "stale": false,
+   "alerts": 5,
+   "device": "lab-node-16114",
+   "fields": {
+    "cpu": 12,
+    "mem": 38,
+    "top": 3765666365.624798,
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "up",
+   "maintenance": false
+  },
+  {
+   "h": 100,
+   "w": 190,
+   "x": 840,
+   "y": 1040,
+   "id": "g45",
+   "kind": "device",
+   "label": "lab-node-17974",
+   "stale": false,
+   "alerts": 1,
+   "device": "lab-node-17974",
+   "fields": {
+    "ping": 0,
+    "stencil": "server"
+   },
+   "status": "down",
+   "maintenance": false
+  }
+ ],
+ "interactive": true,
+ "grid": {
+  "cols": 0,
+  "fields": [
+   "stencil",
+   "cpu",
+   "mem",
+   "top",
+   "ping"
+  ],
+  "sections": null,
+  "sectioned": false
+ }
+}

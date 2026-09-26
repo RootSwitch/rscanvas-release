@@ -5,11 +5,27 @@
 // The render primitives live in dom.js so the hostile round-trip test can
 // exercise THE SAME CODE the browser runs rather than a re-implementation.
 
-import { cell, pill, dotCell, rowEl } from './dom.js';
+import { cell, pill, badge, dotCell, rowEl } from './dom.js';
 import { parseHosts } from './parse.js';
 import * as Charts from './charts.js';
 
 const $ = (id) => document.getElementById(id);
+
+// WHAT THIS USER MAY DO, from the server (2026-09-25). /api/me and login
+// carry `can`, the role's actions read from the same table authorize() uses,
+// and every write control on the page names the action its route enforces
+// in data-can. The page used to know only "admin or not", which hid
+// operator controls from operators (untrack, mute) and showed viewers forms
+// the server then refused (maintenance, grouping, transient, export). This
+// is still not the access control - every route enforces - it is which
+// doors are advertised. check-can-attrs.mjs refuses a data-can or can()
+// naming an action the server does not have, because a typo here fails
+// CLOSED and silently: the control just never appears. Declared first so
+// nothing that runs during load can reach it before it exists.
+let myCan = new Set();
+const can = (action) => myCan.has(action);
+/** data-can may name alternatives separated by spaces: shown if ANY is held. */
+const canAny = (spec) => String(spec || '').split(/\s+/).filter(Boolean).some(can);
 
 async function api(path, opts) {
     const res = await fetch(path, { credentials: 'same-origin', ...opts });
@@ -320,7 +336,27 @@ function renderAlertDetail(a, history) {
             && a.threshold !== null && a.threshold_now !== a.threshold) {
             txt += ` - now ${fmtValue(a.threshold_now, a.unit)}, was ${fmtValue(a.threshold, a.unit)} when this fired`;
         }
-        facts.appendChild(factLine('threshold set by', txt));
+        // if-down is a yes/no rule with no threshold to have set.
+        facts.appendChild(factLine(a.kind === 'if-down' ? 'rule set by' : 'threshold set by', txt));
+    }
+    // MUTE FROM HERE (operator, 2026-09-23: the Alerts page was where they
+    // looked for it, and found only the event rules, which are about syslog).
+    // Offered on alerts that carry a per-entity rule the scan evaluates:
+    // interface and sensor alerts. device-down keys by host and has the
+    // transient declaration as its lever; event alerts belong to their rule.
+    // Code scope only - the wider scopes live on the device page's gears.
+    detailAlert = a;
+    {
+        const mb = $('alert-mute');
+        const mutable = can('alertrule.write') && !!a.code && a.kind !== 'device-down' && a.kind !== 'event'
+            && a.state !== 'cleared' && !a.threshold_muted;
+        mb.classList.toggle('hidden', !mutable);
+        if (mutable) {
+            const on = String(a.kind).startsWith('if-') ? 'this interface' : 'this sensor';
+            mb.textContent = `Mute ${a.kind === 'if-down' ? 'link-down' : a.kind} alerts on ${on}`;
+            mb.title = 'Suspend this one rule for this one interface or sensor. Polling and history continue, '
+                + 'this alert clears as source-removed within a few scans, and the device page shows the mute and undoes it.';
+        }
     }
     // The wedge, said out loud (easy-win E8). Clearing is judged against the
     // stored threshold - the one this incident crossed - so raising the
@@ -469,6 +505,8 @@ async function showAlert(id) {
     $('alert-sub').textContent = '';
     $('alert-facts').replaceChildren();
     $('alert-history').querySelector('tbody').replaceChildren();
+    $('alert-mute').classList.add('hidden');
+    $('alert-mute-msg').textContent = '';
     const r = await api(`/api/alert?id=${encodeURIComponent(id)}`);
     if (r.status === 401) { showLogin(); return; }
     if (!r.ok) {
@@ -486,19 +524,43 @@ function showAlertList() {
 }
 
 $('alert-back').addEventListener('click', showAlertList);
+// The alert the detail panel last rendered, for the mute button's handler:
+// renderAlertDetail runs on every refresh, the listener is wired once.
+let detailAlert = null;
+$('alert-mute').addEventListener('click', async () => {
+    const a = detailAlert;
+    if (!a || !a.code) return;
+    const r = await saveThreshold({
+        kind: a.kind, host: null, code: a.code, warn: null, crit: null, enabled: false,
+        note: `muted from alert ${a.id}`,
+    });
+    $('alert-mute-msg').textContent = r.ok
+        ? `${r.detail}. This alert clears as source-removed within a few scans; unmute from the device page.`
+        : (r.detail || `refused (${r.status})`);
+    if (!r.ok) return;
+    const id = currentAlert;
+    const d = await api(`/api/alert?id=${encodeURIComponent(id)}`);
+    if (d.ok && currentAlert === id) renderAlertDetail(d.alert, d.history || []);
+});
 $('alert-filter').addEventListener('input', () => renderAlerts(null));
 $('alert-scope').addEventListener('change', () => renderAlerts(null));
 
 // --- event rules (slice 10) ---------------------------------------------------
 
-/** Fetch and render the rules editor. Admin-only by role; the API enforces
- *  regardless - this just avoids advertising a door that will not open. */
+/** Fetch and render the rules (System tab since 2026-09-25). Operators read
+ *  the list (alertrule.read); the enable and delete buttons, like the add
+ *  row, are built only for a role that may write rules. The API enforces
+ *  regardless - this is which doors are advertised. */
 async function loadEventRules() {
     const r = await api('/api/alert-rules');
     if (!r.ok) return;
+    const rules = r.rules || [];
+    const armed = rules.filter((x) => x.enabled).length;
+    $('rules-sub').textContent = rules.length === 0 ? 'none yet'
+        : `${rules.length} rule(s), ${armed} enabled`;
     const tbody = $('rules-table').querySelector('tbody');
     tbody.replaceChildren();
-    for (const rule of r.rules || []) {
+    for (const rule of rules) {
         const del = document.createElement('button');
         del.type = 'button';
         del.textContent = 'delete';
@@ -525,7 +587,7 @@ async function loadEventRules() {
             loadEventRules();
         });
         const actions = document.createElement('td');
-        actions.append(en, document.createTextNode(' '), del);
+        if (can('alertrule.write')) actions.append(en, document.createTextNode(' '), del);
 
         // "enabled: yes" and "matching nothing" can both be true: the
         // ingest worker disarms a rule whose regex blows the step budget,
@@ -537,7 +599,7 @@ async function loadEventRules() {
         const enCell = cell(rule.enabled ? 'yes' : 'no', rule.enabled ? '' : 'muted');
         if (disarmed) {
             enCell.appendChild(document.createTextNode(' '));
-            enCell.appendChild(pill('DISARMED', 'badge fail'));
+            enCell.appendChild(badge('DISARMED', 'badge fail'));
             enCell.title = 'the ingest worker stopped running this pattern - it took too long on a single message; editing the pattern is what rearms it';
         }
         const tr = rowEl([
@@ -686,7 +748,8 @@ const DEVICE_SORTS = {
         return String(a.host).localeCompare(String(b.host));
     },
     status: (a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)),
-    entities: (a, b) => (b.entities ?? 0) - (a.entities ?? 0),
+    entities: (a, b) => (b.tracked_ifs ?? b.entities ?? 0) - (a.tracked_ifs ?? a.entities ?? 0),
+    tracked_sensors: (a, b) => (b.tracked_sensors ?? 0) - (a.tracked_sensors ?? 0),
     open_alerts: (a, b) => (b.open_alerts ?? 0) - (a.open_alerts ?? 0),
     last_poll_ts: (a, b) => Date.parse(b.last_poll_ts ?? 0) - Date.parse(a.last_poll_ts ?? 0),
     last_seen_ts: (a, b) => Date.parse(b.last_seen_ts ?? 0) - Date.parse(a.last_seen_ts ?? 0),
@@ -941,6 +1004,34 @@ async function setTransientSelected(transient) {
 }
 $('roster-transient').addEventListener('click', () => setTransientSelected(true));
 $('roster-untransient').addEventListener('click', () => setTransientSelected(false));
+
+// Slice 54: mute for the selection - the device page's toggle, made about a
+// set the operator has already chosen. Same route, same audit.
+async function setMutedSelected(muted) {
+    const names = [...selected];
+    if (names.length === 0) return;
+    const gate = $('roster-gate');
+    gate.replaceChildren();
+    gate.classList.remove('hidden');
+    const r = await api('/api/devices/mute', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ names, muted }),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        gate.appendChild(factLine('refused', r.detail || `http ${r.status}`));
+        return;
+    }
+    const n = (r.changed || []).length;
+    gate.appendChild(factLine(muted ? 'muted' : 'unmuted',
+        muted
+            ? `${n} device(s) muted - nothing on them raises, and anything open clears within a few scans`
+            : `${n} device(s) unmuted - anything still true raises again on the next scan`));
+    const d = await api('/api/devices');
+    if (d.ok) renderDevices(d);
+}
+$('roster-mute').addEventListener('click', () => setMutedSelected(true));
+$('roster-unmute').addEventListener('click', () => setMutedSelected(false));
 $('roster-setcred').addEventListener('click', () => setCredentialSelected(false));
 $('roster-rediscover').addEventListener('click', () => rediscoverSelected(false));
 $('roster-rediscover-reset').addEventListener('click', () => rediscoverSelected(true));
@@ -1000,34 +1091,35 @@ const ROSTER_COLS = [
         // notYetMeasured, not !last_poll_ts: a ping-only device never gets a
         // poll and read `pending` permanently.
         const unpolled = notYetMeasured(d);
-        // Slice 25: a transient device that is down reads OFF, in the quiet
-        // badge, never the red one - the column agrees with the dot or the
-        // classification isn't real.
-        const off = d.transient === true && d.status === 'down';
-        const c = unpolled
-            ? pill('pending', 'badge')
-            : off
-                ? pill('off', 'badge maint')
-                : pill(d.status, `badge ${d.status === 'up' ? 'ok' : d.status === 'down' ? 'fail' : ''}`);
-        if (unpolled) c.title = 'added, not yet polled - the first poll is due within one interval';
-        if (off) c.title = 'transient device, not answering - off is a state, not a fault';
-        // THE DECLARATION IS VISIBLE WHILE THE DEVICE IS PRESENT, not only
-        // when it is away as "off": the operator found that the device page's
-        // checkbox was the sole in-app sign a device was transient, after an
-        // email about a present laptop's GPU - which transient never
-        // promised to silence (rulings quiet 2 and 4 keep the present half),
-        // but a declaration nobody can see is a declaration nobody can
-        // reason about. Same dashed badge as "off" - the decision vocabulary.
-        if (d.transient === true && !off) {
-            const wrap = cell('');
-            const t = pill('transient', 'badge maint');
-            t.title = 'declared transient: absence is a state, not a fault - device-down never raises. '
-                + 'Its readings still alert while it is present; a standing notify policy '
-                + '(System tab) is what silences delivery for a device, location or application.';
-            wrap.append(c, document.createTextNode(' '), t);
-            return wrap;
+        // ONE BADGE IN ONE CELL (operator, 2026-09-25). A transient device
+        // used to show its status AND a second "transient" pill, built as a
+        // table cell nested inside this one, which pushed its row out of
+        // line with every other. A transient device now reads "transient"
+        // IN PLACE of up or down, coloured by the same status - green
+        // present, red away - so the declaration and the state are one
+        // shape (the operator's own proposal). The dot beside the name keeps
+        // the quiet "off" rendering, so a transient device that is away
+        // still does not look like an outage at a glance.
+        const td = document.createElement('td');
+        const cls = `badge ${d.status === 'up' ? 'ok' : d.status === 'down' ? 'fail' : ''}`;
+        const b = unpolled ? badge('pending', 'badge')
+            : d.transient === true ? badge('transient', cls)
+                : badge(d.status, cls);
+        if (unpolled) b.title = 'added, not yet polled - the first poll is due within one interval';
+        else if (d.transient === true) {
+            b.title = `transient, ${d.status === 'up' ? 'present' : d.status === 'down' ? 'away - off is a state, not a fault' : d.status}: `
+                + 'device-down never raises for it. Its readings still alert while it is present '
+                + 'unless its alerts are muted too.';
         }
-        return c;
+        td.appendChild(b);
+        // Muted (slice 54) rides beside the status, dashed like the other
+        // declarations: it is a decision about the device, not its state.
+        if (d.alerts_muted === true) {
+            const m = badge('muted', 'badge maint');
+            m.title = 'alerts muted: nothing on this device raises - down, interfaces, sensors';
+            td.append(document.createTextNode(' '), m);
+        }
+        return td;
     } },
     { key: 'reach', label: 'reach', sort: 'reach', on: true, cell: (d) => {
         // BLANK WHEN UP, a pill otherwise - the same rule as the grouping
@@ -1054,7 +1146,19 @@ const ROSTER_COLS = [
     // empty cell already reads as "not set".
     { key: 'location', label: 'location', sort: 'location', on: true, cell: (d) => clipCell(d.location ?? '', 'muted') },
     { key: 'application', label: 'application', sort: 'application', on: true, cell: (d) => clipCell(d.application ?? '', 'muted') },
-    { key: 'entities', label: 'interfaces', th: 'num', sort: 'entities', on: true, cell: (d) => cell(String(d.entities), 'num') },
+    // TWO COUNTS, NOT ONE (operator, 2026-09-23). The column said
+    // "interfaces" and counted every tracked entity, sensors included, so a
+    // switch with 24 watched ports and 4 sensors read 28. The key stays
+    // 'entities' so saved column orders keep their place; the sensors column
+    // is new and lands at the end of a saved order, like any added column.
+    // Both count TRACKED rows - the ones that alert and chart - and the
+    // header titles say so, because the device page lists untracked ones too.
+    { key: 'entities', label: 'interfaces', th: 'num', sort: 'entities', on: true,
+      title: 'Tracked interfaces - the ones that alert and chart. The device page also lists the untracked ones.',
+      cell: (d) => cell(String(d.tracked_ifs ?? d.entities), 'num') },
+    { key: 'tracked_sensors', label: 'sensors', th: 'num', sort: 'tracked_sensors', on: true,
+      title: 'Tracked sensors - cpu, memory, filesystems, temperatures and the rest',
+      cell: (d) => cell(d.tracked_sensors > 0 ? String(d.tracked_sensors) : '', 'num') },
     { key: 'open_alerts', label: 'open alerts', th: 'num', sort: 'open_alerts', on: true, cell: (d) => {
         const c = cell(d.open_alerts > 0 ? String(d.open_alerts) : '', 'num');
         if (d.worst === 'crit') c.classList.add('cell-crit');
@@ -1323,6 +1427,14 @@ function renderDevices(data) {
         // worse than a short list.
         deviceCapped = data.capped === true;
         deviceTotal = typeof data.total === 'number' ? data.total : lastDevices.length;
+        // The open device's name line reads the roster row, so it follows
+        // every roster fetch - the 10s refresh and each save's refetch alike.
+        renderDeviceHeader();
+        // So does the report's device list, and it must be HERE, where the
+        // roster has just landed: filled from refresh()'s Dashboard branch it
+        // ran before the first roster at sign-in and sat empty for a whole
+        // refresh interval - found by the screenshot run timing out on it.
+        fillReportDevices();
     }
     const all = lastDevices;
     const q = $('device-filter').value.trim().toLowerCase();
@@ -1501,10 +1613,10 @@ function speedEditButton(e, td) {
 function speedCell(e) {
     const override = e.speed_override_bps;
     const bps = override && override > 0 ? override : e.speed_bps;
-    const canTune = (myRole === 'admin' || myRole === 'operator')
+    const canTune = can('device.speed')
         && e.tracked && (!e.kind || e.kind === 'if') && e.snmp_index !== null && e.snmp_index !== undefined;
     if (e.speed_untrusted && !(override > 0)) {
-        const c = pill('unrated', 'badge stale');
+        const c = badge('unrated', 'badge stale');
         c.title = 'Advertised speed disproven by measured traffic (common on virtio and Hyper-V NICs)'
             + ' - utilization is suspended. Set a speed override to restore it.';
         const td = document.createElement('td');
@@ -1520,7 +1632,7 @@ function speedCell(e) {
     const td = cell(txt, 'num');
     if (override > 0) {
         td.appendChild(document.createTextNode(' '));
-        const b = pill('set', 'badge');
+        const b = badge('set', 'badge');
         b.title = 'Operator speed override - utilization uses this, not the advertised speed';
         td.appendChild(b);
     }
@@ -1531,7 +1643,7 @@ function speedCell(e) {
     // the full sentence, the badge says there is a sentence to read.
     if (e.hc_missing) {
         td.appendChild(document.createTextNode(' '));
-        const b = pill('32-bit', 'badge');
+        const b = badge('32-bit', 'badge');
         b.title = 'no 64-bit (ifHC) counters - rates use wrap-corrected 32-bit counters';
         td.appendChild(b);
     }
@@ -1780,10 +1892,22 @@ async function openRttChart(name) {
     });
 }
 
-$('chart-close').addEventListener('click', () => {
+/**
+ * Close the chart and orphan any reply still in flight for it.
+ *
+ * A CHART BELONGS TO THE DEVICE IT WAS OPENED ON (operator, 2026-09-24): it
+ * used to survive Back and a different device, still titled with the old
+ * sensor, until closed by hand or replaced by another click. Leaving a device
+ * closes it now; the generation bump makes a late reply for the old chart
+ * drop itself at openChart's guard instead of redrawing on the new page.
+ */
+function closeChart() {
     chartEntity = null;
+    chartGen += 1;
     $('chart-wrap').classList.add('hidden');
-});
+}
+
+$('chart-close').addEventListener('click', closeChart);
 $('chart-range').addEventListener('change', () => {
     if (chartEntity === null) return;
     if (chartEntity.rttDevice) openRttChart(chartEntity.rttDevice);
@@ -1891,27 +2015,34 @@ function renderSensorCards(sensors) {
             // "we saw this and chose not to watch it" stays visible.
             card.className = 'card untracked';
         }
-        const nm = document.createElement('div');
+        // THE NAME TRUNCATES, THE CONTROLS DO NOT (operator, 2026-09-23: a
+        // long ZFS dataset name on a TrueNAS box pushed "untrack" out of the
+        // card). The buttons used to live INSIDE the ellipsis box with the
+        // text, so a long name clipped them along with itself. Now the head
+        // is a row: the name takes what is left and ellipsizes, the buttons
+        // keep their width, and the full name is on the name's tooltip.
+        const head = document.createElement('div');
+        head.className = 'card-head';
+        const nm = document.createElement('span');
         nm.className = 'card-name';
         nm.textContent = s.name;
-        if ((myRole === 'admin' || myRole === 'operator') && s.snmp_index !== null) {
-            nm.appendChild(trackButton(s));
+        nm.title = s.name;
+        head.appendChild(nm);
+        if (can('device.track') && s.snmp_index !== null) {
+            head.appendChild(trackButton(s));
         }
         // The threshold control lives on the card because that is where the
         // decision is made: looking at the reading and saying "this is fine
-        // here". Hidden for roles that cannot write rules, by the same
-        // admin-only class the page already gates.
-        if (isAdmin && s.code) {
+        // here". Built only for a role that can write rules (alertrule.write).
+        if (can('alertrule.write') && s.code) {
             const dev = currentDevice === null ? null : lastDevices.find((d) => d.name === currentDevice);
             const g = thresholdControl(s, dev);
-            g.classList.add('admin-only');
-            nm.appendChild(g);
+            head.appendChild(g);
         }
-        nm.title = s.name;
         const val = document.createElement('div');
         val.className = 'card-value';
         val.textContent = s.tracked ? p.value : 'not watched';
-        card.append(nm, val);
+        card.append(head, val);
         // Provenance ON the card (2026-08-27): a muted sensor looked
         // identical to a watched one, and the answer lived pages away in a
         // table of bare codes. A line appears only when something differs
@@ -1924,13 +2055,19 @@ function renderSensorCards(sensors) {
             th.className = 'muted small';
             if (s.threshold.muted) {
                 th.textContent = `alerts MUTED (${srcLabel}) `;
-                const un = document.createElement('button');
-                un.type = 'button';
-                un.className = 'small admin-only';
-                un.textContent = 'unmute';
-                un.title = 'Remove the mute; the next tier or the default applies on the next scan';
-                un.addEventListener('click', (ev) => { ev.stopPropagation(); unmuteSensor(s); });
-                th.appendChild(un);
+                // Built only for a role that can write rules. The class that
+                // used to gate it did nothing: the page's gate sweep runs
+                // once at login, before any card exists, so every role saw
+                // this button and every role but admin was refused on click.
+                if (can('alertrule.write')) {
+                    const un = document.createElement('button');
+                    un.type = 'button';
+                    un.className = 'small';
+                    un.textContent = 'unmute';
+                    un.title = 'Remove the mute; the next tier or the default applies on the next scan';
+                    un.addEventListener('click', (ev) => { ev.stopPropagation(); unmuteSensor(s); });
+                    th.appendChild(un);
+                }
             } else {
                 th.textContent = `warn ${s.threshold.warn ?? 'off'} / crit ${s.threshold.crit ?? 'off'} (${srcLabel})`;
             }
@@ -2009,6 +2146,175 @@ function trackButton(e) {
     return b;
 }
 
+// --- per-interface alert rules (2026-09-23) -----------------------------------
+//
+// THE GAP: sensor cards had a gear with Mute; interface rows had only
+// untrack, which also stops the charts. The engine always honoured a
+// per-interface override - the four interface rules resolve by code like any
+// sensor - so this is the page catching up, not a new mechanism: the same
+// /api/thresholds rows, the same three scopes, the engine's own kind names.
+// Muting keeps polling and history; the open alert clears as source-removed.
+const IF_RULES = [
+    ['if-down', 'link down'], ['if-errors', 'errors'],
+    ['if-discards', 'discards'], ['if-util', 'utilization'],
+];
+const IF_RULE_LABEL = new Map(IF_RULES);
+let lastIfRuleDefaults = null;
+
+function ifScopeWords(source, device) {
+    return source === 'override' ? 'this interface'
+        : source === 'host override' ? `every interface on ${device}`
+            : source === 'kind override' ? 'every interface everywhere' : 'default';
+}
+
+/** The provenance badge on an interface row: which rules are muted, or that
+ *  a threshold differs from the default. Null when everything is default -
+ *  the quiet norm draws nothing. */
+function ifRuleBadge(e) {
+    if (!e.ifRules) return null;
+    const muted = IF_RULES.filter(([k]) => e.ifRules[k]?.muted);
+    const tuned = IF_RULES.filter(([k]) => !e.ifRules[k]?.muted
+        && e.ifRules[k] && e.ifRules[k].source !== 'default' && e.ifRules[k].source !== 'none');
+    if (muted.length === 0 && tuned.length === 0) return null;
+    const lines = [
+        ...muted.map(([k, l]) => `${l}: muted (${ifScopeWords(e.ifRules[k].source, currentDevice)})`),
+        ...tuned.map(([k, l]) => `${l}: warn ${e.ifRules[k].warn ?? 'off'} / crit ${e.ifRules[k].crit ?? 'off'} (${ifScopeWords(e.ifRules[k].source, currentDevice)})`),
+    ];
+    const text = muted.length === IF_RULES.length ? 'muted'
+        : muted.length > 0 ? `${muted.map(([, l]) => l).join(', ')} muted`
+            : 'custom thresholds';
+    // A span, not pill(): pill() builds a whole cell, and this sits inside
+    // the name cell beside the interface's name.
+    const b = document.createElement('span');
+    b.className = muted.length > 0 ? 'badge warn if-rule-badge' : 'badge if-rule-badge';
+    b.textContent = text;
+    b.title = lines.join('\n') + (muted.length > 0 ? '\npolling and history continue; muted rules raise nothing' : '');
+    return b;
+}
+
+/** Remove the mutes governing this interface, after naming each one. The
+ *  scope comes from the server-resolved source, exactly as unmuteSensor
+ *  finds its row, so precedence stays decided in the engine. */
+async function unmuteInterface(e) {
+    const muted = IF_RULES.filter(([k]) => e.ifRules?.[k]?.muted);
+    if (muted.length === 0) return;
+    const list = await api('/api/thresholds');
+    if (list.status === 401) { showLogin(); return; }
+    if (!list.ok) { window.alert(list.detail || `could not load overrides (${list.status})`); return; }
+    const rows = new Map();
+    const said = [];
+    for (const [k, l] of muted) {
+        const src = e.ifRules[k].source;
+        const row = (list.overrides || []).find((o) => o.kind === k && (
+            src === 'override' ? o.code === e.code
+                : src === 'host override' ? (o.code === null && o.host === currentDevice)
+                    : (o.code === null && o.host === null)));
+        if (row && !rows.has(row.id)) { rows.set(row.id, row); said.push(`${l} (${ifScopeWords(src, currentDevice)})`); }
+    }
+    if (rows.size === 0) { window.alert('those mutes are already gone - refresh to see the current state'); return; }
+    if (!window.confirm(`Remove ${rows.size === 1 ? 'this mute' : `these ${rows.size} mutes`}: ${said.join(', ')}? `
+        + 'The next tier or the default applies on the next scan.')) return;
+    for (const id of rows.keys()) {
+        const r = await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
+        });
+        if (r.status === 401) { showLogin(); return; }
+        if (!r.ok) { window.alert(r.detail || `refused (${r.status})`); break; }
+    }
+    if (currentDevice) await showDevice(currentDevice);
+}
+
+/**
+ * The per-interface control: a gear that opens a form ROW beneath the
+ * interface. Which rule (all four, or one), which scope (this interface,
+ * every interface on this device, every interface everywhere), levels for
+ * the three rate rules, and Mute. Link down is a yes/no rule, so it offers
+ * Mute alone.
+ */
+function ifRuleControl(e, tr) {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'card-gear'; btn.textContent = '⚙';
+    btn.title = 'Mute this interface\'s alerts, or set its error, discard and utilization thresholds';
+    btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();   // the row itself opens the history chart
+        const next = tr.nextElementSibling;
+        if (next && next.classList.contains('th-row')) { next.remove(); return; }
+        const row = document.createElement('tr');
+        row.className = 'th-row';
+        const td = document.createElement('td');
+        td.colSpan = tr.children.length;
+        const f = document.createElement('form');
+        f.className = 'th-form row';
+        const which = document.createElement('select');
+        for (const [v, l] of [['all', 'all alerts'], ...IF_RULES]) {
+            const o = document.createElement('option'); o.value = v; o.textContent = l; which.appendChild(o);
+        }
+        const scope = document.createElement('select');
+        for (const [v, l] of [['code', 'this interface'], ['host-kind', `every interface on ${currentDevice}`], ['kind', 'every interface everywhere']]) {
+            const o = document.createElement('option'); o.value = v; o.textContent = l; scope.appendChild(o);
+        }
+        const warn = document.createElement('input'); warn.type = 'number'; warn.step = 'any'; warn.placeholder = 'warn'; warn.size = 6;
+        const crit = document.createElement('input'); crit.type = 'number'; crit.step = 'any'; crit.placeholder = 'crit'; crit.size = 6;
+        const note = document.createElement('input'); note.type = 'text'; note.placeholder = 'why (optional)'; note.size = 18;
+        const save = document.createElement('button'); save.type = 'submit'; save.className = 'btn-primary'; save.textContent = 'Set';
+        const mute = document.createElement('button'); mute.type = 'button'; mute.textContent = 'Mute';
+        mute.title = 'Suspend the chosen rule(s) at the chosen scope. Polling and history continue; an open alert clears as source-removed.';
+        const msg = document.createElement('span'); msg.className = 'muted small';
+        // Levels only mean something for the three rate rules. The inputs
+        // prefill with what applies now: this row's override, else the
+        // server's effective default.
+        const syncLevels = () => {
+            const k = which.value;
+            const leveled = k !== 'all' && k !== 'if-down';
+            for (const el of [warn, crit, save]) el.classList.toggle('hidden', !leveled);
+            warn.value = ''; crit.value = '';
+            if (!leveled) return;
+            const cur = e.ifRules?.[k] && !e.ifRules[k].muted ? e.ifRules[k] : lastIfRuleDefaults?.[k];
+            if (cur?.warn !== null && cur?.warn !== undefined) warn.value = String(cur.warn);
+            if (cur?.crit !== null && cur?.crit !== undefined) crit.value = String(cur.crit);
+        };
+        which.addEventListener('change', syncLevels);
+        syncLevels();
+        const bodyFor = (kind, enabled) => ({
+            kind,
+            host: scope.value === 'host-kind' ? currentDevice : null,
+            code: scope.value === 'code' ? e.code : null,
+            warn: enabled && warn.value !== '' ? Number(warn.value) : null,
+            crit: enabled && crit.value !== '' ? Number(crit.value) : null,
+            enabled, note: note.value,
+        });
+        const finish = async (results) => {
+            const bad = results.filter((r) => !r.ok);
+            msg.textContent = bad.length === 0
+                ? (results.length === 1 ? results[0].detail : `${results.length} rules suspended - live on the next scan`)
+                : `${results.length - bad.length} of ${results.length} saved; refused: ${bad.map((r) => r.detail || r.status).join('; ')}`;
+            if (bad.length === 0) {
+                setTimeout(async () => { row.remove(); if (currentDevice) await showDevice(currentDevice); }, 1500);
+                if (lastThresholds !== null) { const d = await api('/api/thresholds'); if (d.ok) renderThresholds(d); }
+            }
+        };
+        f.addEventListener('submit', async (ev) => {
+            ev.preventDefault();
+            finish([await saveThreshold(bodyFor(which.value, true))]);
+        });
+        mute.addEventListener('click', async () => {
+            const kinds = which.value === 'all' ? IF_RULES.map(([k]) => k) : [which.value];
+            // Everywhere is a fleet-wide decision made from one row, so it
+            // is the one scope that asks first.
+            if (scope.value === 'kind' && !window.confirm(
+                `Mute ${which.value === 'all' ? 'every interface alert' : IF_RULE_LABEL.get(which.value)} on EVERY interface of EVERY device?`)) return;
+            const results = [];
+            for (const k of kinds) results.push(await saveThreshold(bodyFor(k, false)));
+            finish(results);
+        });
+        f.append(which, scope, warn, crit, note, save, mute, msg);
+        td.appendChild(f);
+        row.appendChild(td);
+        tr.after(row);
+    });
+    return btn;
+}
+
 // The open alerts for the device on screen, worst first then oldest - the
 // same order as the Alerts section, because an operator who just read that
 // page should not have to re-learn the sort here. Rows click through to the
@@ -2060,6 +2366,7 @@ function renderEntities(data) {
         lastSnmpRtt = data.snmpRtt ?? null;
         lastPollSlots = data.pollSlots ?? null;
         lastAvailability = data.availability24h ?? null;
+        lastIfRuleDefaults = data.ifRuleDefaults ?? null;
     }
 
     // THE SPLIT on kind (sensors slice): sensors become the cards above the
@@ -2069,7 +2376,7 @@ function renderEntities(data) {
     // interface filter, exactly as its placeholder says.
     renderSensorCards(lastEntities.filter((e) => e.kind && e.kind !== 'if'));
 
-    const canTrack = myRole === 'admin' || myRole === 'operator';
+    const canTrack = can('device.track');
     const q = $('entity-filter').value.trim().toLowerCase();
     const rows = lastEntities.filter((e) => !e.kind || e.kind === 'if').filter((e) => q === ''
         || String(e.name ?? '').toLowerCase().includes(q)
@@ -2120,8 +2427,16 @@ function renderEntities(data) {
                 + 'No duplicate means the port itself was removed.';
             return p;
         };
+        // The name cell carries the rule badge: which alerts are muted on
+        // this interface, or that its thresholds differ from the default.
+        const nameCell = () => {
+            const c = cell(e.name);
+            const b = ifRuleBadge(e);
+            if (b) c.append(' ', b);
+            return c;
+        };
         const tr = rowEl(e.tracked ? [
-            cell(e.name),
+            nameCell(),
             cell(e.alias || e.descr, 'muted'),
             speedCell(e),
             stale ? stalePill()
@@ -2134,7 +2449,7 @@ function renderEntities(data) {
                 ? cell(`no reading since ${fmtAgo(e.lv_stale_since)}`, 'muted')
                 : cell(fmtAgo(e.lv_ts)),
         ] : [
-            cell(e.name),
+            nameCell(),
             cell(e.alias || e.descr, 'muted'),
             speedCell(e),
             // An untracked STALE row wears the stale pill too: "untracked"
@@ -2150,6 +2465,25 @@ function renderEntities(data) {
                 : cell('not watched - no alerts, no charts', 'muted'),
         ]);
         tr.appendChild(trackTd);
+        // The rule gear beside untrack, admin-only like the sensor gear
+        // (alertrule.write is an admin permission). Offered on tracked rows
+        // only - an untracked interface raises nothing to mute - while an
+        // unmute stays reachable on any row that carries a mute.
+        if (can('alertrule.write') && e.code) {
+            if (e.tracked) {
+                const g = ifRuleControl(e, tr);
+                trackTd.appendChild(g);
+            }
+            if (IF_RULES.some(([k]) => e.ifRules?.[k]?.muted)) {
+                const un = document.createElement('button');
+                un.type = 'button';
+                un.className = 'btn-track';
+                un.textContent = 'unmute';
+                un.title = 'Remove the mutes on this interface; the next tier or the default applies on the next scan';
+                un.addEventListener('click', (ev) => { ev.stopPropagation(); unmuteInterface(e); });
+                trackTd.appendChild(un);
+            }
+        }
         // Slice 28: an interface on the 32-bit fallback says so where the
         // numbers are read - the reader of a rate deserves to know it came
         // through wrap arithmetic with a plausibility cap, and that this
@@ -2347,15 +2681,75 @@ function renderEntities(data) {
     el.classList.toggle('hidden', msg === '');
 }
 
+/**
+ * The device's declarations and grouping ON the name line (2026-09-25,
+ * operator): transient and muted as badges beside the name, location and
+ * application after the counts. The controls that set them fold away behind
+ * Modify, so the line is where an operator reads them. Blank parts are left
+ * out, not shown as placeholders - the roster's rule.
+ */
+function renderDeviceHeader() {
+    if (currentDevice === null) return;
+    const d = lastDevices.find((x) => x.name === currentDevice);
+    const badges = $('device-badges');
+    badges.replaceChildren();
+    if (d?.transient === true) {
+        const t = badge('transient', 'badge maint');
+        t.title = 'declared transient: off is a state, not a fault - device-down never raises';
+        badges.appendChild(t);
+    }
+    if (d?.alerts_muted === true) {
+        if (badges.childElementCount > 0) badges.appendChild(document.createTextNode(' '));
+        const m = badge('muted', 'badge maint');
+        m.title = 'alerts muted: nothing on this device raises - down, interfaces, sensors';
+        badges.appendChild(m);
+    }
+    const grp = $('device-grouping');
+    grp.replaceChildren();
+    for (const [label, value] of [['location', d?.location], ['application', d?.application]]) {
+        if (!value) continue;
+        const part = document.createElement('span');
+        const k = document.createElement('span');
+        k.className = 'muted';
+        k.textContent = `${label} `;
+        part.append(k, document.createTextNode(value));
+        grp.appendChild(part);
+    }
+}
+
+// MODIFY (2026-09-25): the edit block is folded by default and remembers the
+// choice per browser, so an operator doing a round of edits is not re-opening
+// it on every device. Browser storage can be absent (private windows), and
+// the page works the same without it - folded.
+const EDIT_OPEN_KEY = 'rscanvas.deviceEditOpen';
+function setDeviceEditOpen(open) {
+    $('device-edit').classList.toggle('hidden', !open);
+    $('device-modify').setAttribute('aria-expanded', String(open));
+    $('device-modify').textContent = open ? 'Done' : 'Modify';
+}
+$('device-modify').addEventListener('click', () => {
+    const open = $('device-edit').classList.contains('hidden');
+    setDeviceEditOpen(open);
+    try { localStorage.setItem(EDIT_OPEN_KEY, open ? '1' : '0'); } catch { /* per-browser nicety only */ }
+});
+function deviceEditRemembered() {
+    try { return localStorage.getItem(EDIT_OPEN_KEY) === '1'; } catch { return false; }
+}
+
 async function showDevice(name) {
     // currentDevice is set NOW and re-checked after the fetch: two quick row
     // clicks are two of these in flight, and the first response landing
     // SECOND would otherwise render the wrong device's entities under the
     // right title - the openChart guard's rule, which this function
     // documented for charts and did not apply to itself (2026-09-01 review).
+    // A different device (or the first one) starts without the last page's
+    // chart; the same device re-shown after an edit keeps it open.
+    const arriving = currentDevice !== name;
+    if (arriving) closeChart();
     currentDevice = name;
     $('roster-panel').classList.add('hidden');
     $('device-panel').classList.remove('hidden');
+    syncDeviceToolbar();
     $('device-title').textContent = name;
     $('device-sub').textContent = 'loading...';
     $('entity-filter').value = '';
@@ -2368,6 +2762,10 @@ async function showDevice(name) {
     $('dev-application').value = known?.application ?? '';
     $('dev-transient').checked = known?.transient === true;
     $('transient-msg').textContent = '';
+    $('dev-muted').checked = known?.alerts_muted === true;
+    $('mute-msg').textContent = '';
+    if (arriving) setDeviceEditOpen(deviceEditRemembered());
+    renderDeviceHeader();
     $('grouping-msg').textContent = '';
     $('rename-msg').textContent = '';
     // The move form starts from where the device IS, so an operator sees
@@ -2400,12 +2798,34 @@ async function showDevice(name) {
         return;
     }
     renderEntities(r);
+    // PING-ONLY DEVICES OPEN ON THEIR CHART (2026-09-25, operator). Latency
+    // is the only history such a device has, and it sat behind a click on
+    // the responsiveness line that nothing marked as clickable enough. Once
+    // per arrival: a chart the operator closes stays closed until they come
+    // back, and the 10s refresh never reopens it.
+    if (arriving && known?.snmp_enabled === false && currentDevice === name && chartEntity === null) {
+        openRttChart(name);
+    }
 }
 
 function showRoster() {
     currentDevice = null;
+    closeChart();
     $('device-panel').classList.add('hidden');
     $('roster-panel').classList.remove('hidden');
+    syncDeviceToolbar();
+}
+
+/**
+ * The Devices toolbar: "Back to devices" while a device is open, "+ Add
+ * device" for an admin. The panel carrying them is shown to every role so the
+ * Back button is everyone's, and hidden when it would be empty - a viewer on
+ * the device list has neither button to see (2026-09-24).
+ */
+function syncDeviceToolbar() {
+    const open = currentDevice !== null;
+    $('device-back').classList.toggle('hidden', !open);
+    if (section === 'devices') $('onboard-panel').classList.toggle('hidden', !can('device.create') && !open);
 }
 
 // Rename: the server carries the name across alerts and overrides; the
@@ -2517,6 +2937,29 @@ $('dev-transient').addEventListener('change', async () => {
     if (d.ok) renderDevices(d);
 });
 
+// Slice 54: mute the whole device, saved on toggle for the same reason as
+// transient above - the change IS the decision, and a separate Save button
+// invites the half-saved state.
+$('dev-muted').addEventListener('change', async () => {
+    if (currentDevice === null) return;
+    const want = $('dev-muted').checked;
+    const r = await api('/api/devices/mute', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ names: [currentDevice], muted: want }),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        $('dev-muted').checked = !want;   // the mute did not take
+        $('mute-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('mute-msg').textContent = want
+        ? 'MUTED - nothing new raises, and anything open clears within a few scans'
+        : 'UNMUTED - anything still true raises again on the next scan';
+    const d = await api('/api/devices');
+    if (d.ok) renderDevices(d);
+});
+
 $('device-back').addEventListener('click', showRoster);
 $('device-filter').addEventListener('input', () => renderDevices(null));
 $('device-scope').addEventListener('change', () => { deviceSort = null; renderDevices(null); });
@@ -2565,18 +3008,21 @@ function renderMaint() {
     const tbody = $('maint-table').querySelector('tbody');
     tbody.replaceChildren();
     for (const w of maintData) {
-        const cancel = document.createElement('button');
-        cancel.type = 'button';
-        cancel.textContent = 'Cancel';
-        cancel.addEventListener('click', async () => {
-            const r = await api(`/api/maintenance?id=${encodeURIComponent(w.id)}`, { method: 'DELETE' });
-            $('maint-msg').textContent = r.ok
-                ? 'window cancelled - suppressed alerts still active are delivered on the next pass'
-                : (r.detail || `refused (${r.status})`);
-            refresh();
-        });
         const c = cell('');
-        c.appendChild(cancel);
+        // Everyone reads the windows; only alert.suppress may end one.
+        if (can('alert.suppress')) {
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.textContent = 'Cancel';
+            cancel.addEventListener('click', async () => {
+                const r = await api(`/api/maintenance?id=${encodeURIComponent(w.id)}`, { method: 'DELETE' });
+                $('maint-msg').textContent = r.ok
+                    ? 'window cancelled - suppressed alerts still active are delivered on the next pass'
+                    : (r.detail || `refused (${r.status})`);
+                refresh();
+            });
+            c.appendChild(cancel);
+        }
         tbody.appendChild(rowEl([
             pill(w.active ? 'active' : 'upcoming', w.active ? 'badge maint' : 'badge'),
             cell(w.scope === 'all' ? 'everything' : `${w.scope}: ${w.target}`),
@@ -2658,18 +3104,21 @@ function renderPolicies() {
     const tbody = $('policy-table').querySelector('tbody');
     tbody.replaceChildren();
     for (const p of policyData) {
-        const drop = document.createElement('button');
-        drop.type = 'button';
-        drop.textContent = 'Drop';
-        drop.addEventListener('click', async () => {
-            const r = await api(`/api/policy?id=${encodeURIComponent(p.id)}`, { method: 'DELETE' });
-            $('policy-msg').textContent = r.ok
-                ? 'policy dropped - anything it was withholding is delivered on the next pass'
-                : (r.detail || `refused (${r.status})`);
-            refresh();
-        });
         const c = cell('');
-        c.appendChild(drop);
+        // Everyone reads the policies; only alert.suppress may drop one.
+        if (can('alert.suppress')) {
+            const drop = document.createElement('button');
+            drop.type = 'button';
+            drop.textContent = 'Drop';
+            drop.addEventListener('click', async () => {
+                const r = await api(`/api/policy?id=${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+                $('policy-msg').textContent = r.ok
+                    ? 'policy dropped - anything it was withholding is delivered on the next pass'
+                    : (r.detail || `refused (${r.status})`);
+                refresh();
+            });
+            c.appendChild(drop);
+        }
         tbody.appendChild(rowEl([
             cell(`${p.scope}: ${p.target}`),
             cell(p.note ?? '', 'muted'),
@@ -3036,9 +3485,59 @@ for (const [id] of FIELDS) $(id).addEventListener('input', fieldsNote);
 
 /** The filters currently on screen, shared by search and export. */
 let lastSearchParams = null;
+/** Set by the first search the operator runs; until then Logs shows the
+ *  most recent messages each time it is opened. */
+let searchedByUser = false;
+
+function renderResultRows(rows) {
+    const tbody = $('results').querySelector('tbody');
+    tbody.replaceChildren();
+    for (const row of rows) {
+        const ts = new Date(row.ts);
+        tbody.appendChild(rowEl([
+            cell(ts.toLocaleString(), 'ts'),
+            sevPill(row.severity),
+            cell(row.host),
+            cell(row.app),
+            cell(row.msg, 'msg'),
+        ]));
+    }
+}
+
+/**
+ * THE LOGS PAGE OPENS ON SOMETHING (operator, 2026-09-24). It used to open
+ * empty until a search ran, which says nothing about whether messages are
+ * arriving at all. So until the operator searches, opening Logs lists the
+ * 50 newest messages of the last 24 hours: no filter and no text, so it needs
+ * no trigram index and admission passes it; count=0 skips the total, which is
+ * the one expensive half of a search.
+ */
+async function showRecent() {
+    const table = $('results');
+    renderHints(null);
+    $('export-row').classList.add('hidden');
+    showSearchMessage('loading the most recent messages...', 'allquiet');
+    const r = await api('/api/syslog/search?hours=24&limit=50&count=0');
+    if (r.status === 401) { showLogin(); return; }
+    // The operator searched while this was in flight: their results win.
+    if (searchedByUser) return;
+    if (!r.ok) {
+        table.classList.add('hidden');
+        showSearchMessage(r.detail || `could not load recent messages (${r.status})`, 'refusal');
+        return;
+    }
+    const rows = r.rows || [];
+    renderResultRows(rows);
+    table.classList.toggle('hidden', rows.length === 0);
+    showSearchMessage(rows.length === 0
+        ? 'no messages in the last 24 hours - nothing has sent syslog or traps to this server, or it is not reaching it'
+        : `the ${rows.length} most recent message(s) from the last 24 hours - search to narrow them or reach further back`,
+        'allquiet');
+}
 
 async function runSearch(ev) {
     if (ev) ev.preventDefault();
+    searchedByUser = true;
     const q = $('q').value.trim();
     const table = $('results');
     renderHints(null);
@@ -3073,18 +3572,7 @@ async function runSearch(ev) {
         return;
     }
 
-    const tbody = table.querySelector('tbody');
-    tbody.replaceChildren();
-    for (const row of r.rows || []) {
-        const ts = new Date(row.ts);
-        tbody.appendChild(rowEl([
-            cell(ts.toLocaleString(), 'ts'),
-            sevPill(row.severity),
-            cell(row.host),
-            cell(row.app),
-            cell(row.msg, 'msg'),
-        ]));
-    }
+    renderResultRows(r.rows || []);
     table.classList.toggle('hidden', r.returned === 0);
     renderHints(r.hints);
 
@@ -3099,7 +3587,9 @@ async function runSearch(ev) {
         const of = r.total !== null && Number(r.total) > r.returned
             ? ` of ${Number(r.total).toLocaleString()}` : '';
         showSearchMessage(`${r.returned}${of} message(s), ${took}ms`, 'allquiet');
-        $('export-row').classList.remove('hidden');
+        // Offered only to a role that may export (syslog.export): a viewer
+        // was shown the button and refused on click.
+        $('export-row').classList.toggle('hidden', !can('syslog.export'));
         $('export-msg').textContent = r.total !== null && Number(r.total) > r.returned
             ? `the export would carry all ${Number(r.total).toLocaleString()}, not just these ${r.returned}`
             : '';
@@ -3159,6 +3649,7 @@ function renderExports(jobs) {
 }
 
 async function refreshExports() {
+    if (!can('syslog.export')) return;
     const r = await api('/api/syslog/export');
     if (r.ok) renderExports(r.jobs || []);
 }
@@ -3581,7 +4072,7 @@ $('ob-add').addEventListener('click', async () => {
 // current whether it is displayed or not. A back button that unwound section
 // changes would be answering a question nobody asked while losing the one
 // people do ask, which is "why did my search box empty".
-let section = 'alerts';
+let section = 'dashboard';
 
 function showSection(name) {
     section = name;
@@ -3597,7 +4088,8 @@ function showSection(name) {
             // every role may read. They stay hidden for anyone who cannot
             // use them, so a viewer opening System sees a page that is
             // entirely theirs rather than one mostly full of refusals.
-            const gated = el.classList.contains('admin-only') && !isAdmin;
+            const gated = (el.classList.contains('admin-only') && !isAdmin)
+                || (el.dataset.can !== undefined && !canAny(el.dataset.can));
             el.classList.toggle('hidden', !belongs || gated || (isDrill && !drillOpen));
         }
     }
@@ -3606,8 +4098,25 @@ function showSection(name) {
     }
     // The list panel and its drill-down are the same section, so hide the
     // list when its drill-down is open rather than stacking both.
-    if (name === 'devices') $('roster-panel').classList.toggle('hidden', currentDevice !== null);
+    if (name === 'devices') {
+        $('roster-panel').classList.toggle('hidden', currentDevice !== null);
+        syncDeviceToolbar();
+    }
+    // Logs opens on the newest messages until the operator searches, so the
+    // page says at a glance that syslog and traps are arriving (2026-09-24).
+    if (name === 'search' && !searchedByUser) showRecent().catch(() => {});
     if (name === 'alerts') $('alerts-panel').classList.toggle('hidden', currentAlert !== null);
+    // The Dashboard's lists are fetched on arrival unless a minute-fresh
+    // copy is on screen; its alert list comes from data already in hand.
+    if (name === 'dashboard') {
+        renderDashAlerts();
+        fillReportDevices();
+        syncReportControls();
+        if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
+    }
+    // The rules live on System now; re-read them on each visit so an edit
+    // made in another tab, or a rule the ingest worker disarmed, shows up.
+    if (name === 'system' && can('alertrule.read')) loadEventRules();
     if (name === 'system' && isAdmin) {
         refreshAdmin();
         fillGroupSuggestions($('inv-axis').value, 'group-values');
@@ -3616,6 +4125,410 @@ function showSection(name) {
 
 for (const b of document.querySelectorAll('.navbtn')) {
     b.addEventListener('click', () => showSection(b.dataset.section));
+}
+
+// --- System: folding panels (2026-09-25, operator) ---------------------------
+//
+// "At its full length the page is intimidating." Each System panel folds to
+// its header, and the header keeps its summary - the health verdict, the
+// retention line - so a folded page still reads as a status board. First
+// visit: everything but Health folded, so the tab opens on the verdict.
+// After that the choice is remembered per browser; storage can be absent
+// (private windows) and the page then simply starts from the default.
+//
+// A real <button> carries the fold for keyboards and screen readers, and a
+// click anywhere on the header does the same for a mouse - except on a
+// control that happens to live in a header, which keeps its own click.
+const SYS_FOLD_KEY = 'rscanvas.systemFolded';
+/** id -> unfold(), so a link elsewhere (your name, for My account) can open
+ *  a folded panel rather than land the operator on a closed header. */
+const systemUnfold = new Map();
+function setupSystemFolds() {
+    let saved = null;
+    try {
+        const v = JSON.parse(localStorage.getItem(SYS_FOLD_KEY) || 'null');
+        if (Array.isArray(v)) saved = new Set(v);
+    } catch { /* default fold */ }
+    const panels = [...document.querySelectorAll('.panel[data-section="system"]')];
+    const persist = () => {
+        const folded = panels.filter((p) => p.classList.contains('folded')).map((p) => p.id);
+        try { localStorage.setItem(SYS_FOLD_KEY, JSON.stringify(folded)); } catch { /* per-browser nicety */ }
+    };
+    for (const panel of panels) {
+        const h = panel.querySelector(':scope > h2');
+        if (h === null || !panel.id) continue;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'fold-btn';
+        btn.setAttribute('aria-label', 'fold or unfold this section');
+        h.prepend(btn);
+        h.classList.add('fold-head');
+        const set = (folded) => {
+            panel.classList.toggle('folded', folded);
+            btn.setAttribute('aria-expanded', String(!folded));
+        };
+        set(saved === null ? panel.id !== 'health-panel' : saved.has(panel.id));
+        systemUnfold.set(panel.id, () => { set(false); persist(); });
+        h.addEventListener('click', (ev) => {
+            const ctl = ev.target instanceof Element ? ev.target.closest('button, a, input, select, label') : null;
+            if (ctl !== null && ctl !== btn) return;
+            set(!panel.classList.contains('folded'));
+            persist();
+        });
+    }
+}
+setupSystemFolds();
+
+// --- My account: change your own password (2026-09-25, operator) -------------
+
+$('whoami').addEventListener('click', () => {
+    showSection('system');
+    systemUnfold.get('account-panel')?.();
+    $('account-panel').scrollIntoView({ block: 'start' });
+    $('pw-current').focus();
+});
+
+$('password-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = $('pw-msg');
+    const current = $('pw-current').value;
+    const next = $('pw-new').value;
+    // Checked here for a quick answer; the server checks the length again
+    // and is the one that decides.
+    if (next !== $('pw-confirm').value) { msg.textContent = 'the new password and its repeat differ'; return; }
+    if (next.length < 8) { msg.textContent = 'the new password needs at least 8 characters'; return; }
+    if (next === current) { msg.textContent = 'that is the current password'; return; }
+    msg.textContent = 'changing...';
+    const r = await api(`/api/users/${encodeURIComponent(myUsername)}/password`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ currentPassword: current, newPassword: next }),
+    });
+    // Whatever happened, the typed passwords leave the page: a form that
+    // keeps them is one more place for them to sit.
+    for (const id of ['pw-current', 'pw-new', 'pw-confirm']) $(id).value = '';
+    if (r.status === 401) { showLogin(); return; }
+    // api() folds a 403 into {ok:false} without the body; for this route a
+    // 403 is the server's "Current password is incorrect."
+    if (r.status === 403) { msg.textContent = 'the current password is not right - nothing changed'; return; }
+    if (!r.ok) { msg.textContent = r.detail || `refused (${r.status})`; return; }
+    const others = Number(r.sessionsRevoked) || 0;
+    msg.textContent = `password changed${others > 0 ? ` - ${others} other session(s) signed out` : ''}`;
+});
+
+// --- the Dashboard (2026-09-25, operator) --------------------------------------
+//
+// Open alerts first, from the same list the Alerts page renders (no second
+// query); then the top 10 lists from /api/dashboard, which the server caches
+// per window for a minute. The lists are refetched on arrival, on a window
+// change, and at most once a minute while the Dashboard is on screen - they
+// can only move when the hourly rollup does.
+
+function fmtCount(n) {
+    if (n === null || n === undefined) return '';
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 1e4) return `${Math.round(n / 1e3)}k`;
+    return String(Math.round(n));
+}
+
+/** "vs before": the change against the previous window, or nothing to say. */
+function trendCell(t) {
+    const c = cell('', 'num muted small');
+    if (t === null || t === undefined) { c.title = 'nothing in the window before this one to compare with'; return c; }
+    const pct = Math.round(t * 100);
+    c.textContent = pct === 0 ? 'same' : `${pct > 0 ? '▲' : '▼'} ${Math.abs(pct)}%`;
+    c.title = `${pct > 0 ? '+' : ''}${pct}% against the previous window of the same length`;
+    return c;
+}
+
+/** Interface name with its description beside it, and the coverage when short. */
+function dashIfCell(r) {
+    const c = cell(r.name || r.code);
+    if (r.alias) {
+        const a = document.createElement('span');
+        a.className = 'muted small';
+        a.textContent = ` ${r.alias}`;
+        c.appendChild(a);
+    }
+    if (r.coverage < 0.95) {
+        const b = badge(`saw ${Math.round(r.coverage * 100)}%`, 'badge warn');
+        b.title = 'the samples covered only this share of the window - the device did not answer, or rebooted, for the rest';
+        c.append(document.createTextNode(' '), b);
+    }
+    return c;
+}
+
+let dashLoadedAt = 0;
+let dashGen = 0;
+
+/** Open the device page on this interface's or sensor's chart. */
+async function openEntityChart(device, code) {
+    showSection('devices');
+    await showDevice(device);
+    const e = lastEntities.find((x) => x.code === code);
+    if (e && currentDevice === device) openChart(e);
+}
+
+function renderDashList(tableId, rows, cells, empty) {
+    const tbody = $(tableId).querySelector('tbody');
+    tbody.replaceChildren();
+    if (rows.length === 0) {
+        const tr = rowEl([cell(empty, 'muted small')]);
+        tr.firstChild.colSpan = 5;
+        tbody.appendChild(tr);
+        return;
+    }
+    for (const r of rows) {
+        const tr = rowEl(cells(r));
+        tr.className = 'clickable';
+        tr.title = `open ${r.device} on this chart`;
+        tr.addEventListener('click', () => openEntityChart(r.device, r.code));
+        tbody.appendChild(tr);
+    }
+}
+
+async function loadDashboard() {
+    const gen = ++dashGen;
+    const hours = Number($('dash-window').value) || 24;
+    $('dash-msg').textContent = dashLoadedAt === 0 ? 'loading...' : '';
+    const r = await api(`/api/dashboard?window=${hours}`);
+    if (gen !== dashGen) return;
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('dash-msg').textContent = r.detail || `could not load (${r.status})`; return; }
+    dashLoadedAt = Date.now();
+    if (r.window === null) {
+        $('dash-window-sub').textContent = '';
+        $('dash-msg').textContent = r.detail || 'nothing rolled up yet';
+    } else {
+        const to = new Date(r.window.to);
+        const label = hours === 168 ? '7 days' : `${hours} hours`;
+        $('dash-window-sub').textContent = `the ${label} to ${to.toLocaleString([], {
+            weekday: hours === 168 ? 'short' : undefined, hour: '2-digit', minute: '2-digit' })}`;
+        $('dash-msg').textContent = '';
+    }
+    const traffic = (key, peakKey, trendKey) => (x) => [
+        cell(x.device), dashIfCell(x), cell(fmtBytes(x[key]), 'num'),
+        cell(fmtBps(x[peakKey]), 'num'), trendCell(x[trendKey]),
+    ];
+    renderDashList('dash-rx', r.rx || [], traffic('inBytes', 'peakInBps', 'trendIn'), 'no traffic recorded in this window');
+    renderDashList('dash-tx', r.tx || [], traffic('outBytes', 'peakOutBps', 'trendOut'), 'no traffic recorded in this window');
+    renderDashList('dash-errs', r.errs || [], (x) => [
+        cell(x.device), dashIfCell(x), cell(fmtCount(x.errors), 'num'),
+        cell(fmtCount(x.discards), 'num'), trendCell(x.trendErrs),
+    ], 'no errors or discards on any interface - a clean window');
+    const pctRow = (x) => [
+        cell(x.device), cell(x.name || x.code, 'muted'),
+        cell(x.meanPct === null ? '' : `${Math.round(x.meanPct)}%`, 'num'),
+        cell(x.peakPct === null ? '' : `${Math.round(x.peakPct)}%`, 'num'), trendCell(x.trend),
+    ];
+    renderDashList('dash-cpu', r.cpu || [], pctRow, 'no CPU readings in this window');
+    renderDashList('dash-mem', r.mem || [], pctRow, 'no memory readings in this window');
+}
+$('dash-window').addEventListener('change', () => { dashLoadedAt = 0; loadDashboard(); });
+
+/** The Dashboard's alert list: active, pending and clearing, worst first. */
+function renderDashAlerts() {
+    const all = (alertData.open || []).filter((a) => a.state !== 'cleared');
+    const sev = { crit: 0, warn: 1 };
+    const order = { active: 0, clearing: 1, pending: 2 };
+    const sorted = [...all].sort((x, y) => (order[x.state] ?? 3) - (order[y.state] ?? 3)
+        || (sev[x.severity] ?? 2) - (sev[y.severity] ?? 2)
+        || Date.parse(x.raised_ts ?? x.first_breach_ts ?? 0) - Date.parse(y.raised_ts ?? y.first_breach_ts ?? 0));
+    const SHOWN = 10;
+    const tbody = $('dash-alerts').querySelector('tbody');
+    tbody.replaceChildren();
+    for (const a of sorted.slice(0, SHOWN)) {
+        const tr = rowEl([
+            pill(a.severity, `sev ${a.severity}`),
+            a.state === 'active' ? cell('') : pill(a.state, `sev ${a.state}`),
+            cell(a.label),
+            cell(fmtValue(a.value, a.unit), 'num'),
+            cell(a.raised_ts ? fmtAgo(a.raised_ts) : `breach ${fmtAgo(a.first_breach_ts)}`),
+        ]);
+        tr.className = 'clickable';
+        if (a.in_maintenance || a.under_policy) tr.classList.add('maint-row');
+        tr.addEventListener('click', () => { showSection('alerts'); showAlert(a.id); });
+        tbody.appendChild(tr);
+    }
+    const count = (s) => all.filter((a) => a.state === s).length;
+    // "Pending" is breaching and not yet past the raise count - the state the
+    // operator calls soaking; the tooltip says so rather than a second name.
+    const total = alertData.capped === true && typeof alertData.openTotal === 'number' ? alertData.openTotal : all.length;
+    $('dash-alert-counts').textContent = total === 0 ? ''
+        : `${count('active')} active, ${count('pending')} pending, ${count('clearing')} clearing`;
+    $('dash-alert-counts').title = 'pending: breaching, not yet raised (soaking); clearing: back to normal, not yet cleared';
+    $('dash-alerts').classList.toggle('hidden', all.length === 0);
+    $('dash-no-alerts').classList.toggle('hidden', all.length > 0);
+    const more = total - Math.min(SHOWN, sorted.length);
+    $('dash-alerts-more').textContent = more > 0 ? `and ${more} more on the Alerts page` : '';
+    $('dash-alerts-more').classList.toggle('hidden', more <= 0);
+}
+
+// --- the interface traffic report ----------------------------------------------
+
+/** code -> { device, name, alias }, across devices: an ISP link on one
+ *  router and a backup on another belong in the same report. */
+const reportChosen = new Map();
+let reportPickDevice = null;
+let reportPickEntities = [];
+
+function localDay(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** The period as [from, to] local dates, or null when a custom one is incomplete. */
+function reportRange() {
+    const now = new Date();
+    const y = now.getFullYear(), m = now.getMonth();
+    switch ($('report-period').value) {
+        case 'this-month': return [localDay(new Date(y, m, 1)), localDay(now)];
+        case 'last-month': return [localDay(new Date(y, m - 1, 1)), localDay(new Date(y, m, 0))];
+        case 'last-7': return [localDay(new Date(y, m, now.getDate() - 6)), localDay(now)];
+        case 'last-30': return [localDay(new Date(y, m, now.getDate() - 29)), localDay(now)];
+        default: {
+            const f = $('report-from').value, t = $('report-to').value;
+            return f && t ? [f, t] : null;
+        }
+    }
+}
+
+function reportQuery(format) {
+    const range = reportRange();
+    if (range === null || reportChosen.size === 0) return null;
+    const q = new URLSearchParams({
+        codes: [...reportChosen.keys()].join(','),
+        from: range[0], to: range[1],
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    });
+    if (format) q.set('format', format);
+    return q.toString();
+}
+
+function syncReportControls() {
+    const chosen = $('report-chosen');
+    chosen.replaceChildren();
+    for (const [code, x] of reportChosen) {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = `${x.device} ${x.name || code}`;
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'chip-x';
+        rm.textContent = 'x';
+        rm.title = 'remove from the report';
+        rm.addEventListener('click', () => { reportChosen.delete(code); syncReportControls(); renderReportPick(); });
+        chip.appendChild(rm);
+        chosen.appendChild(chip);
+    }
+    $('report-none').classList.toggle('hidden', reportChosen.size > 0);
+    const custom = $('report-period').value === 'custom';
+    $('report-from').classList.toggle('hidden', !custom);
+    $('report-to').classList.toggle('hidden', !custom);
+    const q = reportQuery('csv');
+    const link = $('report-csv');
+    link.classList.toggle('hidden', q === null);
+    if (q !== null) {
+        link.href = `/api/report/traffic?${q}`;
+        const range = reportRange();
+        link.download = `rscanvas-traffic-${range[0]}-to-${range[1]}.csv`;
+    }
+}
+
+function renderReportPick() {
+    const box = $('report-pick');
+    box.replaceChildren();
+    const needle = $('report-filter').value.trim().toLowerCase();
+    const ifs = reportPickEntities.filter((e) => (!e.kind || e.kind === 'if')
+        && (needle === '' || `${e.name ?? ''} ${e.alias ?? ''}`.toLowerCase().includes(needle)));
+    for (const e of ifs.slice(0, 200)) {
+        const label = document.createElement('label');
+        label.className = 'small';
+        const box2 = document.createElement('input');
+        box2.type = 'checkbox';
+        box2.checked = reportChosen.has(e.code);
+        box2.addEventListener('change', () => {
+            if (box2.checked) reportChosen.set(e.code, { device: reportPickDevice, name: e.name, alias: e.alias });
+            else reportChosen.delete(e.code);
+            syncReportControls();
+        });
+        label.append(box2, document.createTextNode(` ${e.name || e.code}${e.alias ? ` - ${e.alias}` : ''}`
+            + `${e.tracked ? '' : ' (not tracked - no history)'}`));
+        box.appendChild(label);
+    }
+    $('report-pick-msg').textContent = reportPickDevice === null ? ''
+        : ifs.length > 200 ? `showing 200 of ${ifs.length} - narrow the filter` : `${ifs.length} interface(s)`;
+    box.classList.toggle('hidden', reportPickDevice === null);
+    $('report-filter').classList.toggle('hidden', reportPickDevice === null);
+}
+
+async function pickReportDevice() {
+    const name = $('report-device').value.trim();
+    if (name === '' || name === reportPickDevice) return;
+    if (!lastDevices.some((d) => d.name === name)) {
+        $('report-pick-msg').textContent = 'no device by that name';
+        return;
+    }
+    $('report-pick-msg').textContent = 'loading...';
+    const r = await api(`/api/device?name=${encodeURIComponent(name)}`);
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('report-pick-msg').textContent = r.detail || `could not load (${r.status})`; return; }
+    reportPickDevice = name;
+    reportPickEntities = r.entities || [];
+    $('report-filter').value = '';
+    renderReportPick();
+}
+$('report-device').addEventListener('change', pickReportDevice);
+$('report-filter').addEventListener('input', renderReportPick);
+for (const id of ['report-period', 'report-from', 'report-to']) {
+    $(id).addEventListener('change', syncReportControls);
+}
+
+$('report-run').addEventListener('click', async () => {
+    const q = reportQuery(null);
+    const msg = $('report-msg');
+    if (q === null) {
+        msg.textContent = reportChosen.size === 0 ? 'choose at least one interface' : 'choose both dates';
+        return;
+    }
+    msg.textContent = 'running...';
+    const r = await api(`/api/report/traffic?${q}`);
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { msg.textContent = r.detail || `refused (${r.status})`; return; }
+    const tbody = $('report-table').querySelector('tbody');
+    tbody.replaceChildren();
+    const gb = (v) => (v === null ? '' : `${v.toLocaleString()} GB`);
+    const mbps = (v) => (v === null ? '' : `${v.toLocaleString()} Mb/s`);
+    for (const l of r.lines || []) {
+        // A total row says "total" here, with the range in its title; the
+        // CSV keeps the full "total <from> to <to>", where there is no hover.
+        const isTotal = l.day.startsWith('total');
+        const dayCell = cell(isTotal ? 'total' : l.day);
+        if (isTotal) dayCell.title = l.day;
+        const tr = rowEl([
+            dayCell, cell(l.device), cell(l.iface), cell(l.description, 'muted'),
+            cell(gb(l.inGB), 'num'), cell(gb(l.outGB), 'num'), cell(gb(l.totalGB), 'num'),
+            cell(mbps(l.peakInMbps), 'num'), cell(mbps(l.peakOutMbps), 'num'),
+            cell(`${l.coveragePct}%`, l.coveragePct < 95 ? 'num cell-warn' : 'num'),
+        ]);
+        if (isTotal) tr.className = 'total-row';
+        tbody.appendChild(tr);
+    }
+    $('report-table').classList.toggle('hidden', (r.lines || []).length === 0);
+    const through = r.through ? new Date(r.through).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+    msg.textContent = (r.lines || []).length === 0 ? 'nothing recorded for these interfaces in this period'
+        : `${r.from} to ${r.to} (${r.tz})${through ? `, complete hours through ${through}` : ''}`
+            + `${(r.missing || []).length ? ` - ${r.missing.length} interface(s) had nothing in range` : ''}`;
+});
+
+function fillReportDevices() {
+    const dl = $('report-devices');
+    if (dl.childElementCount === lastDevices.length) return;
+    dl.replaceChildren();
+    for (const d of lastDevices) {
+        const o = document.createElement('option');
+        o.value = d.name;
+        dl.appendChild(o);
+    }
 }
 
 // --- admin: retention, users, audit --------------------------------------------
@@ -3645,13 +4558,30 @@ for (const b of document.querySelectorAll('.navbtn')) {
 let adminData = null;
 let isAdmin = false;
 let myRole = 'viewer';
+let myUsername = '';
+
+/** Show each data-can control to a role that holds its action (see can()). */
+function applyCanGates() {
+    for (const el of document.querySelectorAll('[data-can]:not(.panel)')) {
+        el.classList.toggle('hidden', !canAny(el.dataset.can));
+    }
+    // The roster's selection column exists for the bulk actions; a role with
+    // none of them gets no checkboxes rather than a column that selects
+    // nothing it can act on.
+    const bulk = canAny('device.disable device.group device.mute device.create device.delete');
+    $('devices').classList.toggle('no-select', !bulk);
+}
 let lastBoards = [];
 let lastGridFields = [];
 let lastGridDefaults = [];
 
+/** Decimal units, as the traffic report's CSV and every carrier bill use them.
+ *  Missing is blank, never "0 B" - null is "not measured", not zero. */
 function fmtBytes(n) {
+    if (n === null || n === undefined) return '';
     const b = Number(n);
     if (!Number.isFinite(b)) return '';
+    if (b >= 1e12) return `${(b / 1e12).toFixed(2)} TB`;
     if (b >= 1e9) return `${(b / 1e9).toFixed(1)} GB`;
     if (b >= 1e6) return `${(b / 1e6).toFixed(0)} MB`;
     if (b >= 1e3) return `${(b / 1e3).toFixed(0)} kB`;
@@ -4671,7 +5601,7 @@ function renderCredentials(data) {
             cell(name), cell(''), cell(''), cell('', 'num'), cell(''), cell(''),
         ]);
         const kind = document.createElement('td');
-        const k = pill('env var', 'badge'); k.title = 'A name in the service environment, not a stored profile. Edit /etc/rscanvas/rscanvas.env to change it.';
+        const k = badge('env var', 'badge'); k.title = 'A name in the service environment, not a stored profile. Edit /etc/rscanvas/rscanvas.env to change it.';
         kind.appendChild(k);
         tr.replaceChild(kind, tr.children[2]);
         tr.className = 'muted';
@@ -4834,6 +5764,10 @@ async function refresh() {
     if (alerts.status === 401 || devices.status === 401) { showLogin(); return; }
     if (gen !== refreshGen) return;
     if (alerts.ok) renderAlerts(alerts);
+    if (section === 'dashboard') {
+        renderDashAlerts();
+        if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
+    }
     if (devices.ok) renderDevices(devices);
     if (reachEv.ok) renderReachEvents(reachEv);
     if (maint.ok) { maintData = maint.windows || []; renderMaint(); }
@@ -4846,10 +5780,11 @@ async function refresh() {
         // the operator is mid-click on it), so "did it stick?" is answered by
         // looking at it - the operator finding was exactly that doubt.
         const box = $('dev-transient');
-        if (document.activeElement !== box) {
-            const known = lastDevices.find((x) => x.name === currentDevice);
-            if (known) box.checked = known.transient === true;
-        }
+        const known = lastDevices.find((x) => x.name === currentDevice);
+        if (document.activeElement !== box && known) box.checked = known.transient === true;
+        // The mute box follows server truth the same way.
+        const mbox = $('dev-muted');
+        if (document.activeElement !== mbox && known) mbox.checked = known.alerts_muted === true;
         // Captured, then re-checked: navigating to another device while this
         // fetch is in flight must not render the old device's interfaces
         // under the new device's title - the same rule showDevice and
@@ -4909,11 +5844,14 @@ window.addEventListener('hashchange', () => {
 
 async function showApp(me) {
     restoreWindow();
-    refreshExports();
     $('login').classList.add('hidden');
     $('app').classList.remove('hidden');
     $('logout').classList.remove('hidden');
     $('whoami').textContent = `${me.username} (${me.role})`;
+    $('whoami').classList.remove('hidden');
+    myUsername = me.username;
+    $('pw-username').value = me.username;
+    $('account-sub').textContent = `signed in as ${me.username}, ${me.role}`;
     // The admin tab appears only for a role that can open it. This is NOT
     // the access control - every admin route calls enforce() and would
     // refuse a viewer who typed the URL. It is the difference between a
@@ -4921,12 +5859,23 @@ async function showApp(me) {
     // second one avoids teaching people to click things that fail.
     isAdmin = me.role === 'admin';
     myRole = me.role;
+    // The role's actions, as the server states them. An empty list (a server
+    // older than this page) shows no write control at all - the safe side.
+    myCan = new Set(Array.isArray(me.can) ? me.can : []);
+    applyCanGates();
+    refreshExports();
     // The delete button is a control rather than a panel, so it is hidden here
     // rather than by showSection's panel sweep. The rules editor is the same
     // shape: a block INSIDE a panel everyone sees. :not(.panel) matters -
     // admin-only PANELS (onboarding) belong to showSection's sweep, and a
     // second toggler fighting it would show them on the wrong section.
-    for (const el of document.querySelectorAll('button.admin-only, div.admin-only:not(.panel)')) {
+    //
+    // EVERY TAG, not a list of them (2026-09-23): the selector named button
+    // and div, so the rename and move FORMS on the device page and the
+    // roster's credential INPUT were shown to viewers and operators, whose
+    // submits the server then refused - the advertised-but-locked door this
+    // loop exists to avoid.
+    for (const el of document.querySelectorAll('.admin-only:not(.panel)')) {
         el.classList.toggle('hidden', !isAdmin);
     }
     // A deep link opens the DEVICES section, not alerts, and only after the
@@ -4935,10 +5884,10 @@ async function showApp(me) {
     // that raced refresh() would open a device page with three blank fields
     // and no sign that they were merely early.
     const deep = deepLinkDevice();
-    showSection(deep === null ? 'alerts' : 'devices');
+    showSection(deep === null ? 'dashboard' : 'devices');
     await refresh();
     if (deep !== null) await openDeepLink();
-    if (isAdmin) loadEventRules();
+    if (can('alertrule.read')) loadEventRules();
     clearInterval(timer);
     timer = setInterval(refresh, 10_000);
 }
@@ -4948,6 +5897,9 @@ function showLogin() {
     $('app').classList.add('hidden');
     $('logout').classList.add('hidden');
     $('whoami').textContent = '';
+    $('whoami').classList.add('hidden');
+    for (const id of ['pw-current', 'pw-new', 'pw-confirm']) $(id).value = '';
+    $('pw-msg').textContent = '';
     $('login').classList.remove('hidden');
     $('username').focus();
 }

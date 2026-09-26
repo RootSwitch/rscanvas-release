@@ -4,6 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RSCanvas</title>
+<!-- The .ico comes FIRST (2026-09-24, ported from rswiki). Firefox showed the
+     generic globe while /favicon.svg answered 200: its first, unprompted GET
+     /favicon.ico had 404'd, and it stores "this origin has no icon" in
+     places.sqlite, where a hard reload does not reach. The SVG stays the
+     sharp one for every browser that takes it; the apple-touch icon is the
+     180px raster for a home screen. Both rasters are drawn from favicon.svg
+     by tools/make-favicons.mjs, and npm test refuses them when they drift. -->
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -16,17 +26,21 @@
 -->
 <div id="topbar">
     <span class="brand">
+        <!-- The Canvas Suite mark (2026-09-24, the operator's choice): the
+             easel of six zones, one per app of the suite RSCanvas
+             supersedes. One file serves as the favicon and this mark, so
+             the tab and the page cannot drift apart; the raster copies in
+             the head are stamped with its hash and checked by npm test. -->
         <span class="logo" aria-hidden="true">
-            <svg width="17" height="17" viewBox="0 0 16 16" fill="none">
-                <rect x="1" y="1" width="6" height="6" rx="1.2" stroke="var(--se-logo-a)" stroke-width="1.6"/>
-                <rect x="9" y="9" width="6" height="6" rx="1.2" stroke="var(--se-logo-b)" stroke-width="1.6"/>
-                <path d="M7 4h3a2 2 0 0 1 2 2v3" stroke="var(--se-accent)" stroke-width="1.6" stroke-linecap="round"/>
-            </svg>
+            <img src="/favicon.svg" width="20" height="20" alt="">
         </span>
         <span class="brand-name">RSCanvas</span>
     </span>
     <span class="topbar-spacer"></span>
-    <span id="whoami" class="muted small"></span>
+    <!-- Your name opens My account (System tab): where to change a password
+         should not be a question anyone has to ask. -->
+    <button type="button" id="whoami" class="whoami small hidden"
+            title="Your account - change your password"></button>
     <span id="refreshed" class="muted small"></span>
     <button id="logout" class="hidden">Sign out</button>
     <label for="theme-select">Theme</label>
@@ -58,7 +72,10 @@
           advertising a door that will not open.
         -->
         <div id="nav" class="row">
-            <button type="button" data-section="alerts" class="navbtn active">Alerts</button>
+            <!-- Dashboard first and the landing page (operator, 2026-09-25):
+                 what is wrong now, then what the fleet did over the window. -->
+            <button type="button" data-section="dashboard" class="navbtn active">Dashboard</button>
+            <button type="button" data-section="alerts" class="navbtn">Alerts</button>
             <button type="button" data-section="devices" class="navbtn">Devices</button>
             <!-- "Logs", not "Syslog search": one word like its siblings, and
                  honest about scope - traps land in the same store and the
@@ -66,6 +83,132 @@
                  2026-08-14. -->
             <button type="button" data-section="search" class="navbtn">Logs</button>
             <button type="button" data-section="system" class="navbtn">System</button>
+        </div>
+
+        <!-- THE DASHBOARD (2026-09-25, operator; IDEAS-REPORTING.md has the
+             sketches it came from). Open alerts at the top, then the top 10
+             lists the operator used on SolarWinds - traffic each way, errors
+             and discards, CPU, memory - over a window, each row with its
+             trend against the previous window, because the value of those
+             widgets was always recognising a shape over time. Every number
+             is from the hourly rollup, so windows end at the last complete
+             hour and say so. -->
+        <div class="panel" data-section="dashboard" id="dash-alerts-panel">
+            <h2>Alerts <span id="dash-alert-counts" class="muted"></span></h2>
+            <table class="list compact hidden" id="dash-alerts">
+                <thead><tr>
+                    <th>severity</th><th>state</th><th>alert</th><th class="num">value</th><th>since</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="dash-alerts-more" class="muted small hidden"></div>
+            <div id="dash-no-alerts" class="allquiet hidden">nothing open - no alert is active, pending or clearing</div>
+        </div>
+
+        <div class="panel" data-section="dashboard" id="dash-top-panel">
+            <h2>Top 10 <span id="dash-window-sub" class="muted"></span></h2>
+            <div class="row">
+                <label for="dash-window" class="small">over</label>
+                <select id="dash-window">
+                    <option value="6">6 hours</option>
+                    <option value="24" selected>24 hours</option>
+                    <option value="168">7 days</option>
+                </select>
+                <span id="dash-msg" class="muted small"></span>
+            </div>
+            <div class="dash-grid">
+                <div class="widget">
+                    <h3>Received</h3>
+                    <table class="list compact" id="dash-rx">
+                        <thead><tr><th>device</th><th>interface</th><th class="num">total</th>
+                            <th class="num">peak</th><th class="num">vs before</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="widget">
+                    <h3>Transmitted</h3>
+                    <table class="list compact" id="dash-tx">
+                        <thead><tr><th>device</th><th>interface</th><th class="num">total</th>
+                            <th class="num">peak</th><th class="num">vs before</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="widget">
+                    <h3>Errors and discards</h3>
+                    <table class="list compact" id="dash-errs">
+                        <thead><tr><th>device</th><th>interface</th><th class="num">errors</th>
+                            <th class="num">discards</th><th class="num">vs before</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="widget">
+                    <h3>CPU</h3>
+                    <table class="list compact" id="dash-cpu">
+                        <thead><tr><th>device</th><th>sensor</th><th class="num">average</th>
+                            <th class="num">peak</th><th class="num">vs before</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="widget">
+                    <h3>Memory</h3>
+                    <table class="list compact" id="dash-mem">
+                        <thead><tr><th>device</th><th>sensor</th><th class="num">average</th>
+                            <th class="num">peak</th><th class="num">vs before</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+            <p class="muted small">Totals are each hour's average rate times the hour, from the
+               interfaces' own counters - a missed poll loses no traffic. Hours a device did not
+               answer at all, or rebooted through, count as nothing; a row that saw less than 95% of
+               the window says how much it saw. "vs before" compares with the window just before this
+               one. Memory is used over size as the device reports them, and some devices count
+               caches as used.</p>
+        </div>
+
+        <!-- THE INTERFACE REPORT (2026-09-25, operator): "how much did this ISP
+             link or sub-interface carry this month" - pick interfaces from
+             any devices, a period, and read it here or take the CSV. -->
+        <div class="panel" data-section="dashboard" id="report-panel">
+            <h2>Interface traffic report</h2>
+            <div class="row">
+                <label for="report-device" class="small">device</label>
+                <input type="text" id="report-device" list="report-devices" placeholder="device name"
+                       autocomplete="off" maxlength="120">
+                <datalist id="report-devices"></datalist>
+                <input type="text" id="report-filter" placeholder="filter its interfaces" autocomplete="off"
+                       class="hidden">
+                <span id="report-pick-msg" class="muted small"></span>
+            </div>
+            <div id="report-pick" class="report-pick hidden"></div>
+            <div class="row">
+                <span class="small">chosen:</span>
+                <span id="report-chosen" class="report-chosen"></span>
+                <span id="report-none" class="muted small">none yet - pick a device above and tick its interfaces</span>
+            </div>
+            <div class="row">
+                <label for="report-period" class="small">period</label>
+                <select id="report-period">
+                    <option value="this-month" selected>this month so far</option>
+                    <option value="last-month">last month</option>
+                    <option value="last-7">last 7 days</option>
+                    <option value="last-30">last 30 days</option>
+                    <option value="custom">from ... to ...</option>
+                </select>
+                <input type="date" id="report-from" class="hidden">
+                <input type="date" id="report-to" class="hidden">
+                <button type="button" id="report-run" class="btn-primary">Show report</button>
+                <a id="report-csv" class="btn hidden" download>Download CSV</a>
+                <span id="report-msg" class="muted small"></span>
+            </div>
+            <table class="list compact hidden" id="report-table">
+                <thead><tr>
+                    <th>date</th><th>device</th><th>interface</th><th>description</th>
+                    <th class="num">in</th><th class="num">out</th><th class="num">total</th>
+                    <th class="num">peak in</th><th class="num">peak out</th><th class="num">coverage</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
         </div>
 
         <div class="panel" data-section="search">
@@ -191,41 +334,6 @@
                 <tbody></tbody>
             </table>
             <div id="no-reach-events" class="allquiet hidden">no transitions recorded - a fleet that holds its state writes nothing here</div>
-
-            <!-- Slice 10: event rules. Admin-edited because a pattern runs on
-                 the ingest thread per message - authoring one is a hot-path
-                 change. Operators see the list read-only via the API; this
-                 block is the EDITOR and follows the onboarding panel's
-                 admin-only pattern. -->
-            <div class="admin-only hidden" id="rules-block">
-                <h3>Event rules <span class="muted small">a match raises an alert the moment the line arrives; no match for the TTL clears it</span></h3>
-                <table class="list" id="rules-table">
-                    <thead><tr>
-                        <th>rule</th><th>pattern</th><th>source</th><th>severity</th>
-                        <th class="num">clears after</th><th>enabled</th><th></th>
-                    </tr></thead>
-                    <tbody></tbody>
-                </table>
-                <div class="row">
-                    <input type="text" id="rule-name" placeholder="name" size="14" autocomplete="off">
-                    <input type="text" id="rule-pattern" class="grow" autocomplete="off"
-                           placeholder="substring to match - e.g. link state changed, or 1.3.6.1.6.3.1.1.5.3 for linkDown traps">
-                    <label><input type="checkbox" id="rule-regex"> regex</label>
-                    <select id="rule-source">
-                        <option value="any" selected>any</option>
-                        <option value="syslog">syslog</option>
-                        <option value="trap">trap</option>
-                    </select>
-                    <select id="rule-severity">
-                        <option value="warn" selected>warn</option>
-                        <option value="crit">crit</option>
-                    </select>
-                    <input type="text" id="rule-ttl" value="300" size="5" autocomplete="off"
-                           title="seconds without a match before the alert clears">
-                    <button type="button" id="rule-add" class="btn-primary">Add rule</button>
-                </div>
-                <div id="rules-msg" class="muted small"></div>
-            </div>
         </div>
 
         <div class="panel hidden" data-section="alerts" id="alert-panel">
@@ -233,6 +341,11 @@
                 <span id="alert-sub" class="muted"></span></h2>
             <div class="row">
                 <button id="alert-back">Back to alerts</button>
+                <!-- Mute from the alert itself (2026-09-23): the operator looked
+                     for this here first. Shown by renderAlertDetail only for an
+                     admin, on an alert with a per-entity rule to suspend. -->
+                <button type="button" id="alert-mute" class="hidden"></button>
+                <span id="alert-mute-msg" class="muted small"></span>
             </div>
             <div id="alert-facts" class="hints"></div>
             <!-- The note sits BELOW the heading, not inside it: h3 is
@@ -249,7 +362,7 @@
             <div id="no-history" class="allquiet hidden"></div>
         </div>
 
-        <div class="panel" data-section="system">
+        <div class="panel" data-section="system" id="health-panel">
             <h2>Health <span id="health-verdict" class="muted"></span></h2>
             <div id="health-problems" class="hints hidden"></div>
             <div class="row">
@@ -279,79 +392,6 @@
             <div id="slow-agents" class="small hidden"></div>
         </div>
 
-        <div class="panel" data-section="devices" id="roster-panel">
-            <h2>Devices <span id="device-counts" class="muted"></span></h2>
-            <div class="row">
-                <input type="text" id="device-filter" class="grow"
-                       placeholder="filter by name or address" autocomplete="off">
-                <select id="device-scope">
-                    <option value="problems" selected>problems first</option>
-                    <option value="only-problems">problems only</option>
-                    <option value="down">down only</option>
-                    <option value="name">all, by name</option>
-                </select>
-                <button type="button" id="cols-btn" title="Choose and order the columns this table shows - a per-browser preference">Columns</button>
-            </div>
-            <!-- THE COLUMN PANEL. SNMPCanvas's Columns menu, plus the thing it
-                 deliberately left out: ORDER. The parent renders in registry
-                 order whatever you ticked; here the preference is an ordered
-                 list with up/down controls, because a roster tuned for one
-                 operator's eye reads in that operator's order. Per-browser
-                 (localStorage) like the sort: it changes what YOU see. -->
-            <div id="cols-panel" class="hints hidden">
-                <div id="cols-list"></div>
-                <label class="small"><input type="checkbox" id="wide-cb"> wide layout - let the page use the whole window width (for many columns on a big screen)</label>
-                <button type="button" id="cols-reset" class="small"
-                        title="Forget this browser's column order and visibility - back to the out-of-the-box table">Reset to default</button>
-            </div>
-            <div id="roster-msg" class="allquiet hidden"></div>
-            <div class="row hidden" id="roster-actions">
-                <span id="roster-selected" class="muted small"></span>
-                <button type="button" id="roster-disable">Stop watching</button>
-                <button type="button" id="roster-enable">Resume watching</button>
-                <!-- Two buttons because they are two decisions. Rediscover is
-                     additive and safe; "reset tracking" discards manual
-                     selections, so it says so on the button rather than hiding
-                     behind a checkbox nobody reads. -->
-                <input type="text" id="roster-cred" list="ob-cred-list" class="admin-only" size="18"
-                       placeholder="profile or env var" autocomplete="off"
-                       title="Point the selected devices at a credential profile or environment variable name. The picker offers what exists.">
-                <button type="button" id="roster-setcred" class="admin-only">Set credential</button>
-                <!-- Slice 30: transient for a SELECTION. A parlor of guest PCs
-                     is declared as a set; visiting six device pages to flip
-                     one boolean six times was the page being pedantic about
-                     where a fact is entered. -->
-                <button type="button" id="roster-transient">Mark transient</button>
-                <button type="button" id="roster-untransient">Not transient</button>
-                <button type="button" id="roster-rediscover" class="admin-only">Rediscover</button>
-                <!-- Rediscover PRESERVES manual tracking choices; the second
-                     button resets every entity on the selected devices to the
-                     current policy defaults (ifType, name list,
-                     ifConnectorPresent) - without it the discovery fixes can
-                     never reach an already-onboarded device. There was briefly
-                     ALSO a checkbox here, sharing this button's id: the
-                     operator's click handler landed on the checkbox
-                     (getElementById returns the first match), so TICKING THE
-                     BOX fired the rediscover and the button did nothing.
-                     Found by the operator mid-retrack. Two decisions, two
-                     buttons, two ids - and no third control. -->
-                <button type="button" id="roster-rediscover-reset" class="admin-only">Rediscover + reset tracking</button>
-                <button type="button" id="roster-delete" class="admin-only">Delete</button>
-                <button type="button" id="roster-clear">Clear selection</button>
-            </div>
-            <div id="roster-gate" class="hints hidden"></div>
-            <table class="list" id="devices">
-                <!-- The first two headers are the row's identity and never
-                     move; everything after them is rendered from the column
-                     preference (ROSTER_COLS in app.js). -->
-                <thead><tr>
-                    <th><input type="checkbox" id="roster-all" title="select all shown"></th>
-                    <th data-sort="name">device</th>
-                </tr></thead>
-                <tbody></tbody>
-            </table>
-        </div>
-
         <!-- Onboarding lives on the DEVICES section, because that is where
              devices are managed, and is admin-only by the same admin-only
              class the System panels use. The server enforces device.create
@@ -363,9 +403,15 @@
              opens the Devices page prices the page for the rare case. Both
              modes feed the same probe-then-add flow: a single address is a
              one-line paste as far as the machinery cares. -->
-        <div class="panel hidden admin-only" data-section="devices" id="onboard-panel">
+        <!-- THE DEVICES TOOLBAR (2026-09-24, operator): first in the section, and
+             no longer admin-only as a panel. "Back to devices" lives here beside
+             "+ Add device" so the way out of a device page sits where the way in
+             to adding one does; the Add button keeps admin-only itself, and the
+             panel is hidden for a role with nothing in it (syncDeviceToolbar). -->
+        <div class="panel hidden" data-section="devices" id="onboard-panel">
             <div class="row">
-                <button type="button" id="ob-open" class="btn-primary">+ Add device</button>
+                <button type="button" id="device-back" class="hidden">Back to devices</button>
+                <button type="button" id="ob-open" class="btn-primary" data-can="device.create">+ Add device</button>
                 <span id="onboard-sub" class="muted"></span>
             </div>
             <div id="ob-form" class="hidden">
@@ -494,9 +540,180 @@
             </div>
         </div>
 
+        <div class="panel" data-section="devices" id="roster-panel">
+            <h2>Devices <span id="device-counts" class="muted"></span></h2>
+            <div class="row">
+                <input type="text" id="device-filter" class="grow"
+                       placeholder="filter by name or address" autocomplete="off">
+                <select id="device-scope">
+                    <option value="problems" selected>problems first</option>
+                    <option value="only-problems">problems only</option>
+                    <option value="down">down only</option>
+                    <option value="name">all, by name</option>
+                </select>
+                <button type="button" id="cols-btn" title="Choose and order the columns this table shows - a per-browser preference">Columns</button>
+            </div>
+            <!-- THE COLUMN PANEL. SNMPCanvas's Columns menu, plus the thing it
+                 deliberately left out: ORDER. The parent renders in registry
+                 order whatever you ticked; here the preference is an ordered
+                 list with up/down controls, because a roster tuned for one
+                 operator's eye reads in that operator's order. Per-browser
+                 (localStorage) like the sort: it changes what YOU see. -->
+            <div id="cols-panel" class="hints hidden">
+                <div id="cols-list"></div>
+                <label class="small"><input type="checkbox" id="wide-cb"> wide layout - let the page use the whole window width (for many columns on a big screen)</label>
+                <button type="button" id="cols-reset" class="small"
+                        title="Forget this browser's column order and visibility - back to the out-of-the-box table">Reset to default</button>
+            </div>
+            <div id="roster-msg" class="allquiet hidden"></div>
+            <div class="row hidden" id="roster-actions">
+                <span id="roster-selected" class="muted small"></span>
+                <button type="button" id="roster-disable" data-can="device.disable">Stop watching</button>
+                <button type="button" id="roster-enable" data-can="device.disable">Resume watching</button>
+                <!-- Two buttons because they are two decisions. Rediscover is
+                     additive and safe; "reset tracking" discards manual
+                     selections, so it says so on the button rather than hiding
+                     behind a checkbox nobody reads. -->
+                <input type="text" id="roster-cred" list="ob-cred-list" data-can="device.create" size="18"
+                       placeholder="profile or env var" autocomplete="off"
+                       title="Point the selected devices at a credential profile or environment variable name. The picker offers what exists.">
+                <button type="button" id="roster-setcred" data-can="device.create">Set credential</button>
+                <!-- Slice 30: transient for a SELECTION. A parlor of guest PCs
+                     is declared as a set; visiting six device pages to flip
+                     one boolean six times was the page being pedantic about
+                     where a fact is entered. -->
+                <button type="button" id="roster-transient" data-can="device.group">Mark transient</button>
+                <button type="button" id="roster-untransient" data-can="device.group">Not transient</button>
+                <!-- Slice 54: mute for a selection, the same two-button shape. -->
+                <button type="button" id="roster-mute" data-can="device.mute"
+                        title="Nothing on the selected devices raises - down, interfaces, sensors. Still polled and charted.">Mute alerts</button>
+                <button type="button" id="roster-unmute" data-can="device.mute">Unmute alerts</button>
+                <button type="button" id="roster-rediscover" data-can="device.create">Rediscover</button>
+                <!-- Rediscover PRESERVES manual tracking choices; the second
+                     button resets every entity on the selected devices to the
+                     current policy defaults (ifType, name list,
+                     ifConnectorPresent) - without it the discovery fixes can
+                     never reach an already-onboarded device. There was briefly
+                     ALSO a checkbox here, sharing this button's id: the
+                     operator's click handler landed on the checkbox
+                     (getElementById returns the first match), so TICKING THE
+                     BOX fired the rediscover and the button did nothing.
+                     Found by the operator mid-retrack. Two decisions, two
+                     buttons, two ids - and no third control. -->
+                <button type="button" id="roster-rediscover-reset" data-can="device.create">Rediscover + reset tracking</button>
+                <button type="button" id="roster-delete" data-can="device.delete">Delete</button>
+                <button type="button" id="roster-clear">Clear selection</button>
+            </div>
+            <div id="roster-gate" class="hints hidden"></div>
+            <table class="list" id="devices">
+                <!-- The first two headers are the row's identity and never
+                     move; everything after them is rendered from the column
+                     preference (ROSTER_COLS in app.js). -->
+                <thead><tr>
+                    <th><input type="checkbox" id="roster-all" title="select all shown"></th>
+                    <th data-sort="name">device</th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
         <div class="panel hidden" data-section="devices" id="device-panel">
-            <h2><span id="device-title"></span>
-                <span id="device-sub" class="muted"></span></h2>
+            <!-- THE NAME LINE CARRIES THE DECLARATIONS (2026-09-25, operator):
+                 transient and muted are badges beside the name, and location
+                 and application follow the counts, because the controls that
+                 set them now fold away behind Modify - a fact that only
+                 showed as the state of a hidden control would be a fact
+                 nobody sees. Modify is shown to a role that can change
+                 anything in the block, and nobody else. -->
+            <h2 class="device-head"><span id="device-title"></span>
+                <span id="device-badges"></span>
+                <span id="device-sub" class="muted"></span>
+                <span id="device-grouping" class="device-grouping small"></span>
+                <span class="head-spacer"></span>
+                <button type="button" id="device-modify" class="small" aria-expanded="false"
+                        aria-controls="device-edit"
+                        data-can="device.rename device.address alert.suppress device.group device.mute">Modify</button></h2>
+            <!-- An open maintenance window is STATE, not a control, so it stays
+                 visible above the folded edit block. -->
+            <div id="dev-maint" class="hints hidden"></div>
+            <!-- THE EDIT BLOCK folds away behind Modify (2026-09-25): rename,
+                 move, maintenance, grouping, transient and mute are what an
+                 operator changes rarely, and the page is about what the
+                 device is doing. Each row is gated by the action its route
+                 enforces (data-can), so a role sees exactly the rows it can
+                 use - the block is never a wall of refusals. -->
+            <div id="device-edit" class="device-edit hidden">
+            <!-- Grouping is OPTIONAL and the form says so. Empty is a valid,
+                 fully supported state - the product monitors devices, not
+                 groups, and a deployment that never fills these in is not a
+                 degraded one. -->
+            <!-- Rename lives here rather than on the roster because the name
+                 is a fact about ONE device and the page about that device is
+                 where an operator has just confirmed which one it is. -->
+            <form id="rename-form" class="row" data-can="device.rename">
+                <label for="dev-newname">rename to</label>
+                <input type="text" id="dev-newname" placeholder="new device name" autocomplete="off" maxlength="120">
+                <button type="submit">Rename</button>
+                <span id="rename-msg" class="muted small"></span>
+            </form>
+            <!-- A re-addressed device keeps its history: the alternative was
+                 delete and re-add, which threw it away. Polled at the new
+                 address on the next tick. -->
+            <form id="address-form" class="row" data-can="device.address">
+                <label for="dev-newhost">move to</label>
+                <input type="text" id="dev-newhost" placeholder="IP address" autocomplete="off" maxlength="64">
+                <input type="number" id="dev-newport" placeholder="port" min="1" max="65535">
+                <button type="submit">Move</button>
+                <span id="address-msg" class="muted small"></span>
+            </form>
+            <!-- "Maintenance for two hours" lives where the operator already
+                 is when they decide to work on something (slice 22). -->
+            <form id="maint-dev-form" class="row" data-can="alert.suppress">
+                <label for="dev-maint-min">maintenance for</label>
+                <input type="number" id="dev-maint-min" value="120" min="1" max="43200"> minutes
+                <input type="text" id="dev-maint-note" placeholder="optional note" maxlength="500">
+                <button type="submit">Start window</button>
+                <span id="maint-dev-msg" class="muted small"></span>
+            </form>
+            <form id="grouping-form" class="row" data-can="device.group">
+                <label for="dev-location">location</label>
+                <input type="text" id="dev-location" placeholder="optional - e.g. HQ / Floor 2 / Rack 4"
+                       autocomplete="off" maxlength="120">
+                <label for="dev-application">application</label>
+                <input type="text" id="dev-application" placeholder="optional - e.g. PAM Prod"
+                       autocomplete="off" maxlength="120">
+                <button type="submit">Save</button>
+                <span id="grouping-msg" class="muted small"></span>
+            </form>
+            <!-- Slice 25 quiet 2: the transient declaration, beside grouping
+                 because it is the same posture - a fact about the device an
+                 operator states in advance, never derived from behavior.
+                 THE LABEL IS ONE WORD ON PURPOSE (operator finding,
+                 2026-08-28): the first version wrapped the whole explainer
+                 sentence in the label, so any casual click on the text
+                 toggled the declaration - and it saves on toggle, so a
+                 stray click silently re-armed device-down and the next
+                 reboot paged. The explainer is plain text now: readable,
+                 not clickable. -->
+            <div class="row" data-can="device.group">
+                <label class="small"><input type="checkbox" id="dev-transient"> transient</label>
+                <span class="muted small">a guest PC, parlor station, HTPC: off is a state, not a
+                    fault. While set, device-down never raises - the device renders "off"
+                    and keeps being polled. Saves when toggled.</span>
+                <span id="transient-msg" class="small"></span>
+            </div>
+            <!-- Slice 54: mute the whole device. Beside transient because the
+                 two are asked together - "off is fine" versus "I do not want
+                 to hear about this box at all" - and the explainer says which
+                 is which, since transient silences only absence. -->
+            <div class="row" data-can="device.mute">
+                <label class="small"><input type="checkbox" id="dev-muted"> mute alerts</label>
+                <span class="muted small">nothing on this device raises - down, interfaces, sensors.
+                    It is still polled and charted, and anything open clears within a few scans.
+                    Syslog and trap rules are not affected. Saves when toggled.</span>
+                <span id="mute-msg" class="small"></span>
+            </div>
+            </div>
             <!-- The device's own state, on the page about that device. The
                  roster showed down and this panel did not, so a dead device
                  read as healthy here apart from an easily-missed "43m ago" on
@@ -520,72 +737,6 @@
                     <tbody></tbody>
                 </table>
             </div>
-            <div class="row">
-                <button id="device-back">Back to devices</button>
-                <input type="text" id="entity-filter" class="grow"
-                       placeholder="filter interfaces" autocomplete="off">
-            </div>
-            <!-- Grouping is OPTIONAL and the form says so. Empty is a valid,
-                 fully supported state - the product monitors devices, not
-                 groups, and a deployment that never fills these in is not a
-                 degraded one. -->
-            <!-- Rename lives here rather than on the roster because the name
-                 is a fact about ONE device and the page about that device is
-                 where an operator has just confirmed which one it is. -->
-            <form id="rename-form" class="row admin-only">
-                <label for="dev-newname">rename to</label>
-                <input type="text" id="dev-newname" placeholder="new device name" autocomplete="off" maxlength="120">
-                <button type="submit">Rename</button>
-                <span id="rename-msg" class="muted small"></span>
-            </form>
-            <!-- A re-addressed device keeps its history: the alternative was
-                 delete and re-add, which threw it away. Polled at the new
-                 address on the next tick. -->
-            <form id="address-form" class="row admin-only">
-                <label for="dev-newhost">move to</label>
-                <input type="text" id="dev-newhost" placeholder="IP address" autocomplete="off" maxlength="64">
-                <input type="number" id="dev-newport" placeholder="port" min="1" max="65535">
-                <button type="submit">Move</button>
-                <span id="address-msg" class="muted small"></span>
-            </form>
-            <!-- "Maintenance for two hours" lives where the operator already
-                 is when they decide to work on something (slice 22). -->
-            <div id="dev-maint" class="hints hidden"></div>
-            <form id="maint-dev-form" class="row">
-                <label for="dev-maint-min">maintenance for</label>
-                <input type="number" id="dev-maint-min" value="120" min="1" max="43200"> minutes
-                <input type="text" id="dev-maint-note" placeholder="optional note" maxlength="500">
-                <button type="submit">Start window</button>
-                <span id="maint-dev-msg" class="muted small"></span>
-            </form>
-            <form id="grouping-form" class="row">
-                <label for="dev-location">location</label>
-                <input type="text" id="dev-location" placeholder="optional - e.g. HQ / Floor 2 / Rack 4"
-                       autocomplete="off" maxlength="120">
-                <label for="dev-application">application</label>
-                <input type="text" id="dev-application" placeholder="optional - e.g. PAM Prod"
-                       autocomplete="off" maxlength="120">
-                <button type="submit">Save</button>
-                <span id="grouping-msg" class="muted small"></span>
-            </form>
-            <!-- Slice 25 quiet 2: the transient declaration, beside grouping
-                 because it is the same posture - a fact about the device an
-                 operator states in advance, never derived from behavior.
-                 THE LABEL IS ONE WORD ON PURPOSE (operator finding,
-                 2026-08-28): the first version wrapped the whole explainer
-                 sentence in the label, so any casual click on the text
-                 toggled the declaration - and it saves on toggle, so a
-                 stray click silently re-armed device-down and the next
-                 reboot paged. The explainer is plain text now: readable,
-                 not clickable. -->
-            <div class="row">
-                <label class="small"><input type="checkbox" id="dev-transient"> transient</label>
-                <span class="muted small">a guest PC, parlor station, HTPC: off is a state, not a
-                    fault. While set, device-down never raises - the device renders "off"
-                    and keeps being polled. Saves when toggled.</span>
-                <span id="transient-msg" class="small"></span>
-            </div>
-            <div id="device-msg" class="allquiet hidden"></div>
             <!-- Sensor cards (the sensors slice): current reading plus a bar,
                  above the interface table - the parent's layout, which the
                  operator named as the porting bar. -->
@@ -623,6 +774,13 @@
                 <div id="chart-errs"></div>
                 <div id="chart-errs-quiet" class="allquiet hidden"></div>
             </div>
+            <!-- The interface filter sits directly above the table it filters,
+                 below the sensor cards it never touched (operator, 2026-09-24). -->
+            <div class="row">
+                <input type="text" id="entity-filter" class="grow"
+                       placeholder="filter interfaces" autocomplete="off">
+            </div>
+            <div id="device-msg" class="allquiet hidden"></div>
             <table class="list" id="entities">
                 <thead><tr>
                     <th>interface</th><th>description</th><th class="num">speed</th><th>state</th>
@@ -650,7 +808,7 @@
                 <tbody></tbody>
             </table>
             <div id="no-maint" class="muted small">none - notifications flow normally</div>
-            <form id="maint-form" class="row">
+            <form id="maint-form" class="row" data-can="alert.suppress">
                 <select id="maint-scope">
                     <option value="device">device</option>
                     <option value="location">location</option>
@@ -684,7 +842,7 @@
                 <tbody></tbody>
             </table>
             <div id="no-policy" class="muted small">none - every alert pages normally</div>
-            <form id="policy-form" class="row">
+            <form id="policy-form" class="row" data-can="alert.suppress">
                 <select id="policy-scope">
                     <option value="application">application</option>
                     <option value="location">location</option>
@@ -697,6 +855,31 @@
                 <button type="submit">Stand policy</button>
                 <span id="policy-msg" class="muted small"></span>
             </form>
+        </div>
+        <!-- MY ACCOUNT (2026-09-25, operator): every role may change its own
+             password (user.setPasswordOwn), and the page never offered it
+             outside the admin's Users panel - a viewer had no way to do what
+             the server allowed. The server asks for the current password,
+             keeps this session and signs out the account's other sessions;
+             the form asks for the new one twice. Clicking your name in the
+             top bar opens this panel. -->
+        <div class="panel hidden" data-section="system" id="account-panel" data-can="user.setPasswordOwn">
+            <h2>My account <span id="account-sub" class="muted"></span></h2>
+            <form id="password-form" class="row">
+                <!-- For password managers: which account this form is for. -->
+                <input type="text" id="pw-username" class="hidden" autocomplete="username" readonly tabindex="-1">
+                <label for="pw-current" class="small">current password</label>
+                <input type="password" id="pw-current" autocomplete="current-password" required>
+                <label for="pw-new" class="small">new password</label>
+                <input type="password" id="pw-new" autocomplete="new-password" minlength="8" required>
+                <label for="pw-confirm" class="small">again</label>
+                <input type="password" id="pw-confirm" autocomplete="new-password" minlength="8" required>
+                <button type="submit">Change password</button>
+                <span id="pw-msg" class="small"></span>
+            </form>
+            <p class="muted small">At least 8 characters. This browser stays signed in; any other
+               session of yours is signed out, so a password someone else learned stops working
+               everywhere at once.</p>
         </div>
         <div class="panel hidden admin-only" data-section="system" id="retention-panel">
             <h2>Retention <span id="retention-sub" class="muted"></span></h2>
@@ -761,6 +944,51 @@
             </table>
             <h3>Defaults</h3>
             <div id="th-defaults" class="muted small"></div>
+        </div>
+        <!-- SYSLOG AND TRAP ALERT RULES (slice 10), moved here from the bottom
+             of the Alerts page (2026-09-25, operator): a rule is configuration,
+             like Thresholds beside it, and it folds with the rest of System.
+             The operator who built the fleet could not tell what the old block
+             ("Event rules") did, so it is named for what it watches and says
+             what a rule is for. Operators READ the list (alertrule.read); only
+             an admin edits it, because a pattern runs on the ingest thread per
+             message - authoring one is a change to the hot path. -->
+        <div class="panel hidden" data-section="system" id="rules-panel" data-can="alertrule.read">
+            <h2>Syslog and trap alert rules <span id="rules-sub" class="muted"></span></h2>
+            <p class="muted small">Raise an alert when an incoming syslog message or SNMP trap
+               matches a pattern - "authentication failure" in a log line, or a linkDown
+               trap's OID. The alert raises the moment a matching message arrives, names the
+               device that sent it, and clears on its own once no matching message has arrived
+               for the "clears after" time. Rules run on every message received, so keep
+               patterns specific.</p>
+            <table class="list" id="rules-table">
+                <thead><tr>
+                    <th>rule</th><th>pattern</th><th>source</th><th>severity</th>
+                    <th class="num">clears after</th><th>enabled</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div class="row" data-can="alertrule.write">
+                <input type="text" id="rule-name" placeholder="name" size="14" autocomplete="off">
+                <input type="text" id="rule-pattern" class="grow" autocomplete="off"
+                       placeholder="substring to match - e.g. link state changed, or 1.3.6.1.6.3.1.1.5.3 for linkDown traps">
+                <label><input type="checkbox" id="rule-regex"> regex</label>
+                <label for="rule-source" class="small muted">from</label>
+                <select id="rule-source">
+                    <option value="any" selected>syslog or trap</option>
+                    <option value="syslog">syslog only</option>
+                    <option value="trap">traps only</option>
+                </select>
+                <select id="rule-severity">
+                    <option value="warn" selected>warn</option>
+                    <option value="crit">crit</option>
+                </select>
+                <label for="rule-ttl" class="small muted">clears after</label>
+                <input type="text" id="rule-ttl" value="300" size="5" autocomplete="off"
+                       title="seconds without a match before the alert clears"> <span class="small muted">s</span>
+                <button type="button" id="rule-add" class="btn-primary">Add rule</button>
+            </div>
+            <div id="rules-msg" class="muted small"></div>
         </div>
         <div class="panel hidden admin-only" data-section="system" id="credentials-panel">
             <h2>Credentials <span id="cred-sub" class="muted"></span></h2>

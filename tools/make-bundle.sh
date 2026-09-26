@@ -41,7 +41,9 @@ cd "$HERE"
 PAYLOAD=(
     package.json package-lock.json tsconfig.json
     src sql public tools
-    README.md INSTALL.md TESTING.md KNOWN-ISSUES.md LICENSE NOTICE-ICONS.md
+    README.md INSTALL.md TESTING.md KNOWN-ISSUES.md CHANGELOG.md LICENSE NOTICE-ICONS.md
+    # CHANGELOG.md since 0.1.0-alpha.2: the README tells a reader it "says what
+    # changed", and a bundle that ships the README without it sends them looking.
     # The installer travels WITH the code it installs, because the sequence it
     # encodes is version-specific: the slice list, the build-then-harden order
     # and the role split all belong to this commit. An installer fetched
@@ -96,28 +98,39 @@ echo "  deps:    $([ "$WITH_DEPS" = 1 ] && echo 'included (portable - no native 
 # an artifact that cannot say whether it was checked must not read as checked.
 echo "=== dependency audit"
 AUDIT_LINE=""
-if AUDIT_JSON="$(npm audit --omit=dev --json 2>/dev/null)"; then
-    VULNS="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
-        try{const t=JSON.parse(s).metadata.vulnerabilities;
-        const bad=(t.critical||0)+(t.high||0);
-        console.log(bad+" "+((t.moderate||0)+(t.low||0)));}catch(e){console.log("? ?")}})' <<< "$AUDIT_JSON")"
-    HIGH="${VULNS%% *}"
-    REST="${VULNS##* }"
-    if [ "$HIGH" = "?" ]; then
+# THE EXIT STATUS IS NOT THE ANSWER (2026-09-24). npm audit exits 1 when it
+# FINDS vulnerabilities, and this gate used to read any non-zero exit as
+# "registry unreachable" - so the one case it exists for, a high advisory in
+# a runtime dependency, was recorded as NOT RUN and shipped. Found cutting the
+# 6ade0d8 production bundle: nodemailer 9.0.3 carried a high advisory
+# (GHSA-2x7j-588g-ccc2) and the bundle built anyway. The JSON is the answer:
+# a report with metadata.vulnerabilities is a real audit whatever the exit
+# status; no report is an audit that did not happen.
+AUDIT_JSON="$(npm audit --omit=dev --json 2>/dev/null)"
+AUDIT_RC=$?
+VULNS="$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+    try{const t=JSON.parse(s).metadata.vulnerabilities;
+    if(!t||typeof t!=="object")throw new Error("no report");
+    const bad=(t.critical||0)+(t.high||0);
+    console.log(bad+" "+((t.moderate||0)+(t.low||0)));}catch(e){console.log("? ?")}})' <<< "$AUDIT_JSON")"
+HIGH="${VULNS%% *}"
+REST="${VULNS##* }"
+if [ "$HIGH" = "?" ]; then
+    if [ "$AUDIT_RC" != "0" ]; then
+        AUDIT_LINE="audit:       NOT RUN - no report from npm audit (registry unreachable?) at build time"
+        echo "  WARNING: npm audit produced no report (exit ${AUDIT_RC}) - the bundle records NOT RUN"
+    else
         AUDIT_LINE="audit:       INCONCLUSIVE - could not parse npm audit output"
         echo "  WARNING: could not parse npm audit output"
-    elif [ "$HIGH" != "0" ]; then
-        AUDIT_LINE="audit:       ${HIGH} high/critical, ${REST} moderate/low"
-        echo "  REFUSING: ${HIGH} high or critical advisory in runtime dependencies."
-        echo "  Run 'npm audit --omit=dev' and fix or justify before shipping."
-        exit 1
-    else
-        AUDIT_LINE="audit:       clean (0 high/critical, ${REST} moderate/low) at ${STAMP}"
-        echo "  ok   0 high/critical, ${REST} moderate/low"
     fi
+elif [ "$HIGH" != "0" ]; then
+    AUDIT_LINE="audit:       ${HIGH} high/critical, ${REST} moderate/low"
+    echo "  REFUSING: ${HIGH} high or critical advisory in runtime dependencies."
+    echo "  Run 'npm audit --omit=dev' and fix or justify before shipping."
+    exit 1
 else
-    AUDIT_LINE="audit:       NOT RUN - registry unreachable at build time"
-    echo "  WARNING: npm audit could not reach the registry - the bundle records NOT RUN"
+    AUDIT_LINE="audit:       clean (0 high/critical, ${REST} moderate/low) at ${STAMP}"
+    echo "  ok   0 high/critical, ${REST} moderate/low"
 fi
 
 # The four resolved runtime versions, so a deployed tree can name its

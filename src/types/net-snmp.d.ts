@@ -71,6 +71,8 @@ declare module 'net-snmp' {
         timeout?: number;
         version?: number;
         transport?: string;
+        /** Where trap() sends (index.js:2036, default 162). tools/trap-load.ts. */
+        trapPort?: number;
     }
 
     export interface WalkVarbind {
@@ -90,6 +92,17 @@ declare module 'net-snmp' {
             doneCallback: (error: Error | null) => void,
         ): void;
         close(): void;
+        /**
+         * Send one SNMPv2c trap: sysUpTime.0 and snmpTrapOID.0 (typeOrOid) are
+         * prepended by the library, then these varbinds (index.js:2777). The
+         * callback fires once the datagram is handed to the socket - a v2c
+         * trap is unacknowledged. Declared for tools/trap-load.ts, the only
+         * caller; the three-argument form is the one verified.
+         */
+        trap(
+            typeOrOid: string | number, varbinds: Varbind[],
+            callback: (error: Error | null) => void,
+        ): void;
         /**
          * Session extends EventEmitter (index.js:2100,
          * `util.inherits(Session, events.EventEmitter)`), and it EMITS.

@@ -5,7 +5,8 @@
 // SLICE-THRESHOLDS-PLAN done-when 2.
 
 import { rowScope, rowToOverride, overrideKey, mergeOverrides } from '../src/alerts/overrides.ts';
-import type { RulesConfig } from '../src/alerts/rules.ts';
+import type { RulesConfig, Override } from '../src/alerts/rules.ts';
+import { evaluate, buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS } from '../src/alerts/rules.ts';
 
 let pass = 0, fail = 0;
 const eq = (l: string, got: unknown, want: unknown): void => {
@@ -55,6 +56,73 @@ const env: RulesConfig = {
     // the engine's job, the merge only keys them.
     const m = mergeOverrides({ ...env, overrides: [] }, [row({ enabled: false }), row({ host: 'hot', warn: 80, crit: 95 })]);
     eq('kind row and host-kind row for one kind are BOTH kept', m.overrides!.length, 2);
+}
+
+// --- resolveRuleInfo AGAINST THE ENGINE (2026-09-23) --------------------------
+//
+// The device page's interface badge and the alert detail's MUTED line both
+// come from resolveRuleInfo. Their claim is "this rule raises nothing", and
+// the only honest test of that claim is the engine itself. So for each
+// override arrangement, an interface breaching ALL FOUR rules and a CPU
+// breaching its default are evaluated, and "muted" from the resolver must
+// equal "no condition of that kind" from evaluate() - per kind, per case.
+console.log('\nresolveRuleInfo agrees with evaluate():');
+{
+    const base: RulesConfig = {
+        thresholds: { cpu: { warn: 80, crit: 90 } },
+        ifRules: {
+            down: { enabled: true, severity: 'crit' },
+            errors: { warn: 1, crit: 10 }, discards: { warn: 5, crit: 50 }, util: { warn: 80, crit: 95 },
+        },
+        deviceDown: { enabled: true, severity: 'crit' },
+        overrides: [],
+    };
+    const doc = {
+        devices: [{ name: 'sw1', host: '192.0.2.1', status: 'up' }],
+        interfaces: [{ id: 'sw1:1', code: 'IFAA', name: 'Gi0/1', device: { name: 'sw1', status: 'up' },
+            adminStatus: 'up', operStatus: 'down', speedBps: 1e9, inBps: 9.9e8, outBps: 0,
+            inErrorsPerSec: 100, outErrorsPerSec: 0, inDiscardsPerSec: 100, outDiscardsPerSec: 0 }],
+        metrics: [{ code: 'CPU1', host: 'sw1', kind: 'cpu', value: 99 }],
+    };
+    const cases: Array<[string, Override[]]> = [
+        ['no overrides', []],
+        ['code mute on if-down', [{ scope: 'code', code: 'IFAA', kind: 'if-down', enabled: false }]],
+        ['code mute on all four', IF_RULE_KINDS.map((k) => ({ scope: 'code' as const, code: 'IFAA', kind: k, enabled: false }))],
+        ['host-kind mute on if-errors', [{ scope: 'host-kind', host: 'sw1', kind: 'if-errors', enabled: false }]],
+        ['kind mute on if-util', [{ scope: 'kind', kind: 'if-util', enabled: false }]],
+        ['a mute on ANOTHER interface', [{ scope: 'code', code: 'IFZZ', kind: 'if-down', enabled: false }]],
+        ['code levels on if-util (99/100)', [{ scope: 'code', code: 'IFAA', kind: 'if-util', warn: 99, crit: 100, enabled: true }]],
+        ['code mute on the cpu sensor', [{ scope: 'code', code: 'CPU1', kind: 'cpu', enabled: false }]],
+    ];
+    let judged = 0;
+    for (const [name, overrides] of cases) {
+        const cfg = { ...base, overrides };
+        const idx = buildOverrideIndex(overrides);
+        const cs = evaluate(doc as never, cfg);
+        for (const k of [...IF_RULE_KINDS, 'cpu']) {
+            const code = k === 'cpu' ? 'CPU1' : 'IFAA';
+            const info = resolveRuleInfo(idx, cfg, k, code, 'sw1');
+            const cond = cs.find((c) => c.code === code && c.kind === k);
+            eq(`${name}: ${k} muted=${info.muted} matches the engine`, info.muted, cond === undefined);
+            if (cond && info.levels && cond.severity !== null) {
+                judged++;
+                const want = cond.severity === 'crit' ? info.levels.crit : info.levels.warn;
+                eq(`${name}: ${k} levels are the ones the engine judged against`, cond.threshold, want);
+            }
+        }
+    }
+    // The fixture must actually breach, or "no condition" would be true for
+    // every kind and the comparison above would prove nothing.
+    eq('the fixture breaches: leveled conditions were judged in every unmuted case', judged > 20, true);
+    const idx = buildOverrideIndex([]);
+    eq('if-down resolves as a yes/no rule - no levels', resolveRuleInfo(idx, base, 'if-down', 'IFAA', 'sw1'),
+        { source: 'default', muted: false, levels: null });
+    eq('device-down keys by host and resolves too',
+        resolveRuleInfo(buildOverrideIndex([{ scope: 'host-kind', host: 'sw1', kind: 'device-down', enabled: false }]),
+            base, 'device-down', null, 'sw1').muted, true);
+    eq('a kind the engine never evaluates answers none, even with a row naming it',
+        resolveRuleInfo(buildOverrideIndex([{ scope: 'code', code: 'IFAA', kind: 'if-bogus', enabled: false }]),
+            base, 'if-bogus', 'IFAA', 'sw1').source, 'none');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

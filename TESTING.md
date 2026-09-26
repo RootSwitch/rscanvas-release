@@ -23,7 +23,7 @@ and the instruments that produced every number are in `tools/`.
 - **A daily fault window** (`tools/soak-fault.sh`): a slice of the fleet
   taken away for ten minutes each night, so alerting and recovery are
   exercised every day of a run rather than assumed.
-- **The offline suite** (`npm test`): about sixty test files and a dozen
+- **The offline suite** (`npm test`): forty-five test files and sixteen
   static checkers that hold invariants the reviews kept finding one instance
   at a time - every query on a declared lane, no DOM injection sinks, no
   duplicate SQL definitions, every worker message type with a sender, and
@@ -54,8 +54,8 @@ every night. The collector thread crossed 50 ms about sixty times an hour
 for the whole run - 0.020% of its ticks, worst 103 ms - while the idle
 control was clean in every hour and the other two threads never crossed
 once. The plan's own wording does not allow that to be called a pass, so it
-is not. The cause is not attributed; a garbage-collection trace on the
-collector under that load is the next measurement. Two criteria were not
+is not. The cause was attributed and fixed afterwards - it was not garbage
+collection - and the section below has the measurement. Two criteria were not
 exercised at that scale, syslog volume and search under load, and the record
 says so rather than borrowing credit from the 10k soak.
 
@@ -70,12 +70,29 @@ A four-core mini PC held 400 devices with syslog for four weeks on the
 previous build with a clean nightly sawtooth, a flat 450 MB process, and a
 collector that sat at the health report's 0.10% stall edge throughout. On the
 current build it polls the same fleet with a slower median and the same
-cadence, a finding still open in `KNOWN-ISSUES.md`.
+cadence - since attributed on two identical boxes, below.
+
+## Since the first alpha: three measurements
+
+These were investigations and measurement ladders on a rebuilt lab of three
+mini PCs, not pre-registered campaigns, and are reported as such. The fleet
+for all three was the 30k ceiling run's: 1,550 mock devices, 29,988
+entities, 78 dead by design, served from its own box.
+
+| measurement | box under test | what it found |
+|---|---|---|
+| the slower median, A/B | two identical 4-core Intel N150 mini PCs, one per build | the gap was mostly the test fleet: one mock process answering for 450 devices on the poller's own CPU. With the fleet moved to another box as ten-device processes, 55 against 31 ms, and that remainder is the sensors and 32-bit counters the newer build reads |
+| syslog and traps at scale | an 8-thread Ryzen mini PC, 32 GB, NVMe, polling the 30k fleet throughout, a generator on a second box | nothing lost below 15,000 syslog or 12,500 traps a second; write ceiling about 16,400 syslog rows and 13,700 traps a second; the ingest thread never over 50 ms at any rate; every loss above the ceiling counted by the application, the kernel dropping nothing once its receive buffer was sized |
+| the collector's stalls | the same Ryzen box at 30k | a CPU profile of every thread and a garbage-collection trace: not garbage collection (2% of the stall time, no pause over 25 ms), but rows handed to the database one at a time and a timing summary sorted four times a second. Fixed; 70 stalls in five minutes before, under one after, health green at the design ceiling |
+
+The ingest ladder ran the same build twice, identical but for how message
+rows reached the socket, so the one-row-at-a-time cost was measured rather
+than inferred: a fifth of the ceiling, and the ingest thread's stalls.
 
 ## What was not tested
 
-High availability, failover, multi-tenancy, 30,000 entities on small
-hardware, syslog at the 30k scale, search latency under a heavy query load
-at the 30k scale, and real-hardware SNMP beyond one operator's network of
-about forty devices. Each is stated so that nothing above is read as
-covering it.
+High availability, failover, multi-tenancy, 30,000 entities on anything
+smaller than the 8-thread, 32 GB mini PC above, search latency under a heavy
+query load at the 30k scale, how quickly the pages answer at the 30k scale,
+and real-hardware SNMP beyond one operator's network of about forty devices.
+Each is stated so that nothing above is read as covering it.

@@ -1,0 +1,58 @@
+{
+ "ok": true,
+ "overrides": [
+  {
+   "id": "1",
+   "kind": "temp",
+   "host": null,
+   "code": null,
+   "scope": "kind",
+   "warn": null,
+   "crit": null,
+   "enabled": false,
+   "note": "Shipped default: temperature alerts are OFF. No single threshold fits a disk, a CPU and an NVMe. Delete this row to restore warn 45 / crit 55 everywhere, or add per-device overrides above it.",
+   "updatedTs": "2026-09-24T12:55:52.567Z",
+   "entityName": null,
+   "deviceName": null
+  }
+ ],
+ "defaults": {
+  "cpu": {
+   "warn": 85,
+   "crit": 95
+  },
+  "mem": {
+   "warn": 85,
+   "crit": 95
+  },
+  "disk": {
+   "warn": 85,
+   "crit": 95
+  },
+  "temp": {
+   "warn": 45,
+   "crit": 55
+  },
+  "util": {
+   "warn": 70,
+   "crit": 90
+  },
+  "battery": {
+   "warn": 50,
+   "crit": 20
+  },
+  "runtime": {
+   "warn": 600,
+   "crit": 300
+  },
+  "fan": null,
+  "power": null,
+  "outlet": null,
+  "uptime": null,
+  "meter": null,
+  "state": {
+   "warn": null,
+   "crit": 1
+  }
+ }
+}

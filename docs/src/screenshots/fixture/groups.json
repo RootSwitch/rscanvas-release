@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "axis": "location",
+ "groups": [
+  {
+   "value": null,
+   "devices": "1550",
+   "down": "78"
+  }
+ ]
+}

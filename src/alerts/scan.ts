@@ -280,6 +280,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     const doc: ScanDoc = {
         devices: devices.rows.map((d) => ({
             name: d.name, host: d.host, status: d.status, transient: d.transient,
+            muted: d.alerts_muted,
         })),
         // THE GHOST GATE (src/alerts/ghosts.ts): a row whose went-quiet
         // stamp outlived the horizon leaves the doc entirely, so its

@@ -125,7 +125,14 @@ export type Action =
     // required end time; the alerts themselves raise and display normally.
     // Reversible, self-expiring shift work - the same family as
     // device.disable and device.track: operator and up, never viewer.
-    | 'alert.suppress';
+    | 'alert.suppress'
+    // Muting a device (2026-09-25, operator request) stops its polled alerts
+    // from RAISING at all - device-down, interfaces, sensors - where
+    // alert.suppress only withholds delivery. Untracking an interface is the
+    // per-row version of the same act and is already operator work, and the
+    // device keeps being polled and charted, so it sits with device.track:
+    // reversible with one click, operator and up, never viewer.
+    | 'device.mute';
 
 export interface Resource {
     type: 'system' | 'user' | 'syslog' | 'board';
@@ -170,6 +177,7 @@ const BY_ROLE: Record<Role, ReadonlySet<Action>> = {
         'device.disable',
         'device.track',
         'device.speed',
+        'device.mute',
         'alert.suppress',
         // Tagging is the operator's job - they are the ones who know which
         // rack a switch is in and which application a server serves. A viewer
@@ -205,6 +213,7 @@ const BY_ROLE: Record<Role, ReadonlySet<Action>> = {
         'device.delete',
         'device.track',
         'device.speed',
+        'device.mute',
         'device.rename',
         'device.address',
         'alert.suppress',
@@ -303,4 +312,17 @@ export function authorize(
 /** Convenience for handlers: throws nothing, returns the decision to render. */
 export function can(principal: Principal, action: Action, resource?: Resource): boolean {
     return authorize(principal, action, resource).allowed;
+}
+
+/**
+ * The actions a role holds, for the web client to decide which CONTROLS to
+ * show (2026-09-25). This is not the access control - every route still asks
+ * authorize() - it is the difference between a door that is locked and a
+ * door that is not advertised. The client used to know only "admin or not",
+ * so operator controls hid from operators and viewers were shown forms the
+ * server then refused. Read from BY_ROLE, the table authorize() itself
+ * uses, so the page and the server cannot disagree about a role.
+ */
+export function actionsFor(role: Role): Action[] {
+    return [...BY_ROLE[role]].sort();
 }

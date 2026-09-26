@@ -39,6 +39,7 @@ import {
 } from '../alerts/events.ts';
 import { socketStats, systemStats, describeRcvbuf, PROC_AVAILABLE } from '../net/udpstats.ts';
 import type { IngestStats } from './protocol.ts';
+import { makeFlushGate } from './flush-gate.ts';
 
 const FLUSH_MS = 300;
 const FLUSH_ROWS = 200;
@@ -59,7 +60,9 @@ let truncated = 0;
 let laneBusyEvents = 0;
 let running = true;
 let flushing = false;
-let flushTimer: NodeJS.Timeout | null = null;
+// The flush timer lives in a gate that clears its handle before firing - see
+// flush-gate.ts for the stale-handle defect the lab-5 ingest run found here.
+const flushGate = makeFlushGate(() => { flush().catch(onAsyncError); }, FLUSH_MS);
 /**
  * The chunk currently between the queue and a committed COPY.
  *
@@ -243,15 +246,14 @@ function enqueue(row: MessageRow): void {
 
     if (queue.length >= FLUSH_ROWS) {
         flush().catch(onAsyncError);
-    } else if (flushTimer === null) {
-        flushTimer = setTimeout(() => { flush().catch(onAsyncError); }, FLUSH_MS);
-        flushTimer.unref();
+    } else {
+        flushGate.armIfIdle();
     }
 }
 
 async function flush(): Promise<void> {
     if (flushing) return;
-    if (flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null; }
+    flushGate.disarm();
     if (queue.length === 0) return;
 
     flushing = true;
@@ -327,10 +329,7 @@ async function flush(): Promise<void> {
         //
         // One line, and it also removes an entire hypothesis about the
         // intermittent sigterm failure rather than leaving it to be argued.
-        if (queue.length > 0 && flushTimer === null && running) {
-            flushTimer = setTimeout(() => { flush().catch(onAsyncError); }, FLUSH_MS);
-            flushTimer.unref();
-        }
+        if (queue.length > 0 && running) flushGate.armIfIdle();
     }
 }
 
@@ -618,6 +617,38 @@ async function bindTraps(): Promise<TrapReceiver | null> {
             }
         },
     ) as unknown as TrapReceiver;
+
+    // SIZE THE TRAP SOCKET LIKE THE SYSLOG ONE (2026-09-24, the lab-5 ingest
+    // test). net-snmp creates the receiver's socket itself with no buffer
+    // option (index.js:3105, dgram.createSocket(transport) and bind), so the
+    // trap socket ran on the kernel DEFAULT (rmem_default, 212,992 bytes on
+    // Ubuntu) while syslog asked for RCVBUF_BYTES - the half of the ingest
+    // worker's "the OS buffer absorbs ~300 ms of not-reading" promise that
+    // nothing had ever set. Reached through the receiver's listener
+    // (index.js:3441 this.listener, 3102 this.sockets), which the ambient
+    // types deliberately leave undeclared; if a library upgrade moves it, the
+    // log says so instead of the socket silently staying small.
+    const sockets = Object.values(
+        (receiver as unknown as { listener?: { sockets?: Record<string, dgram.Socket> } }).listener?.sockets ?? {});
+    if (sockets.length === 0) {
+        log('WARNING could not reach the trap receiver\'s socket to size SO_RCVBUF - '
+            + 'traps run on the kernel default buffer (net-snmp internals moved?)');
+    }
+    for (const s of sockets) {
+        // bind() is asynchronous and setRecvBufferSize needs a bound socket,
+        // so this waits for 'listening'; attaching here, synchronously after
+        // createReceiver returned, cannot miss the event.
+        s.once('listening', () => {
+            try {
+                s.setRecvBufferSize(CONFIG.rcvbufBytes);
+            } catch (err) {
+                log(`WARNING could not set the trap socket's SO_RCVBUF: ${(err as Error).message}`);
+            }
+            const rb = describeRcvbuf(CONFIG.rcvbufBytes, s.getRecvBufferSize());
+            log(`  traps SO_RCVBUF requested ${rb.requestedBytes} bytes, kernel reports ${rb.actualBytes}`
+                + (rb.clamped ? '  CLAMPED - raise net.core.rmem_max' : ''));
+        });
+    }
 
     log(`traps listening on udp/${CONFIG.trapPort}`);
     const s = socketStats(CONFIG.trapPort);

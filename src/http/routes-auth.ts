@@ -6,7 +6,7 @@
 
 import type http from 'node:http';
 import * as auth from '../auth/index.ts';
-import { isRole, type Principal, type Role } from '../auth/authorize.ts';
+import { actionsFor, isRole, type Principal, type Role } from '../auth/authorize.ts';
 import { sendJson, readJsonBody, str, clientIp, inetOrNull, enforce } from './respond.ts';
 
 function fail(res: http.ServerResponse, status: number, detail: string): void {
@@ -58,7 +58,10 @@ export async function login(req: http.IncomingMessage, res: http.ServerResponse)
 
     sendJson(res, 200, {
         ok: true,
-        user: { username: user.username, role: user.role },
+        // `can`: which controls the page should show this role (actionsFor
+        // says why). The same shape /api/me returns, so a fresh login and a
+        // reload with a live cookie gate the page identically.
+        user: { username: user.username, role: user.role, can: actionsFor(user.role) },
     }, { 'set-cookie': auth.sessionCookie(token) });
 }
 
@@ -81,7 +84,7 @@ export function me(res: http.ServerResponse, principal: Principal): void {
     sendJson(res, 200, {
         ok: true,
         authenticated: true,
-        user: { username: principal.username, role: principal.role },
+        user: { username: principal.username, role: principal.role, can: actionsFor(principal.role) },
     });
 }
 

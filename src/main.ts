@@ -44,7 +44,7 @@ import { encrypt, decrypt, credentialStoreReady, CredentialKeyMissing } from './
 import { validateProfile, isPermittedEnvRef, type ProfileView } from './credentials/profiles.ts';
 import { loadRulesConfig } from './alerts/scan.ts';
 import { mergeOverrides } from './alerts/overrides.ts';
-import { buildOverrideIndex, resolveLevelsInfo } from './alerts/rules.ts';
+import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS } from './alerts/rules.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
 import { parseSourceDeclaration, sameCoverage } from './boards/source.ts';
@@ -66,9 +66,24 @@ import {
     isKernelDropFree, evaluateWorkers, isDbSelfHealthy,
     type IngestStats, type CollectorStats, type JobsStats, type DbSelfState,
 } from './workers/protocol.ts';
+import {
+    DASHBOARD_WINDOWS, parseWindowHours, bytesFromHourlyBps, countFromHourlyRate, coverage, trend,
+    reportLines, reportCsv, isDay, isTimeZone,
+} from './reports/traffic.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const STARTED = Date.now();
+
+// The Dashboard's top lists (/api/dashboard) and the interface report.
+// Ten rows a list, as the operator's SolarWinds widgets had. The cache holds
+// one answer per window for a minute: the lists can only move when the hourly
+// rollup does, and every open Dashboard would otherwise repeat a fleet-wide
+// scan on the heavy lane. A report is capped at 50 interfaces and a year.
+const DASHBOARD_TOP_N = 10;
+const DASHBOARD_CACHE_MS = 60_000;
+const dashboardCache = new Map<number, { at: number; body: unknown }>();
+const REPORT_MAX_INTERFACES = 50;
+const REPORT_MAX_DAYS = 366;
 
 // THE ORDERING IS CHECKED, NOT TRUSTED. Main must outwait the ingest worker's
 // drain deadline; if it does not, main exits while the worker is still writing
@@ -724,6 +739,17 @@ const STATIC_FILES: Record<string, { file: string; type: string }> = {
     '/stencils.js': { file: 'stencils.js', type: 'text/javascript; charset=utf-8' },
     '/style.css': { file: 'style.css', type: 'text/css; charset=utf-8' },
     '/wall.css': { file: 'wall.css', type: 'text/css; charset=utf-8' },
+    // The mark (2026-09-24): favicon for both pages and the header logo, one
+    // file for all three. Sessionless for the same reason as the rest of the
+    // shell - a browser asks for it before anyone has signed in.
+    '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml' },
+    // Its raster copies (2026-09-24), drawn by tools/make-favicons.mjs. The
+    // .ico is what every browser requests unprompted at the root, and a 404
+    // there is what Firefox remembers as "this origin has no icon" - the
+    // globe the operator saw with the SVG answering 200. The apple-touch
+    // icon is the head's 180px raster for a home screen.
+    '/favicon.ico': { file: 'favicon.ico', type: 'image/x-icon' },
+    '/apple-touch-icon.png': { file: 'apple-touch-icon.png', type: 'image/png' },
     // The wall page, sessionless for the SAME reason as the shell and not a
     // new exception: it contains no data. A display cannot log in, so the
     // page has to render before its token is presented - and every byte of
@@ -1035,22 +1061,21 @@ const server = createWebServer(tlsPair, (req, res) => {
             // default - through the same resolveLevelsInfo the scan uses, so
             // the label cannot drift from the engine. When the two disagree
             // (someone moved the threshold since it fired) the UI says both.
-            // Bool-rule kinds (if-down, device-down) carry no threshold and
-            // get no line; a lookup failure degrades to no line, never a 500,
-            // because provenance is garnish on a page that must render.
+            // Bool-rule kinds carry no threshold, but if-down DOES answer
+            // "is this muted?" - it used to be skipped here, so a muted link
+            // alert aged out with no word on this page about why (2026-09-23).
+            // device-down keys by host, not code, and stays out; a lookup
+            // failure degrades to no line, never a 500, because provenance is
+            // garnish on a page that must render.
             const a = alert.rows[0];
             let provenance: Record<string, unknown> = {};
-            if (a.code !== null && a.kind !== 'if-down' && a.kind !== 'device-down' && a.kind !== 'event') {
+            if (a.code !== null && a.kind !== 'device-down' && a.kind !== 'event') {
                 try {
                     let cfg = loadRulesConfig();
                     const orows = await OPS.thresholdOverrides('interactive');
                     if (orows.ok) cfg = mergeOverrides(cfg, orows.rows);
-                    const defaults = a.kind === 'if-util' ? cfg.ifRules.util
-                        : a.kind === 'if-errors' ? cfg.ifRules.errors
-                            : a.kind === 'if-discards' ? cfg.ifRules.discards
-                                : cfg.thresholds[a.kind];
-                    const info = resolveLevelsInfo(
-                        buildOverrideIndex(cfg.overrides), defaults, a.code, a.host, a.kind);
+                    const info = resolveRuleInfo(
+                        buildOverrideIndex(cfg.overrides), cfg, a.kind, a.code, a.host);
                     // THE LAPTOP-OR-UPS HINT, and it is deliberately a HINT.
                     // A state sensor reading 1 raises crit by default, which
                     // is right for a UPS on battery and wrong for a laptop
@@ -1228,6 +1253,138 @@ const server = createWebServer(tlsPair, (req, res) => {
                     Number(x.b), x.med_ms, x.max_ms,
                     x.n > 0 ? Math.round((x.misses / x.n) * 100) : null,
                 ]),
+            });
+            return;
+        }
+        // --- the Dashboard's top lists (2026-09-25, operator) ----------------
+        //
+        // Top 10 interfaces received, transmitted, and by errors plus
+        // discards; top 10 CPU and memory - over 6 hours, 24 hours or 7 days,
+        // each with the previous window's figure for the trend. Everyone who
+        // can read devices can read this: it is the same data as the charts,
+        // summed. Cached per window for DASHBOARD_CACHE_MS, because every
+        // open Dashboard asks and the answer can only change when the hourly
+        // rollup moves - which it does once an hour.
+        if (path === '/api/dashboard' && method === 'GET') {
+            if (!enforce(res, principal, 'devices.read')) return;
+            const hours = parseWindowHours(url.searchParams.get('window'));
+            if (hours === null) {
+                sendJson(res, 400, { ok: false, detail: `window must be one of ${DASHBOARD_WINDOWS.join(', ')} hours` });
+                return;
+            }
+            const cached = dashboardCache.get(hours);
+            if (cached !== undefined && Date.now() - cached.at < DASHBOARD_CACHE_MS) {
+                sendJson(res, 200, cached.body);
+                return;
+            }
+            const f = await OPS.rollupFrontier();
+            if (!f.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${f.reason})` }); return; }
+            const through = f.rows[0]?.through_ts ?? null;
+            if (through === null) {
+                sendJson(res, 200, { ok: true, window: null, rx: [], tx: [], errs: [], cpu: [], mem: [],
+                    detail: 'the hourly rollup has not completed an hour yet - the lists appear after it does' });
+                return;
+            }
+            const H = 3600_000;
+            const hi = new Date(Math.floor(new Date(through).getTime() / H) * H);
+            const lo = new Date(hi.getTime() - hours * H);
+            const prevLo = new Date(lo.getTime() - hours * H);
+            const t0 = performance.now();
+            const [ifs, sens] = await Promise.all([
+                OPS.dashboardInterfaces(prevLo, lo, hi, DASHBOARD_TOP_N),
+                OPS.dashboardSensors(prevLo, lo, hi, DASHBOARD_TOP_N),
+            ]);
+            if (!ifs.ok || !sens.ok) {
+                const reason = !ifs.ok ? ifs.reason : !sens.ok ? sens.reason : '';
+                sendJson(res, 503, { ok: false, detail: `store refused (${reason})` });
+                return;
+            }
+            const ifRow = (r: (typeof ifs.rows)[number]) => ({
+                device: r.device, code: r.code, name: r.name, alias: r.alias,
+                speedBps: r.speed_bps === null ? null : Number(r.speed_bps),
+                inBytes: bytesFromHourlyBps(r.in_s), outBytes: bytesFromHourlyBps(r.out_s),
+                peakInBps: r.pk_in, peakOutBps: r.pk_out,
+                errors: countFromHourlyRate(r.err_s), discards: countFromHourlyRate(r.disc_s),
+                coverage: coverage(r.cov_h, hours),
+                // Per covered hour on each side, and none against a thin
+                // previous window (trend() says why).
+                trendIn: trend(r.in_s, r.p_in_s, r.cov_h, r.p_cov_h, hours),
+                trendOut: trend(r.out_s, r.p_out_s, r.cov_h, r.p_cov_h, hours),
+                trendErrs: trend(r.err_s === null && r.disc_s === null ? null : (r.err_s ?? 0) + (r.disc_s ?? 0),
+                    r.p_ed_s, r.cov_h, r.p_cov_h, hours),
+            });
+            const sensRow = (r: (typeof sens.rows)[number]) => ({
+                device: r.device, code: r.code, name: r.name,
+                meanPct: r.mean_pct, peakPct: r.peak_pct,
+                coverage: coverage(r.cov_h, hours),
+                trend: trend(r.mean_pct, r.p_mean_pct, null, r.p_cov_h, hours),
+            });
+            const body = {
+                ok: true,
+                window: { hours, from: lo.toISOString(), to: hi.toISOString() },
+                rx: ifs.rows.filter((r) => r.list === 'rx').map(ifRow),
+                tx: ifs.rows.filter((r) => r.list === 'tx').map(ifRow),
+                errs: ifs.rows.filter((r) => r.list === 'errs').map(ifRow),
+                cpu: sens.rows.filter((r) => r.list === 'cpu').map(sensRow),
+                mem: sens.rows.filter((r) => r.list === 'mem').map(sensRow),
+                ms: Math.round(performance.now() - t0),
+            };
+            dashboardCache.set(hours, { at: Date.now(), body });
+            sendJson(res, 200, body);
+            return;
+        }
+        // --- the interface traffic report (2026-09-25, operator) -------------
+        //
+        // "How much did this ISP link carry this month": chosen interfaces,
+        // a calendar range in the operator's time zone, one line per
+        // interface-day plus a total per interface - GB in and out, peak
+        // Mbps each way, and the coverage that says how much of the period
+        // the samples saw. JSON for the page, CSV for the spreadsheet (every
+        // cell formula-guarded: interface descriptions are device text).
+        if (path === '/api/report/traffic' && method === 'GET') {
+            if (!enforce(res, principal, 'devices.read')) return;
+            const codes = [...new Set((url.searchParams.get('codes') ?? '').split(',')
+                .map((c) => c.trim()).filter((c) => c !== ''))];
+            if (codes.length === 0 || codes.length > REPORT_MAX_INTERFACES
+                || codes.some((c) => !/^[A-Za-z0-9_-]{1,64}$/.test(c))) {
+                sendJson(res, 400, { ok: false, detail: `codes: 1 to ${REPORT_MAX_INTERFACES} interface codes, comma separated` });
+                return;
+            }
+            const fromDay = url.searchParams.get('from');
+            const toDay = url.searchParams.get('to');
+            if (!isDay(fromDay) || !isDay(toDay) || fromDay > toDay) {
+                sendJson(res, 400, { ok: false, detail: 'from and to must be dates (YYYY-MM-DD), from not after to' });
+                return;
+            }
+            if ((Date.parse(toDay) - Date.parse(fromDay)) / 86_400_000 > REPORT_MAX_DAYS) {
+                sendJson(res, 400, { ok: false, detail: `a report covers at most ${REPORT_MAX_DAYS} days` });
+                return;
+            }
+            const tz = url.searchParams.get('tz') ?? 'UTC';
+            if (!isTimeZone(tz)) { sendJson(res, 400, { ok: false, detail: 'tz must be a time zone name, e.g. America/Chicago' }); return; }
+            const csv = url.searchParams.get('format') === 'csv';
+            const f = await OPS.rollupFrontier();
+            if (!f.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${f.reason})` }); return; }
+            const frontier = f.rows[0]?.through_ts ?? null;
+            const r = frontier === null ? null : await OPS.trafficReport(codes, fromDay, toDay, tz, new Date(frontier));
+            if (r !== null && !r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            const lines = reportLines(r === null ? [] : r.rows);
+            if (csv) {
+                res.writeHead(200, {
+                    'content-type': 'text/csv; charset=utf-8',
+                    'content-disposition': `attachment; filename="rscanvas-traffic-${fromDay}-to-${toDay}.csv"`,
+                    'cache-control': 'no-store',
+                });
+                res.end(reportCsv(lines));
+                return;
+            }
+            const found = new Set((r?.rows ?? []).map((x) => x.code));
+            sendJson(res, 200, {
+                ok: true, from: fromDay, to: toDay, tz,
+                through: frontier === null ? null : new Date(frontier).toISOString(),
+                lines,
+                // Codes that matched no interface: said, not silently dropped.
+                missing: codes.filter((c) => !found.has(c)),
             });
             return;
         }
@@ -1599,21 +1756,50 @@ const server = createWebServer(tlsPair, (req, res) => {
             // with the engine. try/catch because this is garnish: a refusal
             // costs the annotation, never the page.
             let entities: Array<Record<string, unknown>> = rows.rows as unknown as Array<Record<string, unknown>>;
+            // The interface rules' effective defaults (env merged over the
+            // shipped ones), so the page's per-interface form can prefill
+            // what applies without a second fetch. Null when resolution
+            // failed - the form then opens blank, which is still correct.
+            let ifRuleDefaults: Record<string, { warn: number | null; crit: number | null } | null> | null = null;
             try {
                 let cfg = loadRulesConfig();
                 const orows = await OPS.thresholdOverrides('interactive');
                 if (orows.ok) cfg = mergeOverrides(cfg, orows.rows);
                 const idx = buildOverrideIndex(cfg.overrides);
+                ifRuleDefaults = {
+                    'if-errors': cfg.ifRules.errors ?? null,
+                    'if-discards': cfg.ifRules.discards ?? null,
+                    'if-util': cfg.ifRules.util ?? null,
+                };
                 // The collector-to-engine kind rename, the same one
                 // alertScanSensors makes in SQL and the POST route makes on
                 // write. Three sites is two too many; if a third kind ever
                 // diverges, unify them before adding it here.
                 const ek = (k: string): string => (k === 'fs' ? 'disk' : k === 'gauge' ? 'util' : k);
                 entities = entities.map((r) => {
-                    if (r.kind === 'if' || r.code === null || r.code === undefined) return r;
-                    const kind = ek(String(r.kind));
-                    const defaults = (cfg.thresholds as Record<string, { warn: number | null; crit: number | null } | null>)[kind];
-                    const info = resolveLevelsInfo(idx, defaults, String(r.code), name, kind);
+                    if (r.code === null || r.code === undefined) return r;
+                    // INTERFACE RULES ON THE ROW (2026-09-23, operator: "no
+                    // obvious way to mute alerts on individual interfaces").
+                    // The engine always honoured a per-interface override -
+                    // if-down and the three rate rules resolve by code like
+                    // any sensor - but the page never asked, so a mute set
+                    // anywhere was invisible on the row it silenced. Shipped
+                    // only when some rule differs from the default: the
+                    // quiet norm costs the payload nothing.
+                    if (r.kind === 'if') {
+                        const rules: Record<string, { source: string; muted: boolean; warn: number | null; crit: number | null }> = {};
+                        let differs = false;
+                        for (const k of IF_RULE_KINDS) {
+                            const info = resolveRuleInfo(idx, cfg, k, String(r.code), name);
+                            rules[k] = {
+                                source: info.source, muted: info.muted,
+                                warn: info.levels?.warn ?? null, crit: info.levels?.crit ?? null,
+                            };
+                            if (info.source !== 'default' && info.source !== 'none') differs = true;
+                        }
+                        return differs ? { ...r, ifRules: rules } : r;
+                    }
+                    const info = resolveRuleInfo(idx, cfg, ek(String(r.kind)), String(r.code), name);
                     if (info.source === 'none') return r;
                     return {
                         ...r,
@@ -1638,7 +1824,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             const availRow = avail.ok ? avail.rows[0] : undefined;
             const probes = Number(availRow?.probes ?? 0);
             sendJson(res, 200, {
-                ok: true, device: name, entities,
+                ok: true, device: name, entities, ifRuleDefaults,
                 availability24h: probes > 0
                     ? { probes, misses: Number(availRow?.misses ?? 0) }
                     : null,
@@ -2437,37 +2623,68 @@ const server = createWebServer(tlsPair, (req, res) => {
                 // driver's own message, and the loop continues. A per-item
                 // failure reported per item is the difference between "add 23
                 // devices" being a coin flip and being a report.
-                let w;
-                try {
-                    // WRITE-IN-LOOP-OK: one statement per DEVICE, per the
-                    // paragraph above - the try/catch moved the call away from
-                    // that marker, and the checker is right that a marker
-                    // separated from its call proves nothing about the call.
-                    w = await OPS.insertDeviceWithEntities(
-                    name, host, probe.port, probe.version, probe.credentialRef,
-                    probe.pollIntervalS,
-                    r.sysName as string | null, r.sysDescr as string | null,
-                    r.sysLocation as string | null, mint(name, 'uptime'),
-                    // The kind comes from the probe now (sensors slice): 'if'
-                    // for interfaces, the sensor kinds beside them, each with
-                    // its polling instruction in extra.
-                    ents.map((e) => String(e.kind ?? 'if')),
-                    ents.map((e) => String(e.snmpIndex)),
-                    ents.map((e) => String(e.name)),
-                    ents.map((e) => (e.descr ?? null) as string | null),
-                    ents.map((e) => (e.alias ?? null) as string | null),
-                    ents.map((e) => (e.speedBps ?? null) as number | null),
-                    ents.map((e) => e.tracked === true),
-                    ents.map((e) => mint(name, String(e.name))),
-                    ents.map((e) => (e.extra ? JSON.stringify(e.extra) : null)),
-                    );
-                } catch (err) {
-                    const e = err as { message?: string; constraint?: string; detail?: string };
-                    // The CONSTRAINT name is the useful half and a bare message
-                    // usually omits it, so both travel.
-                    const why = `refused by the database: ${e.message ?? String(err)}`
-                        + (e.constraint ? ` [constraint ${e.constraint}]` : '')
-                        + (e.detail ? ` - ${e.detail}` : '');
+                let w: Awaited<ReturnType<typeof OPS.insertDeviceWithEntities>> | undefined;
+                let refusal: string | null = null;
+                // A CODE RACE IS RETRIED, NOT REPORTED AS A BAD DEVICE
+                // (2026-09-24, the lab-5 ingest run). takenCodes is read once
+                // per REQUEST, so two adds running at once cannot see each
+                // other's new codes; at 30,000 entities in a space of about a
+                // million, birthday collisions between them are expected, and
+                // the loser was refused outright - 6 of 292 dense devices at
+                // concurrency 8, each reported as "refused by the database".
+                // The codes are only the key, not the device, so a collision
+                // on either code index re-reads what is taken and mints again.
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        // WRITE-IN-LOOP-OK: one statement per DEVICE, per the
+                        // paragraph above, retried at most twice on a code
+                        // race - the try/catch moved the call away from that
+                        // marker, and the checker is right that a marker
+                        // separated from its call proves nothing about the call.
+                        w = await OPS.insertDeviceWithEntities(
+                        name, host, probe.port, probe.version, probe.credentialRef,
+                        probe.pollIntervalS,
+                        r.sysName as string | null, r.sysDescr as string | null,
+                        r.sysLocation as string | null, mint(name, 'uptime'),
+                        // The kind comes from the probe now (sensors slice): 'if'
+                        // for interfaces, the sensor kinds beside them, each with
+                        // its polling instruction in extra.
+                        ents.map((e) => String(e.kind ?? 'if')),
+                        ents.map((e) => String(e.snmpIndex)),
+                        ents.map((e) => String(e.name)),
+                        ents.map((e) => (e.descr ?? null) as string | null),
+                        ents.map((e) => (e.alias ?? null) as string | null),
+                        ents.map((e) => (e.speedBps ?? null) as number | null),
+                        ents.map((e) => e.tracked === true),
+                        ents.map((e) => mint(name, String(e.name))),
+                        ents.map((e) => (e.extra ? JSON.stringify(e.extra) : null)),
+                        );
+                        refusal = null;
+                        break;
+                    } catch (err) {
+                        const e = err as { message?: string; constraint?: string; detail?: string; code?: string };
+                        const codeRace = e.code === '23505'
+                            && (e.constraint === 'entities_code_idx' || e.constraint === 'devices_uptime_code_idx');
+                        if (codeRace && attempt < 3) {
+                            // WRITE-IN-LOOP-OK: a READ, and only on a code race
+                            // - at most twice per device, never on the path an
+                            // uncontended add takes.
+                            const fresh = await OPS.takenCodes();
+                            if (fresh.ok) for (const t of fresh.rows) takenCodes.add(t.code);
+                            log(`add of ${name} (${host}): a concurrent add took one of its codes `
+                                + `(${e.constraint}) - minting again (attempt ${attempt + 1} of 3)`);
+                            continue;
+                        }
+                        // The CONSTRAINT name is the useful half and a bare
+                        // message usually omits it, so both travel.
+                        refusal = `refused by the database: ${e.message ?? String(err)}`
+                            + (e.constraint ? ` [constraint ${e.constraint}]` : '')
+                            + (e.detail ? ` - ${e.detail}` : '');
+                        break;
+                    }
+                }
+                if (refusal !== null || w === undefined) {
+                    const why = refusal ?? 'refused by the database';
                     log(`add of ${name} (${host}) failed: ${why}`);
                     skipped.push({ host, why });
                     continue;
@@ -2934,6 +3151,38 @@ const server = createWebServer(tlsPair, (req, res) => {
             await auth.audit(principal, 'device.transient', `${changed.length} device(s)`,
                 { transient: body.transient, names: changed }, inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, changed, transient: body.transient });
+            return;
+        }
+        // --- device mute (slice 54) ------------------------------------------
+        //
+        // One route for the device page (a one-name list) and the roster's
+        // selection, because it is one statement. Muted means NOTHING of the
+        // device raises; the scan reads the column on its next pass, so open
+        // alerts retire as source-removed within ALERT_MISSING_SCANS and
+        // unmuting lets anything still true raise afresh.
+        if (path === '/api/devices/mute' && method === 'POST') {
+            if (!enforce(res, principal, 'device.mute')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req, BODY_CAP_BULK);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const sel = normalizeNames(body.names, 1000, 'mute');
+            if (!sel.ok) { sendJson(res, 400, { ok: false, detail: sel.detail }); return; }
+            if (typeof body.muted !== 'boolean') {
+                sendJson(res, 400, { ok: false, detail: 'muted must be true or false' });
+                return;
+            }
+            const r = await OPS.setMutedForDevices(sel.names, body.muted);
+            if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            const changed = r.rows.map((x) => x.name);
+            // Names in the audit, as for transient: "who silenced this box"
+            // is the question a missed outage asks months later.
+            await auth.audit(principal, 'device.mute', `${changed.length} device(s)`,
+                { muted: body.muted, names: changed }, inetOrNull(clientIp(req)));
+            sendJson(res, 200, { ok: true, changed, muted: body.muted });
             return;
         }
         // THE WRITE PATH reach_check WAITED FOR (DECISIONS-2026-09-01 ruling

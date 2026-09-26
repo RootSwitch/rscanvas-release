@@ -118,6 +118,9 @@ export interface ScanDevice {
      *  device, so device-down never raises. Absent means false - older
      *  feeds and the interface-embedded device blocks predate the flag. */
     transient?: boolean | null;
+    /** Slice 54: the operator muted this device, so NOTHING of it raises -
+     *  device-down, interfaces, sensors. Absent means false. */
+    muted?: boolean | null;
 }
 export interface ScanInterface {
     id?: string | null;
@@ -218,6 +221,45 @@ function resolveBool(
     return resolveBoolInfo(idx, defaults, code, host, kind).rule;
 }
 
+/** The four rules every interface carries, in the engine's words. */
+export const IF_RULE_KINDS = ['if-down', 'if-errors', 'if-discards', 'if-util'] as const;
+
+/** What governs one target today: which tier, whether it is muted, and the
+ *  levels when the kind has levels. */
+export interface RuleInfo { source: string; muted: boolean; levels: Levels | null }
+
+/**
+ * THE RULE THAT GOVERNS ONE TARGET, for any kind evaluate() judges. The device
+ * page and the alert detail both show provenance, and each used to pick its
+ * own defaults: the alert detail skipped if-down entirely (a bool rule), so a
+ * muted link alert never said MUTED, and the device page never resolved
+ * interface rules at all. One function picks the same defaults evaluate()
+ * picks for each kind and runs the same resolver, so neither surface can
+ * disagree with the engine.
+ *
+ * A kind evaluate() ignores answers source 'none' even when an override row
+ * names it: the engine skips such kinds, so calling the row live would be
+ * the page promising something the scan never does.
+ */
+export function resolveRuleInfo(
+    idx: OverrideIndex, config: RulesConfig, kind: string, code: string | null, host: string | null,
+): RuleInfo {
+    if (kind === 'if-down' || kind === 'device-down') {
+        const b = resolveBoolInfo(idx, kind === 'if-down' ? config.ifRules.down : config.deviceDown, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    const defaults = kind === 'if-errors' ? config.ifRules.errors
+        : kind === 'if-discards' ? config.ifRules.discards
+            : kind === 'if-util' ? config.ifRules.util
+                : (METRIC_KINDS as readonly string[]).includes(kind) ? config.thresholds[kind]
+                    : undefined;
+    const known = kind === 'if-errors' || kind === 'if-discards' || kind === 'if-util'
+        || (METRIC_KINDS as readonly string[]).includes(kind);
+    if (!known) return { source: 'none', muted: false, levels: null };
+    const info = resolveLevelsInfo(idx, defaults, code, host, kind);
+    return { source: info.source, muted: info.muted, levels: info.levels };
+}
+
 function levelSeverity(
     kind: string, value: number, levels: Levels,
 ): [Severity | null, number | null] {
@@ -274,10 +316,22 @@ export function evaluate(doc: ScanDoc, config: RulesConfig): Condition[] {
     const downDevices = new Set<string>();
     const transientDown = new Set<string>();
     const seenDevices = new Set<string>();
+    // A MUTED DEVICE EMITS NO CONDITION OF ANY KIND (slice 54). Not a frozen
+    // one, not a quiet one: absent, exactly as a muted interface's rule is
+    // absent, so its open alerts go missing and retire as source-removed and
+    // nothing new can raise. Collected before any rule runs because the
+    // interface loop's embedded device blocks would otherwise reach
+    // deviceRule for a device the roster feed has already said is muted.
+    const mutedDevices = new Set<string>();
+    for (const d of doc.devices || []) if (d && d.name && d.muted === true) mutedDevices.add(d.name);
+    for (const i of doc.interfaces || []) {
+        if (i && i.device && i.device.name && i.device.muted === true) mutedDevices.add(i.device.name);
+    }
     const deviceRule = (name?: string | null, host?: string | null, status?: string | null,
         transient?: boolean | null): void => {
         if (!name || seenDevices.has(name)) return;
         seenDevices.add(name);
+        if (mutedDevices.has(name)) return;
         const rule = resolveBool(idx, config.deviceDown, null, name, 'device-down');
         if (!rule) return;   // muted: no alarm, and its metrics evaluate normally
         const isDown = status === 'down';
@@ -324,6 +378,7 @@ export function evaluate(doc: ScanDoc, config: RulesConfig): Condition[] {
     for (const i of doc.interfaces || []) {
         if (!i || !i.code) continue;   // no stable key - nothing to alert on
         const dev = (i.device && i.device.name) || String(i.id || '').split(':')[0];
+        if (mutedDevices.has(dev)) continue;
         const label = ifLabel(i);
 
         // A down device already alerted above. Do not pile on per-interface
@@ -398,6 +453,7 @@ export function evaluate(doc: ScanDoc, config: RulesConfig): Condition[] {
     for (const m of doc.metrics || []) {
         if (!m || !m.code) continue;                        // no stable key
         if (!(METRIC_KINDS as readonly string[]).includes(m.kind)) continue;  // future kinds: ignore until configured
+        if (mutedDevices.has(m.host ?? '')) continue;
         const levels = resolveLevels(idx, config.thresholds[m.kind], m.code, m.host ?? null, m.kind);
         if (!levels) continue;
         if (downDevices.has(m.host ?? '')) {

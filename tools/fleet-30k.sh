@@ -112,7 +112,15 @@ plan() {
 # So each tier is split into chunks with contiguous port ranges. 260 sits under
 # the measured ceiling with margin for the discovery phase, which is the peak:
 # steady polling asks for 16 columns, discovery enumerates everything.
-MAX_PER_PROC=260
+#
+# OVERRIDABLE SINCE 2026-09-24, and smaller is truer. The lab-1/lab-3 comparison
+# (RESULTS-AB-MPC-2026-09-24.md) measured what a shared mock process costs
+# even far below the saturation ceiling: HEAD's median poll read 153 ms against
+# one 450-device process and 55 ms against ten-device processes, because every
+# device in a process queues behind every other device's requests - a queue no
+# real network has. 90 keeps the 78-port dead range inside one sparse process
+# (dead_unit refuses otherwise) and gives the lab-5 ingest run 19 processes.
+MAX_PER_PROC="${MAX_PER_PROC:-260}"
 
 install_tier() {
     local t="$1"

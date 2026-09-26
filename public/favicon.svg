@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Canvas Suite mark: the family easel of six zones, one zone per app,
+       each wearing its social-card theme accent (reading order = creation
+       order): CrossCanvas blueprint, PingCanvas nocturne, SNMPCanvas
+       phosphor, SyslogCanvas amber, AlertCanvas garnet, LaunchCanvas arctic.
+       Fill-wash + full-strength stroke is the PingCanvas red-zone recipe.
+       Adopted 2026-09-24 as the RSCanvas mark and favicon: RSCanvas is the
+       one app that supersedes the six, so the easel of all six fits it. -->
+  <rect width="64" height="64" rx="12" fill="#262a33"/>
+  <path d="M32 5 L32 12" stroke="#a89e8f" stroke-width="4" stroke-linecap="round"/>
+  <path d="M18 45 L12 59 M46 45 L52 59 M32 45 L32 59" stroke="#a89e8f" stroke-width="4" stroke-linecap="round" fill="none"/>
+  <rect x="9" y="12" width="46" height="34" rx="3" fill="#f4f1ea" stroke="#a89e8f" stroke-width="3"/>
+  <g stroke-width="2.6">
+    <rect x="14.5" y="18.5" width="9" height="8" rx="1.5" fill="rgba(127,212,255,0.4)" stroke="#4ba3d9"/>
+    <rect x="27.5" y="18.5" width="9" height="8" rx="1.5" fill="rgba(189,147,249,0.4)" stroke="#9d6fe8"/>
+    <rect x="40.5" y="18.5" width="9" height="8" rx="1.5" fill="rgba(57,255,20,0.35)" stroke="#2bb512"/>
+    <rect x="14.5" y="31.5" width="9" height="8" rx="1.5" fill="rgba(255,176,0,0.4)" stroke="#d99600"/>
+    <rect x="27.5" y="31.5" width="9" height="8" rx="1.5" fill="rgba(217,85,110,0.4)" stroke="#c23b52"/>
+    <rect x="40.5" y="31.5" width="9" height="8" rx="1.5" fill="rgba(136,192,208,0.4)" stroke="#5e9aad"/>
+  </g>
+</svg>

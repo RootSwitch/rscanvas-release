@@ -30,6 +30,48 @@ export function copyLine(values: (string | number | null)[]): string {
 }
 
 /**
+ * About how many characters of COPY rows go out as one chunk.
+ *
+ * NOT ONE ROW PER CHUNK (2026-09-25). pg-copy-streams sends every chunk it is
+ * handed as its own CopyData message - a 5 byte header write, then the chunk
+ * write, two socket writes - so a source that yields a row at a time costs two
+ * syscalls per ROW. The collector's one-second flush of ~1,000 sample rows was
+ * ~2,000 writes in a row without a yield: 40% of the 50 ms+ stretches a CPU
+ * profile found on the collector thread at 30k entities (RESULTS-30K-CEILING
+ * section 6). Gathered into chunks, a flush is a handful of writes.
+ *
+ * Still bounded, which is what yielding per row was for: a large flush never
+ * becomes one large string, only a series of these.
+ */
+export const COPY_CHUNK_CHARS = 64 * 1024;
+
+/**
+ * COPY text, as a lazy series of chunks of whole rows. A row is never split
+ * across chunks (COPY would accept it; the tests are simpler for it), one
+ * longer than the target goes out alone, and `toLine` runs exactly once per
+ * row, in order - callers count per-row facts (stripped NULs) inside it.
+ */
+export function* copyChunks<T>(
+    rows: Iterable<T>,
+    toLine: (row: T) => string,
+    chunkChars = COPY_CHUNK_CHARS,
+): Generator<string> {
+    let parts: string[] = [];
+    let size = 0;
+    for (const row of rows) {
+        const line = toLine(row);
+        parts.push(line);
+        size += line.length;
+        if (size >= chunkChars) {
+            yield parts.join('');
+            parts = [];
+            size = 0;
+        }
+    }
+    if (parts.length > 0) yield parts.join('');
+}
+
+/**
  * Postgres text columns cannot hold a NUL byte at all - not escaped, not
  * encoded. A datagram containing one is legal on the wire and would abort the
  * entire COPY batch, taking every other message in the flush with it. Stripping

@@ -1,8 +1,9 @@
-# Known issues, as of the alpha
+# Known issues, as of 0.1.0-alpha.2
 
-Written 2026-09-15, when the operator paused work. Everything here is known
-and unbuilt; nothing here is hidden behind a feature that pretends to work.
-Grouped by how much it would cost someone using the software.
+Written 2026-09-15 for the first alpha and revised 2026-09-26 for the
+second. Everything here is known and unbuilt; nothing here is hidden behind
+a feature that pretends to work. Grouped by how much it would cost someone
+using the software. `CHANGELOG.md` lists what the second alpha fixed.
 
 ## Rough edges you will meet
 
@@ -17,25 +18,56 @@ Grouped by how much it would cost someone using the software.
 - **Changing a device's credential has never been live-tested** as a
   wrong-to-right swap on a real device. The bulk route exists and the poller
   reads the credential on every poll, so it should take one interval.
-- **The device page is dense** and its long tables (audit, messages,
-  reachability) are not capped; the settings page's order is historical.
-- **A transient device is a per-device flag** with no overview; there is no
-  table of them in settings and no column on the roster.
+- **The device page's long tables** (audit, messages, reachability) are not
+  capped, and in a narrow window the device panel scrolls sideways under its
+  interface table.
+- **Transient and muted devices have no overview.** Each shows on its own
+  row of the device list and on its device page; there is no filter or table
+  of them.
+- **A device mute covers polled alerts only** - device-down, interfaces,
+  sensors. Syslog and trap rule alerts are governed by their rules.
+- **The Boards and Thresholds panels are admin-only** in the page, although
+  the server lets operators edit boards and read thresholds.
+- **The Dashboard reads the hourly rollup**, so its windows end at the last
+  complete hour and can be up to an hour behind, and the 7-day trend is
+  blank until a little over ten days of history exist. Memory percentages
+  are only as good as the device's own accounting; some devices count
+  caches as used.
+- **A traffic report covers an interface's tracked history only.** An
+  interface the discovery defaults leave untracked (some sub-interface
+  types) has none until it is tracked.
+- **At tens of thousands of entities the notify job logs "still running,
+  skipping this one" every scan.** Nothing is behind - its own counters show
+  every run completing - but it fills the log.
 
 ## Findings still open
 
-- **At 30,000 entities the collector thread stalls 50 to 103 ms about sixty
-  times an hour** on a 12 vCPU box, while the other threads never do. No
-  device misses a poll; it is the thesis criterion's own zero that is
-  missed. Not attributed; a GC trace on the collector under that load is
-  the next measurement (`TESTING.md` has the summary; the full results
-  record is private for now).
-- **On a four-core box the current build polls a 400-device fleet with a
-  median of about 140 ms** where the previous build read 26 ms, at the same
-  cadence. Not attributed. The one-variable test is to run the old down-lane
-  cap for a day.
-- **The interactive-latency and syslog-volume criteria** were not exercised
-  at the 30k scale.
+- **The interactive-latency criterion** - how quickly the pages answer - was
+  not exercised at the 30,000-entity scale.
+- **One 426 ms gap on the collector thread**, once, a few minutes after a
+  restart, with the other threads undisturbed and nothing logged. It is
+  under the health report's 500 ms acute limit, has not recurred, and is
+  being watched rather than chased.
+
+## Fixed and measured since the first alpha
+
+`TESTING.md` has the numbers; in short:
+
+- **The collector's stalls at 30,000 entities are fixed.** It used to cross
+  50 ms on about 0.25% of its ticks - two and a half times the health
+  report's limit, so the health page read red at the design ceiling. A CPU
+  profile and a garbage-collection trace attributed it: not garbage
+  collection, but database rows handed over one at a time (two socket writes
+  each) and a timing summary sorted four times a second. After the fix: under
+  one stall in five minutes, health green.
+- **Syslog and trap ingest was measured at scale** alongside the 30k fleet:
+  nothing lost below 15,000 syslog or 12,500 traps a second, a ceiling near
+  16,400 and 13,700 on a mini PC, the ingest thread never stalling, and any
+  loss above the ceiling counted by the application rather than hidden in
+  the kernel.
+- **The slower median poll time** seen on a four-core box after an upgrade
+  was attributed on two identical boxes: mostly the test fleet sharing the
+  poller's CPU, and the rest the sensors and counters the newer build reads.
 
 ## Decisions deferred, not built
 
@@ -43,20 +75,22 @@ Grouped by how much it would cost someone using the software.
   now; the open word is raise versus suppress.
 - **Per-board access rules** are described in three documents and enforced
   nowhere. Enforce or amend.
-- **Board reconcile verbs.** Drift between a board and its device list is
-  detected and named; add, drop and rebuild do not exist.
 - **The stale-band fix for alerts** (a threshold that no longer matches its
   reading keeps its band).
 - **Per-device polling backoff**, the complement to the proportional
   down-lane cap.
 - **A try-all-credentials onboarding probe**, and hardening of interface
   identity on agents that report no physical address.
+- **The ingest queue bound for bursts.** 50,000 rows in memory; a burst of
+  20,000 messages a second for five seconds outruns it and the excess is
+  shed and counted. Holding such a burst needs roughly three times that.
 
 ## Tests and drills owed
 
 - Live: a SIGTERM drill through `tools/chaos.sh` across all four workers, an
   alerts-lane soak, dropping an interface mid-run to assert the stale
-  marker, and a reconcile retag.
+  marker, a reconcile after retagging devices, and a nightly retention drop
+  at the 30,000-entity scale on the current schema.
 - Scratch database: non-UTC retention, event-alert upsert semantics, rollup
   weighting.
 - Live server: the unauthenticated-surface assertion and the
@@ -64,7 +98,7 @@ Grouped by how much it would cost someone using the software.
 
 ## Ideas, not promises
 
-Reporting and a dashboard (top interfaces, a fleet-wide health table,
-per-location traffic), the anomaly detector's next steps, an ARP and MAC
-table scan companion, and the operator's own polish list for the settings,
-board-controls and device pages.
+A fleet-wide health table (every sensor of one kind across the fleet),
+per-location traffic, the anomaly detector's next steps, an ARP and MAC
+table scan companion, and the operator's own polish list for the settings
+and board-controls pages.

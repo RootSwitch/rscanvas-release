@@ -37,6 +37,34 @@ const BANNED: Record<number, string> = {
 
 const NUL = String.fromCharCode(0);
 
+// THE ONE PLACE A TRACKED FILE MAY BE BINARY (2026-09-24): the raster
+// favicons tools/make-favicons.mjs writes into public/. Every PNG carries NUL
+// bytes in its first chunk header, so without this entry the NUL rule below
+// fails them - correctly, by its own terms.
+//
+// Declared by extension AND proven by signature, because the NUL rule's whole
+// point is that a skip must never happen by accident: a text file that merely
+// ends in .png, or a .ico that is not one, still has to pass everything else
+// here. The magic bytes are the file format's own first words, so a file that
+// has them is the binary it claims to be.
+const BINARY_SIGNATURES: Record<string, number[]> = {
+    '.png': [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    '.ico': [0x00, 0x00, 0x01, 0x00],
+};
+let binaries = 0;
+
+function isDeclaredBinary(rel: string): boolean {
+    const sig = BINARY_SIGNATURES[path.extname(rel).toLowerCase()];
+    if (sig === undefined) return false;
+    let head: Buffer;
+    try {
+        head = fs.readFileSync(path.join(ROOT, rel)).subarray(0, sig.length);
+    } catch {
+        return false;
+    }
+    return head.length === sig.length && sig.every((b, i) => head[i] === b);
+}
+
 let files: string[];
 try {
     files = execFileSync('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' })
@@ -50,6 +78,7 @@ let bad = 0;
 let scanned = 0;
 
 for (const rel of files) {
+    if (isDeclaredBinary(rel)) { binaries++; continue; }
     let text: string;
     try {
         text = fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -99,4 +128,4 @@ if (bad > 0) {
     console.error(`charcheck: ${bad} offending line${bad === 1 ? '' : 's'} - use " - " and straight quotes`);
     process.exit(1);
 }
-console.log(`ok - charcheck clean (${scanned} tracked text files)`);
+console.log(`ok - charcheck clean (${scanned} tracked text files, ${binaries} binary by signature)`);

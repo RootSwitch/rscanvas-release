@@ -25,6 +25,7 @@
 import { parentPort } from 'node:worker_threads';
 import { CONFIG } from '../config.ts';
 import { startHeartbeat } from '../heartbeat.ts';
+import { percentiles } from '../collector/percentiles.ts';
 import { installSafetyNet } from '../safety.ts';
 import { OPS, copySamples, closeAll, type SampleRow } from '../store/index.ts';
 import { pollDevice } from '../collector/poll.ts';
@@ -272,12 +273,6 @@ function onAsyncError(err: unknown): void {
 }
 
 installSafetyNet({ thread: 'collector', onRejection: () => { asyncErrors++; } });
-
-const pct = (arr: number[], p: number): number => {
-    if (arr.length === 0) return 0;
-    const s = [...arr].sort((a, b) => a - b);
-    return Number((s[Math.min(s.length - 1, Math.ceil((p / 100) * s.length) - 1)] as number).toFixed(1));
-};
 
 // --- the sample write ----------------------------------------------------------
 //
@@ -835,6 +830,11 @@ function oldestInFlight(): number | null {
 }
 
 function snapshot(): CollectorStats {
+    // One sorted copy per window, not one per percentile: this runs every
+    // second, and four copy-and-sorts of a 10,000+ entry window were a third
+    // of the collector's stalls at 30k (src/collector/percentiles.ts).
+    const [lagP50, lagP95] = percentiles(lagMs, [50, 95]) as [number, number];
+    const [pollP50, pollP95] = percentiles(pollMs, [50, 95]) as [number, number];
     return {
         thread: 'collector' as const,
         polls,
@@ -852,13 +852,13 @@ function snapshot(): CollectorStats {
         lastWriteMs,
         // Poll lag is the criterion: p95 must stay under the interval. A mean
         // hides exactly the tail that matters.
-        pollLagP50Ms: pct(lagMs, 50),
-        pollLagP95Ms: pct(lagMs, 95),
+        pollLagP50Ms: lagP50,
+        pollLagP95Ms: lagP95,
         // A loop, never Math.max(...arr): the spread form is what crashed the
         // process - every element becomes a call argument on the stack.
         pollLagMaxMs: Number(lagMs.reduce((m, v) => (v > m ? v : m), 0).toFixed(1)),
-        pollP50Ms: pct(pollMs, 50),
-        pollP95Ms: pct(pollMs, 95),
+        pollP50Ms: pollP50,
+        pollP95Ms: pollP95,
         reachEnabled,
         reachSweeps,
         reachOverruns,

@@ -136,6 +136,9 @@ if [ "$DO_CHECK" = 1 ]; then
     say "  node       $(command -v node >/dev/null && node -v || echo 'NOT INSTALLED')"
     if command -v fping >/dev/null; then say "  fping      $(fping -v 2>&1 | head -1 | grep -oE '[0-9][0-9.]*' | head -1)"
     else bad "fping NOT INSTALLED - reachability is off, every device reads unknown"; fi
+    rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    if [ "$rmem" -ge 8388608 ]; then say "  rmem_max   $rmem (the 8 MB syslog and trap buffers fit)"
+    else warn "net.core.rmem_max is $rmem - the syslog and trap sockets are CLAMPED to it; rerun the installer or raise it"; fi
     # Present or absent, NEVER the value: --check output gets pasted into
     # tickets and chat.
     if sudo -n test -f "$ENV_FILE" 2>/dev/null && sudo -n grep -qE '^RSCANVAS_SECRET=.+' "$ENV_FILE" 2>/dev/null; then
@@ -298,6 +301,39 @@ good "node $(node -v), postgres $(q 'SHOW server_version')"
 
 [ -n "$(q 'SELECT 1')" ] || die "postgres is installed but not answering - start it and re-run"
 
+step "kernel receive buffers"
+# THE APP ASKS, THE KERNEL DECIDES (2026-09-24, the lab-5 ingest test). The
+# ingest worker requests an 8 MB receive buffer on its syslog and trap
+# sockets (RCVBUF_BYTES), and the kernel silently clamps any request to
+# net.core.rmem_max - 212,992 bytes on a stock Ubuntu box. So every install
+# before this step ran its UDP sockets at 5% of the buffer the code was
+# designed around, and the only sign was one "CLAMPED" line in the journal
+# at startup. Raised, never lowered: an administrator's larger value stays.
+#
+# PERSISTED EVERY RUN, NOT ONLY WHEN LOW (the 2026-09-24 upgrade drill). The
+# first version wrote the file only when the RUNNING value was below the
+# target, so a value raised by hand with `sysctl -w` - or already raised in a
+# shared kernel, as the drill's WSL instance was - skipped the file and would
+# fall back to 212,992 at the next reboot. The file now always records the
+# larger of the running value and the target, so it can never lower anything
+# and always survives a reboot.
+RMEM_WANT=16777216
+RMEM_NOW=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+RMEM_SET=$RMEM_WANT
+if [ "$RMEM_NOW" -gt "$RMEM_WANT" ]; then RMEM_SET=$RMEM_NOW; fi
+cat > /etc/sysctl.d/60-rscanvas.conf <<EOF
+# Written by rscanvas-setup.sh. The RSCanvas ingest worker requests an 8 MB
+# receive buffer (RCVBUF_BYTES) on its syslog and trap sockets; the kernel
+# clamps every request to net.core.rmem_max, which ships at 212992.
+net.core.rmem_max = ${RMEM_SET}
+EOF
+if [ "$RMEM_NOW" -lt "$RMEM_WANT" ]; then
+    sysctl -q -p /etc/sysctl.d/60-rscanvas.conf || warn "could not apply /etc/sysctl.d/60-rscanvas.conf - UDP buffers stay clamped"
+    good "net.core.rmem_max $(sysctl -n net.core.rmem_max) (was ${RMEM_NOW}) - persisted in /etc/sysctl.d/60-rscanvas.conf"
+else
+    good "net.core.rmem_max ${RMEM_NOW} - already enough; persisted in /etc/sysctl.d/60-rscanvas.conf so a reboot keeps it"
+fi
+
 step "service account and directories"
 id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$SVC_USER"
 install -d -o "$SVC_USER" -g "$SVC_USER" "$APP_DIR"
@@ -408,6 +444,21 @@ if [ "$DO_TLS" = 1 ]; then
     fi
     set_secret TLS_CERT "$TLS_DIR/cert.pem"
     set_secret TLS_KEY "$TLS_DIR/key.pem"
+fi
+# TLS IS STICKY, AND SO IS WHAT IT NEEDS (2026-09-24, the upgrade drill). A
+# box installed with --tls serves https on every later run without the flag -
+# the scheme is read from the env file, and INSTALL.md's upgrade says to
+# re-run with no flags - but the directories step resets /etc/rscanvas to
+# 0700 on EVERY run, and only the tls step above gave the service user its
+# traversal back. So the documented upgrade of any TLS install left the
+# service unable to open its own certificate: FATAL EACCES on cert.pem,
+# restarting forever. Found by upgrading a 374ef7a --tls install to the next
+# bundle exactly as INSTALL.md says; production never met it only because its
+# upgrades always passed --tls. The permission now follows the env file, as
+# the scheme does.
+if [ "$DO_TLS" != 1 ] && [ -n "$(read_secret TLS_CERT)" ]; then
+    chgrp "$SVC_USER" /etc/rscanvas; chmod 0710 /etc/rscanvas
+    good "tls kept from a previous run ($(read_secret TLS_CERT))"
 fi
 
 step "roles and database"

@@ -1,0 +1,491 @@
+{
+ "ok": true,
+ "problems": [],
+ "uptimeS": 1328,
+ "notifications": {
+  "enabled": [
+   "syslog"
+  ],
+  "incomplete": {}
+ },
+ "heartbeat": {
+  "thresholdMs": 50,
+  "worstGapMsAcrossThreads": 843.2,
+  "anyThreadOverThreshold": false,
+  "threads": [
+   {
+    "thread": "main",
+    "ticks": 128541,
+    "worstGapMs": 45.1,
+    "p50GapMs": 0,
+    "p99GapMs": 1,
+    "thresholdMs": 50,
+    "overThresholdCount": 0
+   },
+   {
+    "thread": "ingest",
+    "ticks": 128450,
+    "worstGapMs": 37.5,
+    "p50GapMs": 0,
+    "p99GapMs": 1,
+    "thresholdMs": 50,
+    "overThresholdCount": 0
+   },
+   {
+    "thread": "collector",
+    "ticks": 127593,
+    "worstGapMs": 162.5,
+    "p50GapMs": 0,
+    "p99GapMs": 3,
+    "thresholdMs": 50,
+    "overThresholdCount": 2
+   },
+   {
+    "thread": "jobs",
+    "ticks": 119672,
+    "worstGapMs": 843.2,
+    "p50GapMs": 0,
+    "p99GapMs": 2,
+    "thresholdMs": 50,
+    "overThresholdCount": 618
+   }
+  ]
+ },
+ "memory": {
+  "rssBytes": 631037952,
+  "heapUsedBytes": 22279496
+ },
+ "exportQueue": {
+  "queued": 0,
+  "running": 0,
+  "concurrency": 2,
+  "projectedStartMs": 0,
+  "maxQueueWaitMs": 600000,
+  "maxPerUser": 3
+ },
+ "jobs": {
+  "thread": "jobs",
+  "asyncErrors": 0,
+  "jobs": [
+   {
+    "name": "alerts:scan",
+    "runs": 265,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T04:16:24.507Z",
+    "lastOkAt": "2026-09-26T04:16:24.954Z",
+    "lastMs": 447.2,
+    "lastDetail": "1550 device(s), 23788 interface(s), 102903 condition(s), 1958 open"
+   },
+   {
+    "name": "alerts:notify",
+    "runs": 265,
+    "skippedInFlight": 265,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T04:16:24.954Z",
+    "lastOkAt": "2026-09-26T04:16:25.778Z",
+    "lastMs": 824.6,
+    "lastDetail": "0 event(s), notified 0"
+   },
+   {
+    "name": "retention:samples",
+    "runs": 1,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T03:54:34.417Z",
+    "lastOkAt": "2026-09-26T03:54:34.427Z",
+    "lastMs": 10.1,
+    "lastDetail": "nothing expired"
+   },
+   {
+    "name": "retention:messages",
+    "runs": 1,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T03:54:34.418Z",
+    "lastOkAt": "2026-09-26T03:54:34.566Z",
+    "lastMs": 147.7,
+    "lastDetail": "nothing expired"
+   },
+   {
+    "name": "trgm",
+    "runs": 1,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T03:54:34.419Z",
+    "lastOkAt": "2026-09-26T03:54:34.579Z",
+    "lastMs": 159.4,
+    "lastDetail": "no change"
+   },
+   {
+    "name": "retention:alerts",
+    "runs": 1,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T03:54:34.422Z",
+    "lastOkAt": "2026-09-26T03:54:34.586Z",
+    "lastMs": 164.6,
+    "lastDetail": "pruned 0 cleared alert(s), 0 aged notification row(s), 0 expired window(s) past 90d, 0 ping sample(s) past 30d"
+   },
+   {
+    "name": "retention:corpses",
+    "runs": 1,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T03:54:34.422Z",
+    "lastOkAt": "2026-09-26T03:54:34.483Z",
+    "lastMs": 60.5,
+    "lastDetail": "removed 0 superseded interface generation(s) untracked and stale past 7d"
+   },
+   {
+    "name": "partitions:monthly",
+    "runs": 1,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T03:54:34.423Z",
+    "lastOkAt": "2026-09-26T03:54:34.538Z",
+    "lastMs": 114.2,
+    "lastDetail": "0 created"
+   },
+   {
+    "name": "rollup",
+    "runs": 4,
+    "skippedInFlight": 0,
+    "failures": 0,
+    "consecutiveFailures": 0,
+    "lastRunAt": "2026-09-26T04:14:19.417Z",
+    "lastOkAt": "2026-09-26T04:14:19.419Z",
+    "lastMs": 2.1,
+    "lastDetail": "caught up: 1 chunk(s), 0 hours written"
+   }
+  ],
+  "inFlight": [],
+  "frontier": {
+   "throughTs": "2026-09-26T04:00:00.000Z",
+   "lagHours": 0.27,
+   "readAt": "2026-09-26T04:16:19.426Z",
+   "alarmAboveHours": 25
+  },
+  "notifyChannels": [
+   {
+    "channel": "syslog",
+    "trailingFailures": 0,
+    "lastDeliveredTs": "2026-09-25T04:15:33.815Z",
+    "lastAttemptTs": "2026-09-25T04:15:33.815Z"
+   }
+  ],
+  "heartbeat": {
+   "thread": "jobs",
+   "ticks": 119672,
+   "worstGapMs": 843.2,
+   "p50GapMs": 0,
+   "p99GapMs": 2,
+   "thresholdMs": 50,
+   "overThresholdCount": 618
+  }
+ },
+ "collector": {
+  "thread": "collector",
+  "polls": 66352,
+  "failures": 1584,
+  "discovered": 0,
+  "samplesWritten": 1295448,
+  "writeFailures": 0,
+  "pendingSamples": 0,
+  "inFlight": 12,
+  "inFlightDown": 12,
+  "concurrency": 24,
+  "downConcurrency": 12,
+  "skippedNoSlot": 0,
+  "asyncErrors": 0,
+  "lastWriteMs": 32.5,
+  "pollLagP50Ms": 253,
+  "pollLagP95Ms": 970,
+  "pollLagMaxMs": 29019,
+  "pollP50Ms": 22.3,
+  "pollP95Ms": 148.7,
+  "reachEnabled": true,
+  "reachSweeps": 132,
+  "reachOverruns": 0,
+  "reachTransitions": 0,
+  "reachLastSweepMs": 106,
+  "reachUnsupported": 0,
+  "oldestInFlightMs": 4764,
+  "failuresByKind": {
+   "timeout": 1584,
+   "auth": 0,
+   "other": 0
+  },
+  "partitions": {
+   "ensuredThrough": "2026-10-03",
+   "runwayDays": 6,
+   "failures": 0,
+   "consecutiveFailures": 0,
+   "healthy": true,
+   "alarmBelowDays": 3
+  },
+  "heartbeat": {
+   "thread": "collector",
+   "ticks": 127593,
+   "worstGapMs": 162.5,
+   "p50GapMs": 0,
+   "p99GapMs": 3,
+   "thresholdMs": 50,
+   "overThresholdCount": 2
+  }
+ },
+ "lanes": [
+  {
+   "lane": "collector",
+   "capacity": 8,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": 10000,
+   "connectionTimeoutMs": 10000,
+   "onExhaustion": "wait-and-alarm",
+   "samples": 0,
+   "admitted": 0,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0,
+   "waitP99Ms": 0,
+   "waitMaxMs": 0,
+   "execP50Ms": 0,
+   "execP99Ms": 0,
+   "execMaxMs": 0
+  },
+  {
+   "lane": "ingest",
+   "capacity": 4,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": 10000,
+   "connectionTimeoutMs": 10000,
+   "onExhaustion": "wait-and-alarm",
+   "samples": 0,
+   "admitted": 0,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0,
+   "waitP99Ms": 0,
+   "waitMaxMs": 0,
+   "execP50Ms": 0,
+   "execP99Ms": 0,
+   "execMaxMs": 0
+  },
+  {
+   "lane": "alerts",
+   "capacity": 2,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": 15000,
+   "connectionTimeoutMs": 5000,
+   "onExhaustion": "skip",
+   "samples": 0,
+   "admitted": 0,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0,
+   "waitP99Ms": 0,
+   "waitMaxMs": 0,
+   "execP50Ms": 0,
+   "execP99Ms": 0,
+   "execMaxMs": 0
+  },
+  {
+   "lane": "jobs",
+   "capacity": 2,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": null,
+   "connectionTimeoutMs": 30000,
+   "onExhaustion": "skip",
+   "samples": 0,
+   "admitted": 0,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0,
+   "waitP99Ms": 0,
+   "waitMaxMs": 0,
+   "execP50Ms": 0,
+   "execP99Ms": 0,
+   "execMaxMs": 0
+  },
+  {
+   "lane": "interactive",
+   "capacity": 16,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": 2000,
+   "connectionTimeoutMs": 500,
+   "onExhaustion": "http-503",
+   "samples": 49,
+   "admitted": 49,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0.2,
+   "waitP99Ms": 31.5,
+   "waitMaxMs": 31.5,
+   "execP50Ms": 4.5,
+   "execP99Ms": 508,
+   "execMaxMs": 508
+  },
+  {
+   "lane": "heavy",
+   "capacity": 4,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": 30000,
+   "connectionTimeoutMs": 2000,
+   "onExhaustion": "report-busy",
+   "samples": 2,
+   "admitted": 2,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 8,
+   "waitP99Ms": 12.1,
+   "waitMaxMs": 12.1,
+   "execP50Ms": 253.9,
+   "execP99Ms": 989.9,
+   "execMaxMs": 989.9
+  },
+  {
+   "lane": "export",
+   "capacity": 2,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": null,
+   "connectionTimeoutMs": 1000,
+   "onExhaustion": "queue-job",
+   "samples": 0,
+   "admitted": 0,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0,
+   "waitP99Ms": 0,
+   "waitMaxMs": 0,
+   "execP50Ms": 0,
+   "execP99Ms": 0,
+   "execMaxMs": 0
+  },
+  {
+   "lane": "maintenance",
+   "capacity": 1,
+   "inFlight": 0,
+   "queued": 0,
+   "statementTimeoutMs": null,
+   "connectionTimeoutMs": 30000,
+   "onExhaustion": "skip",
+   "samples": 0,
+   "admitted": 0,
+   "busy": 0,
+   "statementTimeouts": 0,
+   "failed": 0,
+   "waitP50Ms": 0,
+   "waitP99Ms": 0,
+   "waitMaxMs": 0,
+   "execP50Ms": 0,
+   "execP99Ms": 0,
+   "execMaxMs": 0
+  }
+ ],
+ "db": {
+  "oldestDatAge": 22566415,
+  "bloat": [
+   {
+    "rel": "alerts",
+    "live": 1959,
+    "dead": 1981
+   },
+   {
+    "rel": "devices",
+    "live": 1550,
+    "dead": 204
+   },
+   {
+    "rel": "entities",
+    "live": 29988,
+    "dead": 10538
+   }
+  ],
+  "disks": [
+   {
+    "path": "/var/lib/postgresql",
+    "availPct": 75
+   },
+   {
+    "path": "/",
+    "availPct": 75
+   }
+  ]
+ },
+ "ingest": {
+  "thread": "ingest",
+  "received": 0,
+  "written": 0,
+  "queued": 0,
+  "flushes": 0,
+  "flushFailures": 0,
+  "laneBusyEvents": 0,
+  "truncated": 0,
+  "nulsStripped": 0,
+  "flushP50Ms": 0,
+  "flushP99Ms": 0,
+  "flushMaxMs": 0,
+  "shedByUs": 0,
+  "asyncErrors": 0,
+  "eventRulesArmed": 0,
+  "eventRuleErrors": 0,
+  "eventRulesDisarmed": 0,
+  "disarmedRuleIds": [],
+  "eventMatches": 0,
+  "eventUpserts": 0,
+  "kernel": {
+   "available": true,
+   "syslogDrops": 0,
+   "trapDrops": 0,
+   "rxQueueBytes": 0,
+   "peakRxQueueBytes": 0,
+   "systemRcvbufErrors": 0,
+   "systemInErrors": 0
+  },
+  "partitions": {
+   "ensuredThrough": "2026-10-03",
+   "runwayDays": 6,
+   "failures": 0,
+   "consecutiveFailures": 0,
+   "healthy": true,
+   "alarmBelowDays": 3
+  },
+  "heartbeat": {
+   "thread": "ingest",
+   "ticks": 128450,
+   "worstGapMs": 37.5,
+   "p50GapMs": 0,
+   "p99GapMs": 1,
+   "thresholdMs": 50,
+   "overThresholdCount": 0
+  },
+  "reportAgeMs": 128
+ },
+ "residency": {
+  "sampled": false,
+  "hint": "add ?deep=1 to sample cache residency (costs 1s)"
+ },
+ "diskstatsAvailable": true
+}

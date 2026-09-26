@@ -16,9 +16,17 @@
 // operator, on the first real click.
 //
 // Scope: absolute same-origin paths written as string or template literals in
-// public/*.js. Relative links, full URLs to other hosts, and anything built
-// at runtime are out of scope - this catches the constant that was wrong, not
-// every reachable string.
+// public/*.js, and href/src attributes in public/*.html. Relative links, full
+// URLs to other hosts, and anything built at runtime are out of scope - this
+// catches the constant that was wrong, not every reachable string.
+//
+// THE HTML HALF (2026-09-24). The pages' own <link> and <script> tags were
+// never read, and they are where a missing allowlist entry does its quietest
+// damage: a favicon link to an unserved path answers JSON with a 404, no page
+// shows an error, and Firefox then records "this origin has no icon" in
+// places.sqlite, where a hard reload does not reach it. Adding favicon.ico,
+// favicon-32.png and apple-touch-icon.png to the head is what made that worth
+// checking before it happens rather than after.
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -65,11 +73,30 @@ export function linkedPaths(src) {
     return out;
 }
 
+/**
+ * Absolute same-origin paths in href= and src= attributes of an HTML page.
+ *
+ * Comments are blanked first, keeping their newlines so line numbers still
+ * point at the right place: index.html explains its own markup at length, and
+ * a tag quoted in a comment is not a request the browser makes. `//host`
+ * (protocol-relative) is another origin and is not ours to check.
+ */
+const ATTR = /\b(?:href|src)\s*=\s*["'](\/(?!\/)[^"']*)["']/g;
+
+export function htmlLinkedPaths(src) {
+    const text = src.replace(/<!--[\s\S]*?-->/g, (c) => c.replace(/[^\n]/g, ' '));
+    const out = [];
+    for (const m of text.matchAll(ATTR)) {
+        out.push({ path: m[1].split(/[#?]/)[0] || '/', line: text.slice(0, m.index).split('\n').length });
+    }
+    return out;
+}
+
 function* walk(dir) {
     for (const e of readdirSync(dir)) {
         const p = join(dir, e);
         if (statSync(p).isDirectory()) yield* walk(p);
-        else if (p.endsWith('.js')) yield p;
+        else if (p.endsWith('.js') || p.endsWith('.html')) yield p;
     }
 }
 
@@ -97,6 +124,22 @@ function selfTest() {
     const bad = links.filter((l) => !served.has(l.path));
     t('the real defect is refused and the fixed form is not',
         bad.length === 1 && bad[0].path === '/index.html');
+    const head = htmlLinkedPaths(
+        '<head>\n'
+        + '<link rel="icon" href="/favicon.ico" sizes="32x32">\n'
+        + '<!-- was <link rel="icon" href="/old.ico"> before\n the port -->\n'
+        + '<script src="/app.js?v=2"></script>\n'
+        + '<link rel="preconnect" href="//cdn.example">\n'
+        + '<a href="#top">top</a>\n');
+    const hp = head.map((l) => l.path);
+    t('reads a head <link> href', hp.includes('/favicon.ico'));
+    t('reads a <script> src and strips its query', hp.includes('/app.js'));
+    t('a tag quoted inside a comment is not a request', !hp.includes('/old.ico'));
+    t('line numbers survive a blanked multi-line comment',
+        head.find((l) => l.path === '/app.js')?.line === 5);
+    t('a protocol-relative URL is another origin, and a fragment is not a path', hp.length === 2);
+    t('the unserved icon is refused',
+        head.filter((l) => !served.has(l.path)).map((l) => l.path).join() === '/favicon.ico');
     return ok;
 }
 
@@ -112,7 +155,8 @@ if (served === null) {
 const bad = [];
 for (const f of walk(root)) {
     const rel = f.replace(/\\/g, '/');
-    for (const l of linkedPaths(readFileSync(f, 'utf8'))) {
+    const scan = f.endsWith('.html') ? htmlLinkedPaths : linkedPaths;
+    for (const l of scan(readFileSync(f, 'utf8'))) {
         if (!served.has(l.path) && !l.path.startsWith('/api/')) bad.push({ rel, ...l });
     }
 }

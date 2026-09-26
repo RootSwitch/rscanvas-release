@@ -12,6 +12,10 @@
 // Env:
 //   FLEET_SIZE    devices to serve            (default 25)
 //   BASE_PORT     first UDP port              (default 16100)
+//   INDEX_OFFSET  first device INDEX to serve (default 0); device i always
+//                 answers on BASE_PORT+i as the same device, so one fleet can be
+//                 split across processes: FLEET_SIZE=100 INDEX_OFFSET=100 serves
+//                 exactly what a single 400-device process served on 16200-16299
 //   IFACES_PER    interfaces per device       (default 8)
 //   STORAGE_PER   filesystems per device      (default 3)
 //   CPUS_PER      processors per device       (default 2)
@@ -66,6 +70,14 @@ const snmp = require('net-snmp');
 
 const int = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
 const SIZE     = int(process.env.FLEET_SIZE, 25);
+// SHARDING (2026-09-23, the lab-1/lab-3 A/B). One node process answering for 450
+// devices is ONE queue, and real devices never share one: every agent answers
+// for itself. On a 4-core N150 the single process saturated in bursts and HEAD
+// polls - a few more requests each - waited on it, which read as the product
+// being five times slower. Splitting by index keeps every device identical
+// (sysName, interfaces, dead ports are all functions of i) while giving each
+// shard its own event loop.
+const OFFSET   = int(process.env.INDEX_OFFSET, 0);
 const BASE     = int(process.env.BASE_PORT, 16100);
 const IFACES   = int(process.env.IFACES_PER, 8);
 const STORES   = int(process.env.STORAGE_PER, 3);
@@ -155,7 +167,13 @@ function buildDevice(i) {
         : {};
 
     const evil = EVIL && i === 0;
-    const name = evil ? EVIL_STRINGS.sysName : `lab-node-${String(i + 1).padStart(3, '0')}`;
+    // NAMED BY PORT, unique by construction. Devices are unique by NAME in
+    // RSCanvas, and naming by index within the process gave every process a
+    // lab-node-001: the 2026-08-29 30k run lost 1,235 devices to it, and its
+    // commit (6539da6) said the generator was fixed to name off the port -
+    // but the fix went into the lab box's copy, never this file, so the
+    // lab-5 ingest run met the same collision on 2026-09-24. Fixed here now.
+    const name = evil ? EVIL_STRINGS.sysName : `lab-node-${port}`;
     for (const [n, oid, type, value] of [
         ['sysDescr', '1.3.6.1.2.1.1.1', OT.OctetString, `SNMPCanvas fleet mock - Linux ${name} 6.8.0 x86_64`],
         ['sysObjectID', '1.3.6.1.2.1.1.2', OT.OID, '1.3.6.1.4.1.8072.3.2.10'],
@@ -322,7 +340,7 @@ function buildDevice(i) {
 }
 
 let live = 0, dead = 0;
-for (let i = 0; i < SIZE; i++) {
+for (let i = OFFSET; i < OFFSET + SIZE; i++) {
     if (isDead(i)) { dead++; continue; }
     try { buildDevice(i); live++; }
     catch (e) { console.error(`port ${BASE + i}: ${e.message}`); }
@@ -389,7 +407,7 @@ setInterval(() => {
 }, TICK_MS);
 
 const perDevice = IFACES + STORES + CPUS + TEMPS;
-console.log(`fleet up: ${live} live agents on udp/${BASE}-${BASE + SIZE - 1}, ${dead} dead ports (timeouts by design)`);
+console.log(`fleet up: ${live} live agents on udp/${BASE + OFFSET}-${BASE + OFFSET + SIZE - 1}, ${dead} dead ports (timeouts by design)`);
 console.log(`per device: ${IFACES} interfaces + ${STORES} storage + ${CPUS} cpu + ${TEMPS} temps = ~${perDevice} pollable entities`);
 if (TEMPS > 0) {
     // SAY WHICH SENSORS MISBEHAVE, so a test does not have to re-derive the
