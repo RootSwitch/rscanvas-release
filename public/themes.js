@@ -244,11 +244,16 @@
 
     const KEY = 'rscanvas-theme';   // deliberately NOT the suite's key - see header
 
-    function applyTheme(name) {
+    // persist: false paints without saving. The wall uses it, because its
+    // state is its URL: a wall rotating palettes used to save each one here
+    // in turn, so the next person to open the app in that browser inherited
+    // whatever the wall happened to be showing.
+    function applyTheme(name, { persist = true } = {}) {
         const theme = THEMES[name] || THEMES.classic;
         const root = document.documentElement.style;
         for (const v of THEME_VARS) root.removeProperty(v);
         for (const [k, val] of Object.entries(theme.vars)) root.setProperty(k, val);
+        if (!persist) return;
         try { localStorage.setItem(KEY, name); } catch (_) { /* private mode */ }
     }
 

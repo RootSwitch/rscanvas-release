@@ -169,7 +169,43 @@ export async function readJsonBody(
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         throw new Error('body must be a JSON object');
     }
+    // PostgreSQL cannot store NUL in text at all, so a NUL in any string
+    // reached the database and came back a 500 (2026-09-28, the surface
+    // sweep). Refused here, once, for every route - there is no legitimate
+    // use for it in anything this API takes.
+    if (containsNul(parsed)) throw new Error('a string in the body contains a NUL character');
     return parsed as Record<string, unknown>;
+}
+
+// Built, not typed: an escape sequence for it has twice landed in this repo
+// as the raw byte it names.
+const NUL = String.fromCharCode(0);
+
+/** Whether any string in a parsed JSON value, or a query parameter, holds NUL. */
+export function containsNul(v: unknown): boolean {
+    if (typeof v === 'string') return v.includes(NUL);
+    if (Array.isArray(v)) return v.some(containsNul);
+    if (v !== null && typeof v === 'object') return Object.entries(v).some(([k, x]) => k.includes(NUL) || containsNul(x));
+    return false;
+}
+
+/**
+ * The body, or null after answering 400 with the reason. For the routes that
+ * used to write `readJsonBody(req).catch(() => ({}))`: that turned a
+ * truncated or malformed request into an EMPTY one and acted on it - the
+ * surface sweep's invalid JSON turned a glance-grid board into a drawn one
+ * and erased the group it was generated from (2026-09-28). A request whose
+ * body cannot be read is refused, never reinterpreted.
+ */
+export async function readBodyOr400(
+    req: http.IncomingMessage, res: http.ServerResponse, limit: number = MAX_BODY_BYTES,
+): Promise<Record<string, unknown> | null> {
+    try {
+        return await readJsonBody(req, limit);
+    } catch (err) {
+        sendJson(res, 400, { ok: false, detail: `request body refused: ${(err as Error).message}` });
+        return null;
+    }
 }
 
 export function str(body: Record<string, unknown>, key: string): string {

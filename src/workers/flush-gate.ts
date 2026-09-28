@@ -65,3 +65,27 @@ export function makeFlushGate(fire: () => void, delayMs: number, timers: TimerAp
         armed() { return handle !== null; },
     };
 }
+
+// --- a failing database, and how often to try it again ---------------------------
+//
+// THE RETRY FLOOD (2026-09-28, the outage drill). PostgreSQL stopped for three
+// minutes under 50 messages a second, and ingest kept every row - requeued,
+// then written within two seconds of the database returning - but once the
+// requeued backlog passed FLUSH_ROWS, EVERY arriving datagram started another
+// flush straight into the refused connection and logged an ALARM: 8,701 lines
+// in three minutes, one per message. At the ceiling rate that is 15,000 failed
+// connection attempts and log lines a second, spent exactly when the box is
+// in trouble. So a failed flush now waits before the next, doubling from 250
+// ms to a 2-second cap, and says so on the first three failures and then
+// every fifteenth (about every 30 s at the cap) rather than on every one.
+
+/** How long to wait after the Nth failed flush in a row. 0 once one succeeds. */
+export function failureBackoffMs(streak: number): number {
+    if (!(streak > 0)) return 0;
+    return Math.min(2000, 250 * 2 ** Math.min(streak - 1, 10));
+}
+
+/** Whether the Nth failure in a row is worth a log line of its own. */
+export function shouldLogFailure(streak: number): boolean {
+    return streak <= 3 || streak % 15 === 0;
+}

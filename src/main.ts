@@ -38,7 +38,8 @@ import { planRemoval, gateRemoval, normalizeNames, normalizeMode } from './devic
 import { compileRule } from './alerts/events.ts';
 import {
     suggestLocations, selectForAdd, selectForForce, locationAssignments,
-    normalizeProbeRequest, probedName, addOutcome, normalizeExplicitName,
+    normalizeProbeRequest, probedName, addOutcome, normalizeExplicitName, probeStanding,
+    standingFields,
 } from './devices/onboard.ts';
 import { encrypt, decrypt, credentialStoreReady, CredentialKeyMissing } from './credentials/crypto.ts';
 import { validateProfile, isPermittedEnvRef, type ProfileView } from './credentials/profiles.ts';
@@ -56,14 +57,14 @@ import { serializeMetrics } from './health/metrics.ts';
 // can actually probe.
 import { SUPPORTED_CHECKS } from './collector/reach.ts';
 import {
-    sendJson, enforce, readJsonBody, clientIp, inetOrNull, BODY_CAP_BULK, BODY_CAP_DOC, securityHeaders,
+    sendJson, enforce, readJsonBody, readBodyOr400, containsNul, clientIp, inetOrNull, BODY_CAP_BULK, BODY_CAP_DOC, securityHeaders,
 } from './http/respond.ts';
 import * as authRoutes from './http/routes-auth.ts';
 import * as exportRoutes from './http/routes-export.ts';
 import * as exportJobs from './export/jobs.ts';
 import {
     isPartitionHealthy, isFrontierHealthy, isJobsHealthy, isHeartbeatHealthy,
-    isKernelDropFree, evaluateWorkers, isDbSelfHealthy,
+    isKernelDropFree, evaluateWorkers, isDbSelfHealthy, isRetentionEnforcing, isNotifyDelivering,
     type IngestStats, type CollectorStats, type JobsStats, type DbSelfState,
 } from './workers/protocol.ts';
 import {
@@ -465,11 +466,15 @@ async function health(res: http.ServerResponse, deep: boolean): Promise<void> {
         // rollup, with the frontier current and healthy the whole way. Nothing
         // saw it until the consumption sweep asked what job failures were for.
         isJobsHealthy(jobsStats?.jobs, CONFIG.jobsEnabled),
+        // ...and a retention that succeeds every run by dropping nothing.
+        isRetentionEnforcing(jobsStats?.jobs, CONFIG.retentionDryRun, CONFIG.jobsEnabled),
         // A half-configured notification channel is a TYPO standing between an
         // alert and the person who needs it, and it is invisible without this:
         // the channel is silently off, alerts settle as delivered because
         // nothing owed them, and "why was I not alerted" has no answer.
         isNotifyConfigSane(channels),
+        // ...and a configured one that has stopped getting through.
+        isNotifyDelivering(jobsStats?.notifyChannels),
         ...isDbSelfHealthy(dbSelf),
     ];
     const problems = verdicts.filter((v) => !v.healthy).map((v) => (v as { problem: string }).problem);
@@ -808,6 +813,25 @@ const server = createWebServer(tlsPair, (req, res) => {
     const path = url.pathname;
 
     const route = async (): Promise<void> => {
+        // INPUT NO ROUTE CAN USE, refused before any route sees it (2026-09-28,
+        // the surface sweep - tools/live-surface.mjs). A NUL in a query
+        // parameter reached PostgreSQL, which cannot store one, as a 500 on
+        // four routes; an id of 20 digits passed every [0-9]+ check and
+        // overflowed bigint, a 500 again. Both are refused here once, rather
+        // than in each of the sixty routes that would otherwise have to
+        // remember.
+        for (const v of url.searchParams.values()) {
+            if (containsNul(v)) {
+                sendJson(res, 400, { ok: false, detail: 'a query parameter contains a NUL character' });
+                return;
+            }
+        }
+        for (const seg of path.split('/')) {
+            if (/^[0-9]{19,}$/.test(seg) && BigInt(seg) > 9223372036854775807n) {
+                sendJson(res, 404, { ok: false, detail: 'no such id' });
+                return;
+            }
+        }
         // A CONTAINER HEALTHCHECK MUST TARGET THIS ROUTE, NOT /api/health.
         //
         // There is no compose file in the repo yet, so this constraint has
@@ -871,7 +895,10 @@ const server = createWebServer(tlsPair, (req, res) => {
         // that one and would stop rendering the very panel that explains the
         // problem.
         if (path === '/api/health/work' && method === 'GET') {
-            const verdict = workHealth(collectorStats, CONFIG.pollLagAlarmMs, CONFIG.collectorEnabled);
+            const scan = jobsStats?.jobs.find((j) => j.name === 'alerts:scan') ?? null;
+            const verdict = workHealth(collectorStats, CONFIG.pollLagAlarmMs, CONFIG.collectorEnabled, {
+                scan, ingest: ingestStats, nowMs: Date.now(), limitMs: CONFIG.dbOutageAlarmMs,
+            });
             // The STATUS CODE stays sessionless - it is the whole point of
             // the route (see above): a monitor learns "starved" from a 503.
             // The BODY is operational detail - lag percentiles, concurrency,
@@ -986,7 +1013,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             const open = await OPS.uiOpenAlerts();
             if (!open.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${open.reason})` }); return; }
             const cleared = await OPS.uiRecentCleared(
-                Number(url.searchParams.get('history') ?? 25) || 25);
+                Math.min(500, Math.max(1, Math.floor(Number(url.searchParams.get('history') ?? 25)) || 25)));
             if (!cleared.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${cleared.reason})` }); return; }
             // The flap report (easy-win E11) rides the same response: keys
             // that raised and cleared three-plus times today are the churn
@@ -1053,7 +1080,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             if (!alert.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${alert.reason})` }); return; }
             if (alert.rows.length === 0) { sendJson(res, 404, { ok: false, detail: 'no such alert' }); return; }
             const history = await OPS.uiAlertHistory(
-                id, Number(url.searchParams.get('history') ?? 50) || 50);
+                id, Math.min(500, Math.max(1, Math.floor(Number(url.searchParams.get('history') ?? 50)) || 50)));
             if (!history.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${history.reason})` }); return; }
             // THRESHOLD PROVENANCE, resolved NOW rather than stored at raise:
             // the row's threshold column is what fired (frozen, honest), and
@@ -1840,6 +1867,11 @@ const server = createWebServer(tlsPair, (req, res) => {
         }
         if (path === '/api/syslog/export') {
             if (method === 'POST') {
+                // Authorised FIRST (2026-09-28, the surface sweep): the body was
+                // parsed and its window validated before submit() checked the
+                // role, so a signed-out caller was told which parameters to
+                // send. submit() still checks too; this is the order.
+                if (!enforce(res, principal, 'syslog.export')) return;
                 let body: Record<string, unknown> = {};
                 try {
                     body = await readJsonBody(req);
@@ -2425,12 +2457,11 @@ const server = createWebServer(tlsPair, (req, res) => {
 
             // Already-known is its own outcome, not an error. Onboarding gets
             // retried after fixing two credentials, and a retry that fails on
-            // the successes is a retry nobody runs.
-            const proposed = results.map((r) => String(r.sysName ?? r.host));
+            // the successes is a retry nobody runs. Known means the same
+            // address AND port; probeStanding owns that call.
+            const proposed = results.map((r) => probedName(r));
             const known = await OPS.knownDevices(proposed, hosts);
             if (!known.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${known.reason})` }); return; }
-            const knownHosts = new Set(known.rows.map((k) => k.host));
-            const knownNames = new Set(known.rows.map((k) => k.name));
 
             const token = crypto.randomBytes(16).toString('base64url');
             probeCache.set(token, {
@@ -2488,7 +2519,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                 devices: results.map((r) => ({
                     host: r.host,
                     ok: r.ok,
-                    name: String(r.sysName ?? r.host),
+                    name: probedName(r),
                     sysDescr: r.sysDescr,
                     sysLocation: r.sysLocation,
                     // Interfaces and sensors reported SEPARATELY: "25
@@ -2500,7 +2531,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                     sensors: Array.isArray(r.entities)
                         ? (r.entities as Array<{ kind?: string }>).filter((e) => e.kind !== 'if').length : 0,
                     tracked: r.trackedCount ?? 0,
-                    known: knownHosts.has(String(r.host)) || knownNames.has(String(r.sysName ?? r.host)),
+                    ...standingFields(probeStanding(probedName(r), String(r.host), port, known.rows)),
                     error: r.error,
                     errorKind: r.errorKind,
                 })),
@@ -3405,7 +3436,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             const axis = url.searchParams.get('axis') === 'application' ? 'application' : 'location';
             const value = url.searchParams.get('value');
             const boardRaw = url.searchParams.get('board');
-            if (boardRaw !== null && !/^[0-9]{1,19}$/.test(boardRaw)) {
+            if (boardRaw !== null && !/^[0-9]{1,18}$/.test(boardRaw)) {
                 sendJson(res, 400, { ok: false, detail: 'board must be a positive integer' });
                 return;
             }
@@ -3678,7 +3709,8 @@ const server = createWebServer(tlsPair, (req, res) => {
         const boardSource = /^\/api\/boards\/([0-9]{1,19})\/source$/.exec(path);
         if (boardSource && method === 'POST') {
             if (!enforce(res, principal, 'board.write')) return;
-            const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>));
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
             const id = boardSource[1] as string;
             // Slice 41: this route was written before team boards and spoke
             // only {axis, value} - ONE group. Slice 27 gave a board a LIST and
@@ -3904,7 +3936,8 @@ const server = createWebServer(tlsPair, (req, res) => {
         }
         if (path === '/api/boards' && method === 'POST') {
             if (!enforce(res, principal, 'board.write')) return;
-            const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>));
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
             const name = typeof body.name === 'string' ? body.name.trim() : '';
             const collection = body.collection === 'diagram' ? 'diagram' : 'wall';
             if (name === '' || name.length > 120) {
@@ -3975,7 +4008,8 @@ const server = createWebServer(tlsPair, (req, res) => {
         const boardAddr = /^\/api\/boards\/([0-9]{1,19})\/addresses$/.exec(path);
         if (boardAddr && method === 'POST') {
             if (!enforce(res, principal, 'board.write')) return;
-            const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>));
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
             const show = body.show === true;
             const r = await OPS.setBoardAddresses(boardAddr[1] as string, show);
             if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
@@ -3998,7 +4032,8 @@ const server = createWebServer(tlsPair, (req, res) => {
         const boardGrid = /^\/api\/boards\/([0-9]{1,19})\/grid$/.exec(path);
         if (boardGrid && method === 'POST') {
             if (!enforce(res, principal, 'board.write')) return;
-            const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>));
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
             let cols: number | null = null;
             if (body.cols !== null && body.cols !== undefined) {
                 cols = Math.round(Number(body.cols));
@@ -4070,7 +4105,8 @@ const server = createWebServer(tlsPair, (req, res) => {
         }
         if (boardTokens && method === 'POST') {
             if (!enforce(res, principal, 'token.mint')) return;
-            const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>));
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
             const label = typeof body.label === 'string' ? body.label.trim() : '';
             if (label === '' || label.length > 120) {
                 sendJson(res, 400, { ok: false, detail: 'label is required - it is how you will know which display to revoke' });
@@ -4156,7 +4192,8 @@ const server = createWebServer(tlsPair, (req, res) => {
                 boardId = String((display as { boardId: number }).boardId);
             } else if (principal.kind === 'user') {
                 const asked = url.searchParams.get('board') ?? '';
-                if (!/^[0-9]+$/.test(asked)) {
+                // Within bigint: 20 digits passed [0-9]+ and overflowed in SQL.
+                if (!/^[0-9]{1,18}$/.test(asked)) {
                     sendJson(res, 400, {
                         ok: false,
                         reason: 'board-required',

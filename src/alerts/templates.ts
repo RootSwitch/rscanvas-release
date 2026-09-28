@@ -92,7 +92,13 @@ function detailFor(alert: Alert): string {
         return `value ${alert.value}${unit} (threshold ${alert.threshold}${unit})`;
     }
     switch (alert.kind) {
-        case 'device-down': return 'not reporting in the status feed (unreachable or powered off)';
+        // Said as what is KNOWN (2026-09-28, the notification drill): the
+        // email for an agent stopped on a box that still answered ping read
+        // "unreachable or powered off" - neither was true - and "status
+        // feed" is the parent suite's word, not this product's. The poll is
+        // what failed; the ping column is what tells the two cases apart.
+        case 'device-down': return 'not answering SNMP polls (if it still answers ping, suspect '
+            + 'the agent or its credential; if not, the device or the network)';
         case 'if-down':     return 'link is down';
         case 'ping-down':   return alert.severity === 'warn'
             ? `answering ping slowly${alert.value != null ? ` (${alert.value} ms)` : ''}`

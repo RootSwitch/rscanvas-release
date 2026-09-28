@@ -9,7 +9,7 @@
 // and re-arms at the end if rows remain, a fire during a running flush returns
 // early - against fake timers, and asserts the tail is written.
 
-import { makeFlushGate, type TimerApi } from '../src/workers/flush-gate.ts';
+import { makeFlushGate, failureBackoffMs, shouldLogFailure, type TimerApi } from '../src/workers/flush-gate.ts';
 
 // House rule since test-walk: fail unless the run reaches its verdict.
 process.exitCode = 1;
@@ -104,6 +104,25 @@ console.log('\nordinary behaviour kept:');
     const g = makeFlushGate(() => {}, FLUSH_MS, fake);
     g.armIfIdle(); g.disarm();
     ok('disarm cancels a pending fire', !g.armed() && timers.filter((t) => t.live).length === 0);
+}
+
+console.log('\nfailureBackoffMs and shouldLogFailure - a failing database is tried, and reported, less often:');
+{
+    ok('no wait before a failure, or after a success', failureBackoffMs(0) === 0);
+    ok('250 ms after the first failure', failureBackoffMs(1) === 250);
+    ok('then doubling', failureBackoffMs(2) === 500 && failureBackoffMs(3) === 1000 && failureBackoffMs(4) === 2000);
+    ok('capped at 2 s however long the outage runs', failureBackoffMs(5) === 2000 && failureBackoffMs(500) === 2000);
+    ok('a nonsense streak waits nothing rather than NaN', failureBackoffMs(Number.NaN) === 0 && failureBackoffMs(-1) === 0);
+    // The drill's own shape: 180 s at the cap is about 90 attempts, where one
+    // flush per datagram at 50 a second took 8,701.
+    let t = 0;
+    let attempts = 0;
+    while (t < 180_000) { attempts++; t += failureBackoffMs(attempts); }
+    ok('a 3-minute outage costs about 90 attempts', attempts > 80 && attempts < 100, `${attempts}`);
+    let lines = 0;
+    for (let k = 1; k <= attempts; k++) if (shouldLogFailure(k)) lines++;
+    ok('and under ten log lines', lines < 10, `${lines}`);
+    ok('the first failure is always said', shouldLogFailure(1));
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

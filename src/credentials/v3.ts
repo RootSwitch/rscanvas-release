@@ -299,6 +299,21 @@ export function explainV3Error(message: string): string | null {
  * thing standing between the operator and an afternoon spent on a switch
  * that was answering fine.
  */
+/**
+ * The v1/v2c half (2026-09-28, the real-agent drill): net-snmp's snmpd drops a
+ * request with a wrong community without a word, exactly as it drops one from
+ * an address its rocommunity line does not list - so a probe with the wrong
+ * community read "Request timed out" and nothing else, the same sentence a
+ * powered-off switch produces. The v3 timeouts below already said this about
+ * keys; a community is a key too.
+ */
+export function explainCommunityTimeout(): string {
+    return 'on SNMP v1/v2c a timeout ALSO fits a wrong community, or an agent that only answers '
+        + 'certain source addresses: agents drop such requests silently rather than refusing them '
+        + '(net-snmp, measured). If it answers ping, suspect the community and the agent\'s allowed '
+        + 'addresses before the network.';
+}
+
 export function explainV3Timeout(level: V3Level | null): string | null {
     if (level === 'authPriv') {
         return 'on an authPriv session a timeout ALSO fits a wrong privacy OR auth passphrase: '

@@ -13,6 +13,8 @@
 #   ./rscanvas-setup.sh --check              # report, change nothing
 #   sudo ./rscanvas-setup.sh                 # install or reconcile
 #   sudo ./rscanvas-setup.sh --high-ports    # syslog 5514 / traps 15162
+#   sudo ./rscanvas-setup.sh --uninstall     # remove the service, KEEP the data
+#   sudo ./rscanvas-setup.sh --uninstall --purge   # ...and the data
 #
 #   --check          report what this box currently is and exit
 #   --db NAME        database name              (default: rscanvas)
@@ -27,7 +29,20 @@
 #                    TLS_CERT and TLS_KEY from the env file by hand to do that)
 #   --tls-cert PATH  use this PEM certificate instead of minting one
 #   --tls-key PATH   ...and this key (both or neither; implies --tls)
+#   --uninstall      stop and remove the service, the application directory,
+#                    the node port capability and the kernel buffer setting;
+#                    KEEP the database, its roles, /etc/rscanvas and the
+#                    service account, so installing again resumes where it was
+#   --purge          with --uninstall: also drop the database (and any copies
+#                    rscanvas-backup.sh set aside), the roles, /etc/rscanvas and
+#                    the service account. Backups and packages are never removed.
 #   --yes            do not prompt
+#
+#   --db, --dir, --http-port, --high-ports and --user are STICKY too: a later
+#   run without them keeps what the install already uses (read from the env
+#   file and the unit). To change one, pass it again; to return from
+#   --high-ports to 514/162, edit SYSLOG_PORT and TRAP_PORT in the env file
+#   and re-run.
 #
 # WHY --check EXISTS, AND WHY IT IS FIRST IN THE FILE. On 2026-08-15 three
 # deployments went wrong on this lab's own boxes, and all three had one cause:
@@ -54,25 +69,40 @@ DO_TLS=0
 TLS_CERT_SRC=""
 TLS_KEY_SRC=""
 ENV_FILE=/etc/rscanvas/rscanvas.env
+# Which choices were made on THIS command line - the rest are read back from
+# the existing install below, so a re-run cannot quietly undo them.
+SET_DB=0; SET_USER=0; SET_HTTP=0; SET_PORTS=0; SET_DIR=0
+DO_UNINSTALL=0
+DO_PURGE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --check)       DO_CHECK=1 ;;
-        --db)          DB_NAME="$2"; shift ;;
-        --dir)         APP_DIR="$2"; shift ;;
-        --user)        SVC_USER="$2"; shift ;;
-        --http-port)   HTTP_PORT="$2"; shift ;;
-        --high-ports)  SYSLOG_PORT=5514; TRAP_PORT=15162 ;;
+        --uninstall)   DO_UNINSTALL=1 ;;
+        --purge)       DO_PURGE=1 ;;
+        --db)          DB_NAME="$2"; SET_DB=1; shift ;;
+        --dir)         APP_DIR="$2"; SET_DIR=1; shift ;;
+        --user)        SVC_USER="$2"; SET_USER=1; shift ;;
+        --http-port)   HTTP_PORT="$2"; SET_HTTP=1; shift ;;
+        --high-ports)  SYSLOG_PORT=5514; TRAP_PORT=15162; SET_PORTS=1 ;;
         --no-service)  DO_SERVICE=0 ;;
         --tls)         DO_TLS=1 ;;
         --tls-cert)    DO_TLS=1; TLS_CERT_SRC="$2"; shift ;;
         --tls-key)     DO_TLS=1; TLS_KEY_SRC="$2"; shift ;;
         --yes|-y)      ASSUME_YES=1 ;;
-        -h|--help)     sed -n '2,38p' "$0"; exit 0 ;;
+        # Up to the first paragraph that is not usage, found by its heading
+        # rather than a line number that every new flag used to invalidate.
+        -h|--help)     sed -n '2,/^# WHY --check EXISTS/p' "$0" | sed '$d'; exit 0 ;;
         *)             echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
 done
+# Alone, --purge is one mistyped word away from dropping a database while
+# meaning something else entirely; it only ever qualifies --uninstall.
+if [ "$DO_PURGE" = 1 ] && [ "$DO_UNINSTALL" = 0 ]; then
+    echo "--purge only means something with --uninstall: sudo $0 --uninstall --purge" >&2
+    exit 2
+fi
 
 B=$'\033[1m'; Y=$'\033[33m'; R=$'\033[31m'; G=$'\033[32m'; N=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
@@ -118,6 +148,53 @@ disk_for() {
     printf '%s' "$out"
 }
 
+# ----- sticky choices: what the existing install already uses ------------------
+#
+# THE UPGRADE THAT MOVED A BOX TO AN EMPTY DATABASE (2026-09-27, found while
+# building the restore). INSTALL.md's upgrade is "re-run with no flags", and
+# TLS was already sticky for exactly that reason - but --db, --http-port,
+# --high-ports and --user were not. A box installed with --db lab re-run
+# without it had DATABASE_URL rewritten to a NEW, EMPTY database called
+# rscanvas, created and schema'd on the spot, and the service came back
+# healthy on nothing; --high-ports fell back to 514/162, --http-port to 18080
+# under every bookmark, and --user to a second service account. So each is
+# read back from the install when this command line does not say otherwise.
+# Only values of the right shape are taken: a hand-edited env file should
+# fall back to the default, never feed a malformed name into SQL.
+prev_env() {
+    local v=""
+    if [ -r "$ENV_FILE" ]; then v=$(sed -n "s/^$1=//p" "$ENV_FILE" | head -1)
+    else v=$(sudo -n sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -1 || true); fi
+    printf '%s' "$v"
+}
+KEPT=""
+if [ "$SET_DB" = 0 ]; then
+    u="$(prev_env DATABASE_URL)"; u="${u##*/}"; u="${u%%\?*}"
+    if [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] && [ "$u" != "$DB_NAME" ]; then DB_NAME="$u"; KEPT+=" database $u,"; fi
+fi
+if [ "$SET_HTTP" = 0 ]; then
+    p="$(prev_env HTTP_PORT)"
+    if [[ "$p" =~ ^[0-9]{1,5}$ ]] && [ "$p" != "$HTTP_PORT" ]; then HTTP_PORT="$p"; KEPT+=" web port $p,"; fi
+fi
+if [ "$SET_PORTS" = 0 ]; then
+    s="$(prev_env SYSLOG_PORT)"; t="$(prev_env TRAP_PORT)"
+    if [[ "$s" =~ ^[0-9]{1,5}$ ]] && [[ "$t" =~ ^[0-9]{1,5}$ ]] && { [ "$s" != "$SYSLOG_PORT" ] || [ "$t" != "$TRAP_PORT" ]; }; then
+        SYSLOG_PORT="$s"; TRAP_PORT="$t"; KEPT+=" syslog $s and traps $t,"
+    fi
+fi
+if [ "$SET_USER" = 0 ] && [ -f /etc/systemd/system/rscanvas.service ]; then
+    s="$(sed -n 's/^User=//p' /etc/systemd/system/rscanvas.service | head -1)"
+    if [[ "$s" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && [ "$s" != "$SVC_USER" ]; then SVC_USER="$s"; KEPT+=" service user $s,"; fi
+fi
+# --dir from the unit too (2026-09-28, with --uninstall): an uninstall that
+# guessed /opt/rscanvas on a box installed elsewhere would remove the service
+# and leave the application behind, and a re-run from /srv/rscanvas died
+# "no application at /opt/rscanvas".
+if [ "$SET_DIR" = 0 ] && [ -f /etc/systemd/system/rscanvas.service ]; then
+    s="$(sed -n 's/^WorkingDirectory=//p' /etc/systemd/system/rscanvas.service | head -1)"
+    if [[ "$s" =~ ^/[A-Za-z0-9._/-]+$ ]] && [ "$s" != "$APP_DIR" ]; then APP_DIR="$s"; KEPT+=" directory $s,"; fi
+fi
+
 # ----- --check: read the box, change nothing --------------------------------
 #
 # Every line here is a QUESTION SOMEONE GOT WRONG. Kept in the order that makes
@@ -153,7 +230,7 @@ if [ "$DO_CHECK" = 1 ]; then
     fi
     if sudo -n test -f "$ENV_FILE" 2>/dev/null && sudo -n grep -qE '^TLS_CERT=.+' "$ENV_FILE" 2>/dev/null; then
         crt=$(sudo -n sed -n 's/^TLS_CERT=//p' "$ENV_FILE" | head -1)
-        exp=$(sudo -n openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)
+        exp=$(sudo -n openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2 || true)
         say "  tls        on - $crt (expires ${exp:-UNREADABLE - the service will not start})"
     else
         say "  tls        off - web port is plain http (opt in with --tls)"
@@ -170,6 +247,11 @@ if [ "$DO_CHECK" = 1 ]; then
     if [ -n "$pgv" ]; then
         pgdata=$(q 'SHOW data_directory')
         say "  data dir   $pgdata"
+        if ls /etc/systemd/system/postgresql*.service.d/60-rscanvas-restart.conf >/dev/null 2>&1; then
+            say "  restarts   PostgreSQL restarts itself after a failure (the installer's drop-in)"
+        else
+            warn "PostgreSQL does not restart itself - after a disk-full it stays down until started by hand; re-run the installer"
+        fi
         say "  disk       $(disk_for "$pgdata")"
     fi
 
@@ -242,6 +324,197 @@ if [ "$DO_CHECK" = 1 ]; then
     exit 0
 fi
 
+# ----- uninstall: take RSCanvas off the box, keep (or purge) its data ----------
+#
+# KEEP IS THE DEFAULT (the operator's ruling, 2026-09-28). An uninstall is
+# often the first half of something else - moving the application, clearing
+# a broken install, an upgrade gone wrong - and the one step here that cannot
+# be undone is dropping the database. So --uninstall removes what the bundle
+# and the installer can put back (the service, the application, the
+# capability, the kernel setting) and keeps what they cannot: the database,
+# its roles, /etc/rscanvas with RSCANVAS_SECRET, and the service account the
+# TLS files belong to. Installing again finds all of it and resumes.
+# --purge removes those too, and still never touches backups (the one copy
+# that exists for when everything else is gone) or packages (PostgreSQL may
+# be holding other people's databases).
+#
+# Everything is decided and printed BEFORE anything changes, and every
+# removal is checked afterwards by looking, the same rule as the install.
+if [ "$DO_UNINSTALL" = 1 ]; then
+    [ "$(id -u)" = 0 ] || die "run with sudo (removes a service, a directory and a capability)"
+    [[ "$DB_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "database name '$DB_NAME' is not one this installer would have made"
+    UNIT_FILE=/etc/systemd/system/rscanvas.service
+    SYSCTL_FILE=/etc/sysctl.d/60-rscanvas.conf
+    NODE_BIN="$(command -v node || true)"
+    BACKUP_DIR=/var/backups/rscanvas
+
+    # What the application directory is allowed to be. `rm -rf` on a path
+    # nobody verified is how an uninstaller deletes /opt: a wrong --dir, or a
+    # hand-edited unit, must leave the directory alone and say why.
+    app_dir_state() {
+        case "$APP_DIR" in
+            ""|/|/opt|/opt/|/usr|/usr/*|/home|/home/|/root|/etc|/etc/*|/var|/srv|/srv/|/bin|/sbin|/lib*|/boot*|/tmp|/tmp/)
+                echo refuse; return ;;
+        esac
+        [[ "$APP_DIR" = /* ]] || { echo refuse; return; }
+        [ -e "$APP_DIR" ] || { echo absent; return; }
+        { [ -f "$APP_DIR/src/main.ts" ] && grep -q '"name": *"rscanvas"' "$APP_DIR/package.json" 2>/dev/null; } \
+            || { echo foreign; return; }
+        [ -d "$APP_DIR/.git" ] && { echo checkout; return; }
+        echo ours
+    }
+    APP_STATE="$(app_dir_state)"
+    PG_UP=0; [ -n "$(q 'SELECT 1')" ] && PG_UP=1
+    [ "$DO_PURGE" = 1 ] && [ "$PG_UP" = 0 ] && \
+        die "PostgreSQL is not answering, and --purge needs it to drop the database - start it, or run --uninstall alone"
+    # The databases this install made: its own, plus the copies
+    # rscanvas-backup.sh sets aside (<db>_pre_restore_<stamp>) or tests into.
+    DBS=""
+    [ "$PG_UP" = 1 ] && DBS="$(q "SELECT string_agg(datname, ' ' ORDER BY datname) FROM pg_database
+        WHERE datname = '$DB_NAME' OR datname = '${DB_NAME}_restore_test' OR datname LIKE '${DB_NAME}\\_pre\\_restore\\_%'")"
+    # `|| true` is load-bearing: with no match, ls exits 2, pipefail carries
+    # that into the assignment, and set -e ended the whole uninstall there -
+    # silently, on every box that had never been restored. The drill caught
+    # it only on its second pass; the first box had a set-aside copy.
+    ASIDE_ETC="$(ls -d /etc/rscanvas.pre-restore-* 2>/dev/null | xargs || true)"
+    HAS_CAP=0
+    [ -n "$NODE_BIN" ] && getcap "$NODE_BIN" 2>/dev/null | grep -q cap_net_bind_service && HAS_CAP=1
+    NBACKUPS="$(ls "$BACKUP_DIR" 2>/dev/null | grep -c '\.tar$' || true)"
+
+    step "what $( [ "$DO_PURGE" = 1 ] && echo 'a PURGE' || echo 'an uninstall' ) removes, and what it keeps"
+    if [ -n "$KEPT" ]; then say "  found      the install uses${KEPT%,}"; fi
+    [ -f "$UNIT_FILE" ] && say "  removes    the rscanvas service and its unit"
+    case "$APP_STATE" in
+        ours)     say "  removes    $APP_DIR, the application (the bundle you installed from puts it back)" ;;
+        absent)   say "  already    $APP_DIR is not there" ;;
+        checkout) warn "$APP_DIR is a git checkout - left where it is" ;;
+        foreign)  warn "$APP_DIR does not look like an RSCanvas install - left where it is" ;;
+        refuse)   warn "$APP_DIR is not a directory an uninstaller should remove - left where it is" ;;
+    esac
+    [ "$HAS_CAP" = 1 ] && say "  removes    the port-binding capability the installer gave $NODE_BIN"
+    [ -f "$SYSCTL_FILE" ] && say "  removes    $SYSCTL_FILE (the UDP receive buffer setting)"
+    ls /etc/systemd/system/postgresql*.service.d/60-rscanvas-restart.conf >/dev/null 2>&1 \
+        && say "  removes    the restart-on-failure policy it gave PostgreSQL's unit"
+    if [ "$DO_PURGE" = 1 ]; then
+        [ -n "$DBS" ] && say "  DROPS      database$( [ "$(wc -w <<< "$DBS")" -gt 1 ] && echo s) $DBS"
+        say "  DROPS      the roles rscanvas_owner, rscanvas and rscanvas_admin, unless they own something else"
+        [ -d /etc/rscanvas ] && say "  DELETES    /etc/rscanvas - the env file with its secrets, and the TLS pair"
+        [ -n "$ASIDE_ETC" ] && say "  DELETES    $ASIDE_ETC (set aside by a restore)"
+        id -u "$SVC_USER" >/dev/null 2>&1 && say "  DELETES    the service account $SVC_USER"
+    else
+        [ -n "$DBS" ] && say "  keeps      database$( [ "$(wc -w <<< "$DBS")" -gt 1 ] && echo s) $DBS and the three roles"
+        [ -d /etc/rscanvas ] && say "  keeps      /etc/rscanvas - RSCANVAS_SECRET, the database passwords, the TLS pair"
+        id -u "$SVC_USER" >/dev/null 2>&1 && say "  keeps      the service account $SVC_USER, which the TLS files belong to"
+    fi
+    say "  never      backups ($BACKUP_DIR: ${NBACKUPS:-0}) or packages"
+    if [ "$ASSUME_YES" != 1 ]; then
+        if [ "$DO_PURGE" = 1 ]; then
+            read -r -p "  this cannot be undone - type the database name ($DB_NAME) to purge: " a
+            [ "$a" = "$DB_NAME" ] || die "stopped - nothing was changed"
+        else
+            read -r -p "  continue? [y/N] " a
+            case "$a" in y|Y) ;; *) die "stopped - nothing was changed" ;; esac
+        fi
+    fi
+
+    step "the service"
+    if [ -f "$UNIT_FILE" ]; then
+        systemctl disable --now rscanvas >/dev/null 2>&1 || true
+        rm -f "$UNIT_FILE"
+        systemctl daemon-reload
+        systemctl reset-failed rscanvas >/dev/null 2>&1 || true
+        good "stopped, disabled and removed"
+    else
+        say "  no rscanvas unit"
+    fi
+    if [ "$HAS_CAP" = 1 ]; then
+        setcap -r "$NODE_BIN"
+        good "cap_net_bind_service removed from $NODE_BIN (grant it again if something else here needs node on ports below 1024)"
+    fi
+    for d in /etc/systemd/system/postgresql@18-main.service.d/60-rscanvas-restart.conf \
+             /etc/systemd/system/postgresql-18.service.d/60-rscanvas-restart.conf; do
+        if [ -f "$d" ]; then
+            rm -f "$d"; rmdir --ignore-fail-on-non-empty "$(dirname "$d")"; systemctl daemon-reload
+            good "$d removed - PostgreSQL's restart policy is the system's own again"
+        fi
+    done
+    if [ -f "$SYSCTL_FILE" ]; then
+        rm -f "$SYSCTL_FILE"
+        good "$SYSCTL_FILE removed - net.core.rmem_max stays $(sysctl -n net.core.rmem_max) until the next reboot"
+    fi
+    if [ "$APP_STATE" = ours ]; then
+        # This script may be running from inside it. Bash already holds the
+        # file open, so removing it here does not cut the run short.
+        rm -rf -- "$APP_DIR"
+        good "$APP_DIR removed"
+    fi
+
+    if [ "$DO_PURGE" = 1 ]; then
+        step "the data"
+        for d in $DBS; do
+            psql_su -c "DROP DATABASE \"$d\" WITH (FORCE)" >/dev/null && good "database $d dropped"
+        done
+        # rscanvas_admin first: it is a member of rscanvas_owner.
+        for r in rscanvas_admin rscanvas rscanvas_owner; do
+            [ -n "$(q "SELECT 1 FROM pg_roles WHERE rolname = '$r'")" ] || continue
+            owned="$(q "SELECT string_agg(d.datname, ' ') FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba WHERE r.rolname = '$r'")"
+            if [ -n "$owned" ]; then warn "role $r kept - it still owns $owned"; continue; fi
+            if psql_su -c "DROP ROLE \"$r\"" >/dev/null 2>&1; then good "role $r dropped"
+            else warn "role $r kept - it still holds privileges somewhere else on this server"; fi
+        done
+        if [ -e /etc/rscanvas ]; then rm -rf -- /etc/rscanvas && good "/etc/rscanvas removed"; fi
+        for d in $ASIDE_ETC; do rm -rf -- "$d" && good "$d removed"; done
+        rm -rf /var/tmp/rscanvas-restore.* 2>/dev/null || true
+        # Only a SYSTEM account with no login shell, which is what this
+        # installer creates - never a person's account named by a stray --user.
+        if id -u "$SVC_USER" >/dev/null 2>&1; then
+            uid="$(id -u "$SVC_USER")"; sh_="$(getent passwd "$SVC_USER" | cut -d: -f7)"
+            if [ "$uid" -lt 1000 ] && [ "$uid" -gt 0 ] && [[ "$sh_" = */nologin || "$sh_" = */false ]]; then
+                userdel "$SVC_USER" && good "service account $SVC_USER removed"
+                getent group "$SVC_USER" >/dev/null 2>&1 && groupdel "$SVC_USER" 2>/dev/null || true
+            else
+                warn "$SVC_USER is not a system account with no login - left in place"
+            fi
+        fi
+    fi
+
+    step "verify, rather than assume"
+    ok=1
+    [ -f "$UNIT_FILE" ] && { bad "$UNIT_FILE is still there"; ok=0; }
+    [ "$(systemctl is-active rscanvas 2>/dev/null || true)" = active ] && { bad "rscanvas is still running"; ok=0; }
+    [ -n "$NODE_BIN" ] && getcap "$NODE_BIN" 2>/dev/null | grep -q cap_net_bind_service && { bad "$NODE_BIN still has cap_net_bind_service"; ok=0; }
+    [ "$APP_STATE" = ours ] && [ -e "$APP_DIR" ] && { bad "$APP_DIR is still there"; ok=0; }
+    if [ "$DO_PURGE" = 1 ]; then
+        left="$(q "SELECT string_agg(datname, ' ') FROM pg_database WHERE datname = '$DB_NAME' OR datname LIKE '${DB_NAME}\\_pre\\_restore\\_%'")"
+        [ -n "$left" ] && { bad "database(s) still present: $left"; ok=0; }
+        [ -e /etc/rscanvas ] && { bad "/etc/rscanvas is still there"; ok=0; }
+    elif [ -n "$DBS" ]; then
+        [ -n "$(q "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'")" ] || { bad "database $DB_NAME is GONE - it should have been kept"; ok=0; }
+        [ -f "$ENV_FILE" ] || { bad "$ENV_FILE is GONE - it should have been kept"; ok=0; }
+    fi
+    [ "$ok" = 1 ] && good "the service is gone$( [ "$DO_PURGE" = 1 ] && echo ' and so is its data' || echo ', and the data is where it was')"
+
+    printf '\n%s================ RSCanvas is uninstalled ================%s\n' "$B" "$N"
+    if [ "$DO_PURGE" = 0 ] && { [ -n "$DBS" ] || [ -d /etc/rscanvas ]; }; then
+        say "  Kept, so installing again picks up where this left off:"
+        [ -n "$DBS" ] && say "    database   $DBS"
+        [ -d /etc/rscanvas ] && say "    config     /etc/rscanvas"
+        say "  To install again: extract a bundle into $APP_DIR and run rscanvas-setup.sh."
+        say "  To remove the data as well, from any extracted bundle:"
+        say "    sudo ./rscanvas-setup.sh --uninstall --purge"
+    fi
+    [ "${NBACKUPS:-0}" -gt 0 ] && say "  $BACKUP_DIR holds $NBACKUPS backup(s) - yours to keep or delete."
+    # INSTALL.md says to run this from inside the application directory,
+    # which this just removed - so the caller's shell is now standing in it.
+    case "$PWD/" in "$APP_DIR"/*) [ "$APP_STATE" = ours ] && say "  Your shell is still in $APP_DIR, which no longer exists: cd somewhere else." ;; esac
+    say "  The installer also added packages, left in place because other software may use"
+    say "  them: postgresql-18, nodejs and fping, with the PostgreSQL and NodeSource apt"
+    say "  repositories. Removing postgresql-18 deletes EVERY database on this box."
+    say ""
+    [ "$ok" = 1 ] || die "uninstall finished with the failures above"
+    exit 0
+fi
+
 # ----- install --------------------------------------------------------------
 [ "$(id -u)" = 0 ] || die "run with sudo (installs packages, creates a service account and a unit)"
 
@@ -253,6 +526,7 @@ case "${ID:-}${ID_LIKE:-}" in
     *) die "unsupported distribution: ${PRETTY_NAME:-unknown}" ;;
 esac
 good "$PRETTY_NAME, package manager $PKG"
+if [ -n "$KEPT" ]; then good "kept from the existing install:${KEPT%,}"; fi
 
 if [ "$SYSLOG_PORT" -lt 1024 ] || [ "$TRAP_PORT" -lt 1024 ]; then
     warn "syslog udp/$SYSLOG_PORT and traps udp/$TRAP_PORT are privileged ports."
@@ -266,7 +540,24 @@ if [ "$SYSLOG_PORT" -lt 1024 ] || [ "$TRAP_PORT" -lt 1024 ]; then
 fi
 
 step "packages"
-if [ "$PKG" = apt ]; then
+# NOTHING TO FETCH, NOTHING FETCHED (2026-09-28, the offline drill). Upgrades
+# and restores re-run this script on a box that already has everything, and
+# on a network that silently drops outbound traffic `apt-get update` waited
+# out every mirror's timeout: 200 s of no output in this step, where a
+# connected box takes 20, on exactly the boxes - air-gapped ones - where an
+# installer that looks hung is the worst thing to meet. It did finish (apt
+# only warns), but nothing it did was needed. So when every runtime piece is
+# already here, the package manager is not touched at all. Anything missing,
+# and it runs exactly as before - the network is then genuinely required.
+have_everything() {
+    local c
+    for c in curl openssl setcap fping; do command -v "$c" >/dev/null || return 1; done
+    command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ] || return 1
+    command -v psql >/dev/null && q 'SHOW server_version' | grep -qE '^1[89]' || return 1
+}
+if have_everything; then
+    good "Node 22+, PostgreSQL 18, fping and the tools are all installed - the package mirrors are not contacted"
+elif [ "$PKG" = apt ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     # fping IS A DEPENDENCY, not an option. Without it the collector logs one
@@ -300,6 +591,36 @@ fi
 good "node $(node -v), postgres $(q 'SHOW server_version')"
 
 [ -n "$(q 'SELECT 1')" ] || die "postgres is installed but not answering - start it and re-run"
+
+step "postgresql restarts itself"
+# THE DISK-FULL DRILL (2026-09-28, rs-test-2). With the root filesystem full,
+# PostgreSQL PANICked writing WAL, its own crash recovery then failed for the
+# same reason, and it shut down - correctly. Freeing the space brought
+# nothing back: the distribution's unit has Restart=no, so a monitoring box
+# stayed blind until a human noticed and ran systemctl start. This drop-in
+# makes the cluster restart on failure every 10 s, for as long as it takes:
+# harmless while the disk is still full (each attempt fails at once), and
+# back within 10 s of the space returning. It changes nothing else about
+# the unit, and --uninstall removes it.
+PG_UNIT=postgresql@18-main.service
+[ "$PKG" = dnf ] && PG_UNIT=postgresql-18.service
+PG_DROPIN="/etc/systemd/system/${PG_UNIT}.d/60-rscanvas-restart.conf"
+if systemctl cat "$PG_UNIT" >/dev/null 2>&1; then
+    install -d "$(dirname "$PG_DROPIN")"
+    cat > "$PG_DROPIN" <<'EOF'
+# Written by rscanvas-setup.sh: restart the cluster when it dies, and never
+# give up - a disk that fills and is then freed must not leave it down.
+[Unit]
+StartLimitIntervalSec=0
+[Service]
+Restart=on-failure
+RestartSec=10s
+EOF
+    systemctl daemon-reload
+    good "$PG_UNIT restarts itself after a failure (Restart=on-failure, every 10 s)"
+else
+    warn "no $PG_UNIT unit here - PostgreSQL's restart policy is left as the system has it"
+fi
 
 step "kernel receive buffers"
 # THE APP ASKS, THE KERNEL DECIDES (2026-09-24, the lab-5 ingest test). The
@@ -392,6 +713,19 @@ set_secret SYSLOG_PORT "$SYSLOG_PORT"
 set_secret TRAP_PORT "$TRAP_PORT"
 set_secret COLLECTOR_ENABLED 1
 set_secret JOBS_ENABLED 1
+# RETENTION ON, FOR NEW INSTALLS ONLY (the operator's ruling, 2026-09-28). The
+# application defaults to a dry run - it reports what it would drop and drops
+# nothing - and until now nothing ever changed that on an installed box, so
+# every one of them grew until its disk was full. A NEW install (no database
+# credential yet) gets real retention written down where the operator can
+# see and change it. An existing install keeps whatever it has, set or not:
+# switching a running box from keeping everything to deleting is its owner's
+# decision, and /api/health now says when a dry run is keeping data past its
+# date. Written only when absent, so a deliberate 1 is never overwritten.
+if [ "$DB_NEW" = 1 ] && ! grep -q '^RETENTION_DRY_RUN=' "$ENV_FILE"; then
+    set_secret RETENTION_DRY_RUN 0
+    good "retention on: raw samples kept 14 days, messages 30, the hourly rollup always (RETENTION_DRY_RUN=0)"
+fi
 good "$ENV_FILE (0600 root:root), $( [ "$DB_NEW" = 1 ] && echo 'new' || echo 'existing') database credential"
 
 # ----- tls: opt in once, sticky after ----------------------------------------
@@ -488,7 +822,7 @@ good "rscanvas_owner / rscanvas / rscanvas_admin, database $DB_NAME"
 step "code"
 if [ ! -f "$APP_DIR/package.json" ]; then
     die "no application at $APP_DIR - extract the bundle there first:
-      tar -xzf rscanvas-<stamp>-<commit>.tar.gz -C $APP_DIR
+      sudo tar -xzf rscanvas-<stamp>-<commit>.tar.gz -C $APP_DIR
     then re-run. This script deliberately does not fetch code: an installer that
     chooses your version is an installer that can change it under you."
 fi

@@ -1,23 +1,23 @@
-# Known issues, as of 0.1.0-alpha.2
+# Known issues, as of 0.1.0-alpha.3
 
-Written 2026-09-15 for the first alpha and revised 2026-09-26 for the
-second. Everything here is known and unbuilt; nothing here is hidden behind
-a feature that pretends to work. Grouped by how much it would cost someone
-using the software. `CHANGELOG.md` lists what the second alpha fixed.
+Written 2026-09-15 for the first alpha and revised 2026-09-26 and
+2026-09-28 for the second and third. Everything here is known and unbuilt;
+nothing here is hidden behind a feature that pretends to work. Grouped by
+how much it would cost someone using the software. `CHANGELOG.md` lists
+what each alpha fixed.
 
 ## Rough edges you will meet
 
-- **No uninstall or teardown path.** The installer is idempotent and serves
-  upgrades; nothing removes what it made.
-- **The installer's three questions are doctrine, not flags.** The runbook
-  explains the choices (section 1); the script does not yet ask them.
-- **SNMPv3 has code and tests, but no user-facing documentation.**
-- **Backup and restore** has a private runbook being prepared for
-  publication (`INSTALL.md` carries the minimum) and a restore drill script
-  that has not been exercised end to end on a real box.
-- **Changing a device's credential has never been live-tested** as a
-  wrong-to-right swap on a real device. The bulk route exists and the poller
-  reads the credential on every poll, so it should take one interval.
+- **The installer does not ask where the data lives.** Three decisions
+  belong to whoever installs: which disk holds the database (a separate
+  data disk, mounted at `/var/lib/postgresql` by UUID before PostgreSQL is
+  installed, is the sound choice), where a WAL archive would go if one is
+  ever enabled, and how many days are kept, which sets the disk (INSTALL.md,
+  "What you need"). The installer takes the distribution's defaults and
+  asks none of them.
+- **SNMPv3 traps are not accepted.** v1 and v2c traps are; a v3 trap is
+  refused and logged. SNMPv3 polling is supported and documented in
+  INSTALL.md section 3.
 - **The device page's long tables** (audit, messages, reachability) are not
   capped, and in a narrow window the device panel scrolls sideways under its
   interface table.
@@ -87,14 +87,11 @@ using the software. `CHANGELOG.md` lists what the second alpha fixed.
 
 ## Tests and drills owed
 
-- Live: a SIGTERM drill through `tools/chaos.sh` across all four workers, an
-  alerts-lane soak, dropping an interface mid-run to assert the stale
-  marker, a reconcile after retagging devices, and a nightly retention drop
-  at the 30,000-entity scale on the current schema.
+- Live: an alerts-lane soak, dropping an interface mid-run to assert the
+  stale marker, a reconcile after retagging devices, and a nightly retention
+  drop at the 30,000-entity scale on the current schema.
 - Scratch database: non-UTC retention, event-alert upsert semantics, rollup
   weighting.
-- Live server: the unauthenticated-surface assertion and the
-  malformed-parameter matrix.
 
 ## Ideas, not promises
 

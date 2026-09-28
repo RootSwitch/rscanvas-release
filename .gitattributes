@@ -1,0 +1,11 @@
+# LF in the working tree on every platform (2026-09-28, the outsider drill).
+#
+# The bundle is built FROM the working tree and runs on Linux. Git for
+# Windows installs with core.autocrlf=true, so without this a fresh clone
+# there had CRLF in every file, and a bundle built from it failed its first
+# command on Linux with "/usr/bin/env: 'bash\r': No such file or directory".
+# Every file in the repository is already stored LF; this only stops a
+# checkout from converting it.
+* text=auto eol=lf
+*.png binary
+*.ico binary

@@ -14,7 +14,7 @@
 
 import snmp from 'net-snmp';
 import { CONFIG } from '../config.ts';
-import { explainV3Error, explainV3Timeout } from '../credentials/v3.ts';
+import { explainV3Error, explainV3Timeout, explainCommunityTimeout } from '../credentials/v3.ts';
 
 /**
  * net-snmp ships no type declarations, so TypeScript infers what it can from
@@ -172,7 +172,8 @@ export class SnmpError extends Error {
 function translate(err: Error, v3Level: Session['v3Level'] = null): SnmpError {
     const m = err.message || String(err);
     if (/timeout|timed out/i.test(m)) {
-        const hint = explainV3Timeout(v3Level);
+        // null is v1/v2c (Session.v3Level): a community is a key too.
+        const hint = v3Level === null ? explainCommunityTimeout() : explainV3Timeout(v3Level);
         return new SnmpError(hint === null ? m : `${m} - ${hint}`, 'timeout');
     }
     // v3 (slice 29): a usmStats REPORT names the fault, so the message the

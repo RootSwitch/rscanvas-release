@@ -287,6 +287,11 @@ export const CONFIG = {
      * So: p50, and do not "fix" this to p95 later.
      */
     pollLagAlarmMs: num('POLL_LAG_ALARM_MS', 30_000),
+    // How long the database may refuse work before /api/health/work answers
+    // 503 (health/work.ts databaseVerdict). A minute: two alert scans at the
+    // default 30 s, so one unlucky query cannot trip it, and well inside the
+    // three-minute outage the 2026-09-28 drill ran without a single red.
+    dbOutageAlarmMs: num('DB_OUTAGE_ALARM_MS', 60_000),
     collectorEnabled: num('COLLECTOR_ENABLED', 0) === 1,
 
     /**

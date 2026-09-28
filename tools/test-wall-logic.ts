@@ -14,7 +14,7 @@ interface Dials {
 interface WallShape { status?: string | null; fields?: Record<string, unknown>; alerts?: number }
 const {
     clampNum, PREF_SPEC, fmtAge, chooseCols, wallHeightNeeded,
-    visibleFields, tileLineCount, pickFcols, fitAxis,
+    visibleFields, tileLineCount, pickFcols, fitAxis, themeRoster, shuffled, nextShift,
 } = await import('../public/wall-logic.js' as string) as {
     clampNum: (raw: unknown, lo: number, hi: number, def: number) => number;
     PREF_SPEC: Record<string, { def: unknown; parse: (v: string) => unknown }>;
@@ -25,6 +25,9 @@ const {
     tileLineCount: (shape: WallShape, declared: string[], blanks: string) => number;
     pickFcols: (textFieldCount: number) => number;
     fitAxis: (los: number[], his: number[]) => { lo: number; hi: number };
+    themeRoster: (spec: string, themes: Record<string, { group?: string }>) => string[];
+    shuffled: <T>(list: T[], rand?: () => number, notFirst?: T) => T[];
+    nextShift: (n: number, prev?: { x: number; y: number }, rand?: () => number) => { x: number; y: number };
 };
 
 let pass = 0;
@@ -242,6 +245,100 @@ console.log('\nfmtAge - the tense boundaries:');
     eq('90m becomes hours', fmtAge(5_400_000), '2h');
     eq('a day reads in hours, because a wall that stale is the headline',
         fmtAge(86_400_000), '24h');
+}
+
+// A seeded generator, so a failure here reproduces rather than flickers.
+const lcg = (seed: number): (() => number) => {
+    let s = seed >>> 0;
+    return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 2 ** 32; };
+};
+
+console.log('\nburn-in prefs - the kiosk names, clamped like every other dial:');
+{
+    eq('a rotation changes every 5 minutes unless told otherwise (the operator\'s own default)',
+        PREF_SPEC.themeInterval!.def, 300);
+    eq('themeInterval has a floor - a 5 s rotation is a strobe, not a wall', PREF_SPEC.themeInterval!.parse('5'), 30);
+    eq('themeInterval garbage takes the default', PREF_SPEC.themeInterval!.parse('soon'), 300);
+    eq('themeOrder takes shuffle in any case', PREF_SPEC.themeOrder!.parse('Shuffle'), 'shuffle');
+    eq('an unknown themeOrder is list order', PREF_SPEC.themeOrder!.parse('random'), 'list');
+    eq('the shift is OFF unless asked - the default wall keeps its layout', PREF_SPEC.shift!.def, 0);
+    eq('the shift is whole pixels', PREF_SPEC.shift!.parse('7.6'), 8);
+    eq('a negative shift is off', PREF_SPEC.shift!.parse('-4'), 0);
+    eq('the shift is capped - it is paid for in margin', PREF_SPEC.shift!.parse('999'), 50);
+    eq('shift garbage is off, never NaN', PREF_SPEC.shift!.parse('lots'), 0);
+    eq('shiftInterval has a floor', PREF_SPEC.shiftInterval!.parse('1'), 30);
+}
+
+console.log('\nthemeRoster - what ?themes= rotates through:');
+{
+    const T = {
+        classic: {}, canvas: { group: 'Paper' }, gesso: { group: 'Paper' },
+        ink: { group: 'Night' }, midnight: { group: 'Night' }, blueprint: { group: 'Cool' },
+    };
+    eq('empty is no rotation', themeRoster('', T), []);
+    eq('all is every theme, in authored order', themeRoster('all', T),
+        ['classic', 'canvas', 'gesso', 'ink', 'midnight', 'blueprint']);
+    eq('ALL is all', themeRoster('ALL', T).length, 6);
+    eq('a group name is its themes', themeRoster('night', T), ['ink', 'midnight']);
+    eq('a group and a theme mix item by item (the kiosk\'s night,ink bug)',
+        themeRoster('Night,blueprint', T), ['ink', 'midnight', 'blueprint']);
+    eq('a theme named twice comes round once', themeRoster('ink,night', T), ['ink', 'midnight']);
+    eq('a typo drops out instead of emptying the rotation', themeRoster('nosuch,ink', T), ['ink']);
+    eq('nothing known is no rotation', themeRoster('nosuch', T), []);
+    eq('spaces and empty items are ignored', themeRoster(' canvas , , gesso ', T), ['canvas', 'gesso']);
+}
+
+console.log('\nshuffled - ?themeOrder=shuffle:');
+{
+    const list = ['a', 'b', 'c', 'd', 'e'];
+    const r = lcg(7);
+    const out = shuffled(list, r);
+    eq('a shuffle is a permutation', [...out].sort(), list);
+    eq('the input is not reordered in place', list, ['a', 'b', 'c', 'd', 'e']);
+    const firsts = new Set<string>();
+    let repeated = 0;
+    for (let i = 0; i < 2000; i++) {
+        const s = shuffled(list, r, 'c');
+        firsts.add(s[0]!);
+        if (s[0] === 'c') repeated++;
+    }
+    eq('the theme on screen never comes straight back round after a wrap', repeated, 0);
+    eq('every other theme can lead', [...firsts].sort(), ['a', 'b', 'd', 'e']);
+    eq('a one-theme ring cannot avoid itself, and does not try', shuffled(['a'], r, 'a'), ['a']);
+    eq('a generator that returns 1 still permutes', [...shuffled(list, () => 1)].sort(), list);
+}
+
+console.log('\nnextShift - where the wall jumps:');
+{
+    eq('shift 0 is no offset', nextShift(0), { x: 0, y: 0 });
+    eq('a negative shift is no offset', nextShift(-3), { x: 0, y: 0 });
+    eq('a junk shift is no offset', nextShift(Number('junk')), { x: 0, y: 0 });
+    const r = lcg(42);
+    let prev = { x: 0, y: 0 };
+    let outOfRange = 0;
+    let stayed = 0;
+    const xs = new Set<number>();
+    const ys = new Set<number>();
+    for (let i = 0; i < 5000; i++) {
+        const p = nextShift(8, prev, r);
+        if (!Number.isInteger(p.x) || !Number.isInteger(p.y) || Math.abs(p.x) > 8 || Math.abs(p.y) > 8) outOfRange++;
+        if (p.x === prev.x && p.y === prev.y) stayed++;
+        xs.add(p.x); ys.add(p.y);
+        prev = p;
+    }
+    eq('every offset is whole pixels within the band', outOfRange, 0);
+    eq('the wall never "moves" to where it already is', stayed, 0);
+    // The reason it is random and not the kiosk's ring: a ring of radius 8
+    // puts every edge on 3 lines per axis; this must reach all 17.
+    eq('edges are spread over every line of the band, x', xs.size, 17);
+    eq('edges are spread over every line of the band, y', ys.size, 17);
+    eq('a stuck generator still moves the wall, inward', nextShift(8, { x: 0, y: 0 }, () => 0.5), { x: -1, y: 0 });
+    eq('stuck at the far edge, it steps back in', nextShift(8, { x: -8, y: -8 }, () => 0), { x: -7, y: -8 });
+    const hi = nextShift(8, { x: 0, y: 0 }, () => 1);
+    eq('a generator that returns 1 stays in range', Math.abs(hi.x) <= 8 && Math.abs(hi.y) <= 8, true);
+    const shrunk = nextShift(4, { x: 20, y: 20 }, lcg(3));
+    eq('an offset from a wider band comes back inside a narrower one',
+        Math.abs(shrunk.x) <= 4 && Math.abs(shrunk.y) <= 4, true);
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

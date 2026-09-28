@@ -66,9 +66,72 @@ export interface WorkHealth {
  * p95 still travels in the body, because the number that is wrong to alarm on
  * is often the right one to read once somebody is already looking.
  */
+/**
+ * IS THE DATABASE TAKING THE WORK? (2026-09-28, the outage drill.)
+ *
+ * PostgreSQL was stopped for three minutes on an installed box, and this
+ * route answered 200 throughout: the collector kept polling on time, so by
+ * the only measure the route had, the work was being done - while nothing
+ * reached the database and ingest held 9,000 messages in memory. A monitor
+ * pointed here, which is what the route is for, would never have known.
+ *
+ * Two witnesses, because each misses a case the other catches. The alert scan
+ * reaches the database on a timer on every box, syslog or not - it is how a
+ * quiet install learns of an outage - but it runs only as often as it is
+ * configured to. Ingest knows within one flush, but only while something is
+ * being sent. Either one failing past the limit is enough.
+ */
+export interface WriteSignals {
+    /** The jobs worker's record for the alert scan, or null when jobs are off. */
+    scan: { lastOkAt: string | null; lastRunAt: string | null; consecutiveFailures: number; lastDetail: string } | null;
+    /** From the ingest snapshot; null when ingest has not reported. */
+    ingest: { writeFailingMs?: number; queued: number } | null;
+    nowMs: number;
+    limitMs: number;
+}
+
+export function databaseVerdict(w: WriteSignals): { failing: false } | { failing: true; reason: string; detail: string } {
+    const held = w.ingest?.queued ?? 0;
+    const holding = held > 0
+        ? ` Ingest is holding ${held.toLocaleString('en-US')} messages in memory and writes them when the database answers; past 50,000 the oldest are shed.`
+        : '';
+    const s = w.scan;
+    if (s !== null && s.consecutiveFailures > 0) {
+        const okAt = s.lastOkAt === null ? Number.NaN : Date.parse(s.lastOkAt);
+        const forMs = Number.isFinite(okAt) ? w.nowMs - okAt : Number.NaN;
+        // Never succeeded since start: count failures instead of time, two
+        // being the fewest that cannot be one unlucky query.
+        if (forMs >= w.limitMs || (!Number.isFinite(forMs) && s.consecutiveFailures >= 2)) {
+            return {
+                failing: true,
+                reason: 'alert-scan-failing',
+                detail: `the alert scan has failed${Number.isFinite(forMs) ? ` for ${Math.round(forMs / 1000)}s` : ` ${s.consecutiveFailures} times in a row`}`
+                    + ` (${s.lastDetail || 'no detail'}).${holding}`,
+            };
+        }
+    }
+    const f = w.ingest?.writeFailingMs ?? 0;
+    if (f >= w.limitMs) {
+        return {
+            failing: true,
+            reason: 'ingest-write-stalled',
+            detail: `the database has refused ingest's writes for ${Math.round(f / 1000)}s.${holding}`,
+        };
+    }
+    return { failing: false };
+}
+
 export function workHealth(
     stats: CollectorLag | null, limitMs: number, collectorEnabled: boolean,
+    writes: WriteSignals | null = null,
 ): WorkHealth {
+    // First, and whether or not this instance polls: a database that takes
+    // no work is the worst state the box can be in, and a reporting-only
+    // instance with a dead database is broken all the same.
+    if (writes !== null) {
+        const db = databaseVerdict(writes);
+        if (db.failing) return { status: 503, body: { ok: false, reason: db.reason, detail: db.detail } };
+    }
     // A reporting-only instance is not a broken one. Answering 503 here would
     // teach an operator that this endpoint is noise, which costs more than
     // the check is worth.

@@ -32,6 +32,14 @@ OUT="${OUT:-$(pwd)}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# The dependencies ship FROM this tree, so they have to be in it. A fresh
+# clone has none: until 2026-09-28 INSTALL.md's one build command met that
+# as "tar: node_modules: Cannot stat" and left a partial tarball behind.
+if [ "$WITH_DEPS" = 1 ] && [ ! -d node_modules/pg ]; then
+    echo "node_modules is missing or incomplete - run 'npm ci' in $HERE first (or --no-deps to ship without)" >&2
+    exit 1
+fi
+
 # NAMED, NOT DISCOVERED - the same rule every destructive path in this tree
 # follows, applied to the constructive one. An exclude-list bundle ships
 # whatever happens to be lying in the working directory (scratch SQL, a
@@ -50,6 +58,9 @@ PAYLOAD=(
     # separately is an installer that can be a different version than the tree
     # it is pointed at, which is the whole class of problem it exists to end.
     rscanvas-setup.sh
+    # ...and so does the backup tool, for the same reason: what a backup must
+    # hold and how a restore hands back to the installer are this version's.
+    rscanvas-backup.sh
 )
 # What the private tree carries and the public tree does not: the operator's
 # runbooks and the storage spike's SQL, which nothing at runtime reads. They
@@ -159,7 +170,7 @@ MANIFEST="$(mktemp)"
     echo "${AUDIT_LINE}"
     echo ""
     echo "To install on a fresh box (the one-command path, INSTALL.md section 2):"
-    echo "  sudo mkdir -p /opt/rscanvas && tar -xzf <this bundle> -C /opt/rscanvas"
+    echo "  sudo mkdir -p /opt/rscanvas && sudo tar -xzf <this bundle> -C /opt/rscanvas"
     echo "  cd /opt/rscanvas && sudo ./rscanvas-setup.sh --tls"
     echo ""
     echo "Or run by hand (INSTALL.md, from source):"
@@ -170,6 +181,11 @@ MANIFEST="$(mktemp)"
     echo "    node src/main.ts"
 } > "$MANIFEST"
 cp "$MANIFEST" "$HERE/BUNDLE-MANIFEST.txt"
+# Readable by anyone: it is the answer to "what is this box running", and
+# `--check` reads it as a plain user. mktemp makes files 0600, cp keeps
+# that, and Linux tar records it - a bundle built on Linux shipped a
+# manifest only root could read (2026-09-28). Windows builds never showed it.
+chmod 0644 "$HERE/BUNDLE-MANIFEST.txt"
 
 FILES=("${PAYLOAD[@]}" BUNDLE-MANIFEST.txt)
 [ "$WITH_DEPS" = 1 ] && FILES+=(node_modules)
@@ -185,30 +201,60 @@ tar -czf "$TAR" \
     "${FILES[@]}"
 RC=$?
 rm -f "$HERE/BUNDLE-MANIFEST.txt" "$MANIFEST"
-if [ "$RC" != "0" ]; then echo "  TAR FAILED (exit $RC)"; exit 1; fi
+# A failed tar can still leave a file with the bundle's name, and a file with
+# the right name is what the next person copies to the target.
+if [ "$RC" != "0" ]; then echo "  TAR FAILED (exit $RC) - no bundle written"; rm -f "$TAR"; exit 1; fi
 
 # VERIFY THE CARGO, NOT THE CARRIER: read the critical paths back OUT of the
 # artifact. "tar exited 0" is the claim; this is the check. A bundle missing
 # src/main.ts fails here rather than on the target at midnight.
+#
+# HERE-STRINGS, NEVER `printf "$LIST" | grep -q` (2026-09-28, the outsider
+# drill). grep -q exits at its first match; the listing with node_modules is
+# larger than a Linux pipe's 64 KB, so printf was still writing, took
+# SIGPIPE, and pipefail reported every critical path MISSING. On Windows the
+# pipe is big enough, which is why no bundle built here ever showed it - and
+# why nobody could build one on Linux.
 echo "=== verifying the artifact"
 LIST="$(tar -tzf "$TAR")"
 MISSING=0
 for want in package.json src/main.ts src/collector/sensors.ts sql/bootstrap.sql \
             public/index.html INSTALL.md BUNDLE-MANIFEST.txt \
-            rscanvas-setup.sh src/db/apply-schema.ts tools/harden-roles.sh; do
-    printf '%s\n' "$LIST" | grep -qx "$want" || { echo "  MISSING: $want"; MISSING=1; }
+            rscanvas-setup.sh rscanvas-backup.sh src/db/apply-schema.ts tools/harden-roles.sh; do
+    grep -qxF -- "$want" <<< "$LIST" || { echo "  MISSING: $want"; MISSING=1; }
 done
 if [ "$WITH_DEPS" = 1 ]; then
     for want in node_modules/pg node_modules/net-snmp; do
-        printf '%s\n' "$LIST" | grep -q "^${want}/" || { echo "  MISSING: $want"; MISSING=1; }
+        grep -q "^${want}/" <<< "$LIST" || { echo "  MISSING: $want"; MISSING=1; }
     done
 fi
-SQLN=$(printf '%s\n' "$LIST" | grep -c '^sql/.*\.sql$')
+SQLN=$(grep -c '^sql/.*\.sql$' <<< "$LIST")
 # Every slice file has to travel: a bundle one migration short builds a
 # database that is subtly the wrong shape, which is install break 2 wearing
 # a different hat.
 LOCALN=$(ls sql/*.sql | wc -l | tr -d ' ')
 [ "$SQLN" = "$LOCALN" ] || { echo "  SQL MISMATCH: ${SQLN} in bundle, ${LOCALN} in tree"; MISSING=1; }
+# The two scripts INSTALL.md runs as ./name must arrive executable. Until
+# 2026-09-27 git stored the installer 100644: bundles built on Windows came
+# out right only because Git Bash marks any file opening with #! executable,
+# and one built from a Linux clone of the public repository would have
+# answered the first install command with "command not found".
+for want in rscanvas-setup.sh rscanvas-backup.sh; do
+    perm="$(tar -tvzf "$TAR" "$want" 2>/dev/null || true)"
+    [[ "$perm" == -rwx* ]] || { echo "  NOT EXECUTABLE: $want"; MISSING=1; }
+done
+# ...and must be LF. A clone made by Git for Windows with its default
+# core.autocrlf=true has CRLF in every file, and a bundle built from it
+# answers the first command on Linux with "/usr/bin/env: 'bash\r': No such
+# file or directory" - demonstrated on a clean box 2026-09-28, from a bundle
+# this check (then absent) had passed. .gitattributes now pins LF in the
+# working tree; this catches a tree that predates it or ignores it.
+SCRIPTS=$(grep '\.sh$' <<< "$LIST" | grep -v '^node_modules/' || true)
+if [ -n "$SCRIPTS" ]; then
+    # shellcheck disable=SC2086 - one argument per listed member
+    CR=$(tar -xzOf "$TAR" $SCRIPTS | tr -cd '\r' | wc -c | tr -d ' ')
+    [ "$CR" = 0 ] || { echo "  CRLF LINE ENDINGS in the shell scripts - they will not run on Linux (see .gitattributes)"; MISSING=1; }
+fi
 [ "$MISSING" = "0" ] || { echo "  BUNDLE IS INCOMPLETE - not shipping this"; rm -f "$TAR"; exit 1; }
 
 SIZE="$(du -h "$TAR" | cut -f1)"
@@ -220,6 +266,6 @@ echo "  size:   ${SIZE}"
 echo "  sha256: ${SHA}..."
 echo
 echo "On the target box:"
-echo "  tar -xzf ${NAME}.tar.gz -C /opt/rscanvas"
+echo "  sudo mkdir -p /opt/rscanvas && sudo tar -xzf ${NAME}.tar.gz -C /opt/rscanvas"
 echo "  cat /opt/rscanvas/BUNDLE-MANIFEST.txt     # what am I running?"
 echo "  less /opt/rscanvas/INSTALL.md             # the procedure, the flags, upgrades, backups"

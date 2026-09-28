@@ -46,6 +46,7 @@ import {
 import {
     suggestLocations, selectForAdd, selectForForce, locationAssignments,
     normalizeProbeRequest, probedName, addOutcome, normalizeExplicitName,
+    probeStanding, standingFields,
 } from '../src/devices/onboard.ts';
 // Untyped (it is browser JS), so the shape is asserted at the boundary - the
 // same import shape test-render-hostile.ts uses for public/dom.js.
@@ -488,6 +489,43 @@ function main(): void {
         // snapshot, zero rows. Degrades to the historic message, not a guess.
         const a6 = addOutcome('switch', '10.0.4.8', undefined, false);
         eq('zero rows degrades to the historic already-known', a6.kind, 'known');
+    }
+
+    console.log('\nthe probe table says what the add would (a device is its address AND port):');
+    {
+        // Found in the operator's first-15-minutes walkthrough, 2026-09-28:
+        // 198.18.50.2:16100 added, then :16101 read "already known" and could
+        // not be ticked, because the probe matched the address alone.
+        const roster = [
+            { name: 'fleet-16100', host: '198.18.50.2', snmp_port: 16100 },
+            { name: 'switch', host: '10.0.4.7', snmp_port: 161 },
+        ];
+        eq('another port on a known address is a new device',
+            probeStanding('fleet-16101', '198.18.50.2', 16101, roster), { kind: 'new' });
+        eq('the same address and port is already known',
+            probeStanding('fleet-16100', '198.18.50.2', 16100, roster), { kind: 'known' });
+        eq('the same target renamed since is still already known, not a second device',
+            probeStanding('fleet-renamed', '198.18.50.2', 16100, roster), { kind: 'known' });
+        eq('an unknown address with an unknown name is new',
+            probeStanding('core-1', '10.0.4.9', 161, roster), { kind: 'new' });
+        // Ruling 5's collision, which the probe used to fold into "already
+        // known" before the add path could name it.
+        const t1 = probeStanding('switch', '10.0.4.8', 161, roster);
+        eq('a name owned by another address is taken, not known', t1.kind, 'name-taken');
+        if (t1.kind === 'name-taken' && t1.why.includes('10.0.4.7:161')
+            && t1.why.includes('its own name')) {
+            ok('and the reason names the owner and the way out');
+        } else bad('name-taken reason', JSON.stringify(t1));
+        const t2 = probeStanding('fleet-16100', '198.18.50.2', 16101, roster);
+        eq('a name owned by another port on the same address is taken too', t2.kind, 'name-taken');
+        eq('the row fields keep `known` for its readers',
+            standingFields({ kind: 'known' }), { known: true, nameTaken: null });
+        eq('a taken name is not known', standingFields(t1).known, false);
+        // The port may arrive as a string from a driver: compared as a number.
+        eq('a port read back as text still matches',
+            probeStanding('x', '198.18.50.2', 16100,
+                [{ name: 'y', host: '198.18.50.2', snmp_port: '16100' as unknown as number }]),
+            { kind: 'known' });
     }
 
     console.log('\nexplicit names are held to the rename rules:');

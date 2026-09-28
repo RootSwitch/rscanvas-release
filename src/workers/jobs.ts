@@ -633,11 +633,20 @@ async function refreshFrontier(): Promise<void> {
     const lagHours = throughTs === null
         ? null : (Date.now() - new Date(throughTs).getTime()) / 3_600_000;
 
+    // The young-database signal; a failed read leaves it out, which means no
+    // grace rather than a guess.
+    const age = await OPS.deviceAge();
+    const ageRow = age.ok ? age.rows[0] : undefined;
+
     frontier = {
         throughTs: throughTs === null ? null : new Date(throughTs).toISOString(),
         lagHours: lagHours === null ? null : Number(lagHours.toFixed(2)),
         readAt: new Date().toISOString(),
         alarmAboveHours: CONFIG.rollupLagAlarmHours,
+        ...(ageRow !== undefined ? {
+            devices: ageRow.n,
+            firstDeviceAt: ageRow.first === null ? null : new Date(ageRow.first).toISOString(),
+        } : {}),
         // THERE IS NO `healthy` FLAG HERE, and removing it was a finding.
         //
         // The worker computed one, with a comment claiming it was "repeated in

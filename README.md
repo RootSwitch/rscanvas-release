@@ -8,11 +8,14 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.2).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.3).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
 15,000 syslog messages a second alongside that polling without losing one.
+Before this release it was drilled on clean servers: install, upgrade from
+each earlier alpha, backup and restore, uninstall, power loss, a database
+outage, a full disk, and a new user's first fifteen minutes in the browser.
 `KNOWN-ISSUES.md` says what is missing or untested; `TESTING.md` says what
 was measured and how; `CHANGELOG.md` says what changed. This is public domain software
 (`LICENSE`, the Unlicense); the device-icon artwork carries its own notices
@@ -74,11 +77,15 @@ so they show the page as the code now draws it.
   out per day with peaks and coverage, on the page or as CSV.
 - **Boards and the wall.** Diagram boards drawn from your own layout and
   glance grids generated from the device list, on a wall display that fits
-  its tiles to the screen, with capability tokens for kiosks.
+  its tiles to the screen, with capability tokens for kiosks and burn-in
+  guards for screens that never switch off: a timed theme rotation and a
+  small random shift of the whole wall.
 - **Operations.** Per-user accounts with roles and an audit trail - each
   role sees only the controls it may use, and everyone can change their own
   password - TLS, an OpenMetrics endpoint, a one-command installer with hardened database
-  roles, and health reporting that names the thread or lane that is behind.
+  roles, a backup tool that proves its own backups restore, an uninstall that
+  keeps your data unless told otherwise, and health reporting that names the
+  thread or lane that is behind.
 
 Two companions live in their own repositories: **RSNMPAgent**, a small
 Windows SNMP agent with stable interface indexes, and **RSFleet**, synthetic
@@ -95,23 +102,24 @@ SNMP fleets for demonstrations and load tests.
 
 ## Install
 
-The bundle path is the supported one. On a machine with the repository:
+The bundle path is the supported one. On a machine with the repository,
+Node 22 and npm, from the top of the repository:
 
+    npm ci
     bash tools/make-bundle.sh
 
 produces one self-contained tarball. On the target box:
 
     sudo mkdir -p /opt/rscanvas
-    tar -xzf rscanvas-<stamp>-<commit>.tar.gz -C /opt/rscanvas
+    sudo tar -xzf rscanvas-<stamp>-<commit>.tar.gz -C /opt/rscanvas
     cd /opt/rscanvas && sudo ./rscanvas-setup.sh --tls
 
 The installer installs packages, creates the database roles, applies the
 schema, hardens the roles, writes the systemd unit and environment file,
 mints a self-signed certificate, and verifies the result. Re-running it is
 safe by design and is how upgrades are applied. `INSTALL.md` has the whole
-procedure, the flags, upgrades, backups and where to look when something
-is wrong; the installer was drilled end to end on a factory-new machine on
-2026-09-01 with zero breaks.
+procedure, the flags, upgrades, backup and restore, uninstalling, and where
+to look when something is wrong.
 
 From source, for development:
 
@@ -122,7 +130,7 @@ From source, for development:
 
 The first start with no users creates an admin from `ADMIN_PASSWORD` (name
 from `ADMIN_USERNAME`, default `admin`). `npm test` runs the offline suite:
-forty-five test files and sixteen static checkers, no database needed.
+forty-seven test files and sixteen static checkers, no database needed.
 
 ## Configuration
 

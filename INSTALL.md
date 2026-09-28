@@ -6,8 +6,21 @@ exists and is less exercised.
 
 ## What you need
 
-- A Linux box you have root on. Anything from a 4-core mini PC upward; the
-  ceiling test used 12 vCPU and 31 GB for 30,000 tracked entities.
+- A Linux box you have root on. Processor and memory go a long way: a
+  virtual machine with 4 vCPUs and 4 GB of memory (on a Xeon W-1290 host)
+  polled the full 30,000-entity test fleet every 30 seconds using under a
+  tenth of its CPU. RSCanvas itself used about 400 MB, and 2.9 GB of memory
+  stayed free. The lab's 4-core N150 mini PCs run the same fleet too.
+- **Disk is what to size**, from the data you keep (the retention days in
+  section 2 set it):
+  - raw samples, kept 14 days by default: about 6 GB per 1,000 entities;
+  - the hourly rollup behind charts and reports, kept for good: about 1.6 GB
+    per 1,000 entities per year;
+  - syslog and traps, kept 30 days: roughly 0.4 to 0.8 KB per message.
+
+  10,000 entities and a modest syslog feed want about 80 GB to start and
+  16 GB more a year. An entity is one tracked interface or sensor; a switch
+  is usually tens of them.
 - Outbound package access during install. The installer adds the PostgreSQL
   and NodeSource repositories and installs PostgreSQL 18, Node 22, fping and
   a few utilities.
@@ -16,19 +29,22 @@ exists and is less exercised.
 
 ## 1. Get a bundle
 
-On any machine with this repository and Node installed:
+On any machine with this repository, Node 22 and npm, from the top of the
+repository:
 
+    npm ci
     bash tools/make-bundle.sh
 
-That produces `rscanvas-<stamp>-<commit>.tar.gz`: the source, its four
-runtime dependencies, the schema, and the installer. There is no build step;
+`npm ci` fetches the dependencies into the repository, and the bundle ships
+them from there. The result is `rscanvas-<stamp>-<commit>.tar.gz`: the
+source, its four runtime dependencies, the schema, and the installer. There is no build step;
 Node runs the TypeScript directly, and there are no native modules, so a
 bundle built on one platform runs on another. Copy it to the target box.
 
 ## 2. Run the installer
 
     sudo mkdir -p /opt/rscanvas
-    tar -xzf rscanvas-<stamp>-<commit>.tar.gz -C /opt/rscanvas
+    sudo tar -xzf rscanvas-<stamp>-<commit>.tar.gz -C /opt/rscanvas
     cd /opt/rscanvas
     sudo ./rscanvas-setup.sh --tls
 
@@ -63,6 +79,15 @@ Flags worth knowing:
 Then open `https://<box>:18080`, sign in as `admin` with the printed
 password, and change it.
 
+**Retention is on.** Raw per-poll samples are kept 14 days and syslog and
+trap messages 30; the hourly rollup behind the charts, the Dashboard and the
+reports is kept for good. Change the days with `RAW_RETENTION_DAYS` and
+`MESSAGE_RETENTION_DAYS` in `/etc/rscanvas/rscanvas.env` and restart the
+service. `RETENTION_DRY_RUN=1` there makes retention report what it would
+delete without deleting anything. Boxes installed before 0.1.0-alpha.3 were
+left in that dry run by the installer; set `RETENTION_DRY_RUN=0` on them. The
+health page says so once the dry run is keeping data past its date.
+
 ## 3. Add devices
 
 Settings holds credential profiles (v2c communities and v3 users, stored
@@ -72,29 +97,127 @@ Force Add and will be polled until it does. Interfaces and sensors are
 discovered on the first poll. Point your devices' syslog and traps at the
 box, and the messages and event alerts follow.
 
+A device is its address and port together. Several agents behind one
+address (a gateway forwarding ports to the boxes behind it, one agent per
+container) are several devices: probe each port on its own. Names are
+unique, so when a probed device reports a name another device already has,
+the probe table says which device owns it and gives you a box to type a name
+of its own. Nothing is renamed for you.
+
+**SNMPv3.** A profile names the user, the security level (noAuthNoPriv,
+authNoPriv or authPriv), and the protocols: authentication SHA-1, SHA-224,
+SHA-256, SHA-384, SHA-512 or MD5; privacy AES-128, either AES-256 variant
+(Blumenthal, which net-snmp calls AES-256, or Reeder, which Cisco uses; an
+agent answers only the one it was built with), or DES where the system
+allows it. MD5 and DES work but are labelled weak. A device's credential can
+be changed on the device list, and the collector uses the new one at the
+next poll.
+
+**When a probe fails, the message says what it can.** A wrong v3 auth key
+on a net-snmp agent comes back at once as "Wrong Digest". A wrong privacy
+key, or a wrong v2c community, gets no answer at all; the agent drops the
+request silently. So a timeout from a device that answers ping usually
+means a credential, or an agent that only answers certain addresses, and
+the message says so.
+
+**Syslog** is accepted in RFC 3164 and RFC 5424 format on UDP 514.
+**Traps** are accepted as SNMP v1 and v2c on UDP 162, with any community.
+They are stored with the trap's name where it is a standard one (linkDown,
+coldStart and so on) and its trap OID, followed by the varbinds. A v1 trap
+also keeps its enterprise, generic and specific numbers, and carries the
+same trap OID as its v2 equivalent. An event rule matching
+`1.3.6.1.6.3.1.1.5.3` therefore catches a linkDown in either version. A trap
+from an address that belongs to one device is attributed to that device, so
+the device's maintenance window, mute and notify policy apply to alerts it
+raises. SNMPv3 traps are not accepted yet: they are refused and logged.
+
 ## 4. Upgrade
 
 Untar the new bundle over the same directory and run the installer again:
 
-    tar -xzf rscanvas-<newer>.tar.gz -C /opt/rscanvas
+    sudo tar -xzf rscanvas-<newer>.tar.gz -C /opt/rscanvas
     cd /opt/rscanvas && sudo ./rscanvas-setup.sh
 
-It applies any new schema slices before restarting the service, which is the
-order that matters: the new code expects the new columns. Re-running it on
-an unchanged box changes nothing.
+On the default ports it asks once more about the port capability for
+`node` (answer y, or add `--yes`). It applies any new schema slices before
+restarting the service, which is the order that matters: the new code
+expects the new columns. Re-running it on
+an unchanged box changes nothing. It keeps what the install already uses -
+the database name, ports, service user and TLS - unless you pass a flag
+again. Take a backup first (section 5).
 
-## 5. Back up
+## 5. Back up and restore
 
-Two things must survive: the database, and `/etc/rscanvas`, because the
-env file holds the database password and `RSCANVAS_SECRET`. A whole-cluster
-backup (`pg_basebackup`, or a snapshot of the machine) is the right shape;
-a logical `pg_dump` of individual tables does not follow the partition and
-function dependencies this schema relies on, and a dump that exits 0 can
-still be missing the data. Whatever you choose, restore it once onto a
-scratch box before you need to. A fuller backup and restore procedure is
-being prepared for publication.
+Two things must survive: the database, and `/etc/rscanvas`. The env file in
+there holds `RSCANVAS_SECRET`, and a database restored without it comes back
+with every stored SNMP credential unreadable. `rscanvas-backup.sh`, beside
+the installer, takes both into one file while the service keeps running:
 
-## 6. If something is wrong
+    cd /opt/rscanvas
+    sudo ./rscanvas-backup.sh                  # to /var/backups/rscanvas
+    sudo ./rscanvas-backup.sh --test <file>    # prove it restores
+    sudo ./rscanvas-backup.sh --restore <file> # make this box the one in <file>
+
+**What it holds.** Everything except the raw per-poll samples and the syslog
+and trap messages, which are the bulk of the database and the cheapest part
+to lose: raw samples age out after days anyway, and the hourly rollup behind
+the Dashboard, the reports and the long chart ranges is kept. `--full` takes
+everything. The file holds secrets (the database password, the first admin's
+password and `RSCANVAS_SECRET`), is written readable by root only, and
+belongs off the box, wherever your other secrets live. It is small without
+`--full`: a few hundred kilobytes for a small network. Run it daily from
+root's crontab, and copy the file away.
+
+**It checks its own work.** Every table is counted inside the same database
+snapshot the dump is taken from, and the dump is refused if its contents do
+not match those counts. `--test` restores into a scratch database beside the
+live one, compares every table row for row, and drops it; nothing live is
+touched. Run it once after you set backups up, and whenever you change
+PostgreSQL versions.
+
+**Restoring onto a new box.** Install the same RSCanvas version, or a newer
+one, with the installer as in section 2. Then:
+
+    sudo ./rscanvas-backup.sh --restore rscanvas-backup-<host>-<stamp>.tar
+
+It stops the service, renames the new box's database aside and moves its
+`/etc/rscanvas` aside (both kept, never deleted), restores the database and
+compares it row for row, puts the backed-up `/etc/rscanvas` in place, and runs
+the installer again. That brings an older backup's schema forward, sets the
+database roles to the restored passwords and restarts the service. You sign
+in with the old install's accounts. The restored box keeps the old TLS pair,
+so if its address differs, browsers warn again; the script says so and
+prints the two commands that mint a pair for the new box. When you are
+satisfied, it tells you how to drop the set-aside copies.
+
+A whole-machine snapshot, or `pg_basebackup`, is also a sound backup. Like
+any backup, it is only proven once it has been restored.
+
+## 6. Uninstall
+
+    cd /opt/rscanvas
+    sudo ./rscanvas-setup.sh --uninstall
+
+This stops and removes the service, the application directory, the
+capability the installer gave `node` for ports 514 and 162, and its kernel
+buffer setting. It **keeps the data**: the database and its roles,
+`/etc/rscanvas` (with `RSCANVAS_SECRET` and the TLS pair) and the service
+account. Installing again from any bundle finds them and resumes where it
+left off, with the same accounts, devices, history and certificate.
+
+    sudo ./rscanvas-setup.sh --uninstall --purge
+
+This also drops the database (and any copies `rscanvas-backup.sh` set aside),
+the three roles, `/etc/rscanvas` and the service account. It asks you to type
+the database name first, unless you pass `--yes`. To purge after a plain
+uninstall has removed `/opt/rscanvas`, run it from any extracted bundle.
+
+Neither ever removes backups in `/var/backups/rscanvas`, or the packages the
+installer added (PostgreSQL 18, Node 22, fping and their repositories),
+because other software may use them. Removing the PostgreSQL package deletes
+every database on the machine.
+
+## 7. If something is wrong
 
     sudo ./rscanvas-setup.sh --check
     systemctl status rscanvas
@@ -105,6 +228,14 @@ The health report names the worker or database lane that is behind, and
 every startup failure names its own fix in the journal: a missing
 capability for port 514, a database still starting, a schema behind the
 code.
+
+**If the disk fills,** the health report says so first, in its problem
+list. When it runs out entirely, PostgreSQL stops. RSCanvas keeps receiving
+syslog and traps and holds up to 50,000 messages in memory until the
+database returns. Past that it drops the oldest and counts them. Free some
+space and PostgreSQL restarts by itself within 10 seconds: the installer
+gives its unit a restart policy for exactly this. Nothing else needs doing.
+Retention days (section 2) are how to stop it happening again.
 
 ## From source, for development
 

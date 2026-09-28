@@ -39,7 +39,8 @@ import {
 } from '../alerts/events.ts';
 import { socketStats, systemStats, describeRcvbuf, PROC_AVAILABLE } from '../net/udpstats.ts';
 import type { IngestStats } from './protocol.ts';
-import { makeFlushGate } from './flush-gate.ts';
+import { makeFlushGate, failureBackoffMs, shouldLogFailure } from './flush-gate.ts';
+import { renderTrap, deviceForAddress } from '../syslog/trap.ts';
 
 const FLUSH_MS = 300;
 const FLUSH_ROWS = 200;
@@ -60,6 +61,31 @@ let truncated = 0;
 let laneBusyEvents = 0;
 let running = true;
 let flushing = false;
+// A database that refuses writes is retried on a backoff, not per datagram -
+// see failureBackoffMs in flush-gate.ts for the drill that measured why.
+// failingSince also feeds the health status: how long writes have been
+// failing is the one number a monitor needs during an outage.
+let failStreak = 0;
+let failingSince: number | null = null;
+let backoffUntil = 0;
+function flushFailed(what: string): void {
+    failStreak++;
+    failingSince ??= Date.now();
+    backoffUntil = Date.now() + failureBackoffMs(failStreak);
+    if (shouldLogFailure(failStreak)) {
+        log(`ALARM ${what} - rows requeued, depth now ${queue.length}; failing for `
+            + `${Math.round((Date.now() - failingSince) / 1000)}s, attempt ${failStreak}, next in ${failureBackoffMs(failStreak)} ms`);
+    }
+}
+function flushSucceeded(): void {
+    if (failStreak > 0) {
+        log(`flush recovered after ${failStreak} failed attempt(s) over `
+            + `${Math.round((Date.now() - (failingSince ?? Date.now())) / 1000)}s - depth now ${queue.length}`);
+    }
+    failStreak = 0;
+    failingSince = null;
+    backoffUntil = 0;
+}
 // The flush timer lives in a gate that clears its handle before firing - see
 // flush-gate.ts for the stale-handle defect the lab-5 ingest run found here.
 const flushGate = makeFlushGate(() => { flush().catch(onAsyncError); }, FLUSH_MS);
@@ -154,7 +180,18 @@ function disarmRule(rule: EventRule, ms: number): void {
         + `Pattern: ${rule.pattern.slice(0, 120)}`);
 }
 
+// Which device is at which address, for traps (syslog/trap.ts). Refreshed on
+// the event rules' timer; a device added a moment ago is attributed within
+// 30 s, and until then its traps carry the address alone, as they always did.
+let devicesByAddress = new Map<string, string[]>();
+async function reloadDeviceAddresses(): Promise<void> {
+    const res = await OPS.deviceAddresses();
+    if (!res.ok) return;   // keep the last good map
+    devicesByAddress = new Map(res.rows.map((r) => [r.address, r.names]));
+}
+
 async function reloadEventRules(): Promise<void> {
+    await reloadDeviceAddresses();
     const res = await OPS.eventRules();
     if (!res.ok) return;   // lane hiccup: keep the last good set, retry next tick
     const signature = JSON.stringify(res.rows);
@@ -255,6 +292,12 @@ async function flush(): Promise<void> {
     if (flushing) return;
     flushGate.disarm();
     if (queue.length === 0) return;
+    // Backing off after a failure: the gate brings us back, the rows wait in
+    // the queue, and an arriving datagram no longer means another attempt.
+    if (Date.now() < backoffUntil) {
+        flushGate.armIfIdle();
+        return;
+    }
 
     flushing = true;
     try {
@@ -275,6 +318,7 @@ async function flush(): Promise<void> {
                 pushFlushMs(performance.now() - t0);
                 written += outcome.rowCount;
                 flushes++;
+                flushSucceeded();
                 continue;
             }
             inFlightBatch = null;
@@ -286,7 +330,7 @@ async function flush(): Promise<void> {
             // a dropped datagram.
             laneBusyEvents++;
             queue.unshift(...batch);
-            log(`ALARM lane refused a flush (${outcome.reason}) - ${batch.length} rows requeued, depth now ${queue.length}`);
+            flushFailed(`lane refused a flush (${outcome.reason}), ${batch.length} rows`);
             break;
         }
     } catch (err) {
@@ -311,7 +355,7 @@ async function flush(): Promise<void> {
             queue.unshift(...inFlightBatch);
             inFlightBatch = null;
         }
-        log(`ALARM flush threw (${(err as Error).message}) - batch requeued, depth now ${queue.length}`);
+        flushFailed(`flush threw (${(err as Error).message})`);
     } finally {
         flushing = false;
         // RE-ARM AFTER A REQUEUE. Filed as a minor latency note in the first
@@ -460,7 +504,9 @@ async function drain(deadlineMs = CONFIG.ingestDrainDeadlineMs): Promise<void> {
             log(`SHUTDOWN drain-exit reason=queue-empty ms=${Date.now() - t0} wrote=${owed}`);
             return;
         }
-        if (!flushing) {
+        // During a failure backoff flush() returns at once, so waiting here
+        // is what stops this loop spinning; the deadline still bounds it.
+        if (!flushing && Date.now() >= backoffUntil) {
             await flush();
             continue;
         }
@@ -587,13 +633,14 @@ async function bindTraps(): Promise<TrapReceiver | null> {
             }
             try {
                 const n = notification as {
-                    pdu?: { varbinds?: Array<{ oid: string; value: unknown }> };
+                    pdu?: {
+                        varbinds?: Array<{ oid: string; value: unknown }>;
+                        enterprise?: unknown; agentAddr?: unknown; generic?: unknown; specific?: unknown;
+                    };
                     rinfo?: { address?: string };
                 };
-                const varbinds = n.pdu?.varbinds ?? [];
-                const rendered = varbinds
-                    .map((vb) => `${vb.oid}=${renderValue(vb.value)}`)
-                    .join(' ');
+                const pdu = n.pdu ?? {};
+                const varbinds = pdu.varbinds ?? [];
                 const sourceIp = n.rinfo?.address ?? null;
                 const now = new Date();
                 enqueue({
@@ -605,12 +652,21 @@ async function bindTraps(): Promise<TrapReceiver | null> {
                     // on; absent is the honest answer.
                     facility: null,
                     severity: null,
-                    host: null,
+                    // The device at that address, so an event alert raised
+                    // from this trap is that device's - its window, its mute,
+                    // its policy (syslog/trap.ts says what went wrong before).
+                    host: deviceForAddress(sourceIp, devicesByAddress),
                     app: 'snmp-trap',
                     procid: null,
                     proto: 'trap',
-                    msg: rendered || 'trap with no varbinds',
-                    raw: JSON.stringify({ source: sourceIp, varbinds: varbinds.map((v) => ({ oid: v.oid, value: String(v.value) })) }),
+                    msg: renderTrap(pdu),
+                    raw: JSON.stringify({
+                        source: sourceIp,
+                        ...(typeof pdu.enterprise === 'string' ? {
+                            enterprise: pdu.enterprise, generic: pdu.generic, specific: pdu.specific, agentAddr: pdu.agentAddr,
+                        } : {}),
+                        varbinds: varbinds.map((v) => ({ oid: v.oid, value: String(v.value) })),
+                    }),
                 });
             } catch (err) {
                 log('failed to handle trap:', (err as Error).message);
@@ -656,16 +712,6 @@ async function bindTraps(): Promise<TrapReceiver | null> {
     return receiver;
 }
 
-function renderValue(v: unknown): string {
-    if (v === null || v === undefined) return '';
-    if (Buffer.isBuffer(v)) {
-        let printable = true;
-        for (const b of v) if ((b < 0x20 && b !== 0x09) || b === 0x7f) { printable = false; break; }
-        return printable ? v.toString('utf8') : '0x' + v.toString('hex');
-    }
-    return String(v);
-}
-
 // --- reporting ---------------------------------------------------------------
 
 // Returns the SHARED type, so main cannot read a field this does not publish.
@@ -688,6 +734,7 @@ function snapshot(): IngestStats {
         queued: queue.length,
         flushes,
         flushFailures,
+        writeFailingMs: failingSince === null ? 0 : Date.now() - failingSince,
         laneBusyEvents,
         truncated,
         nulsStripped,

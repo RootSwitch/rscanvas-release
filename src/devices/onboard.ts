@@ -254,6 +254,54 @@ export function addOutcome(
     };
 }
 
+/** A roster row as the probe compares against it. */
+export interface KnownDeviceRow { name: string; host: string; snmp_port: number }
+
+export type ProbeStanding =
+    | { kind: 'new' }
+    | { kind: 'known' }
+    | { kind: 'name-taken'; why: string };
+
+/**
+ * What the probe table says about one probed host BEFORE anything is added -
+ * the same judgement addOutcome makes after the insert, so the two cannot
+ * disagree.
+ *
+ * A device is its TARGET, address and port together. The probe used to call
+ * a host known if any device had its address, or any device had its name,
+ * and greyed the row out. That hid two different devices:
+ *
+ * - a second agent on the same address at another port (a NAT gateway
+ *   forwarding ports to the boxes behind it, one agent per container, a
+ *   lab's mock fleet): found by the operator's own walkthrough, 2026-09-28,
+ *   adding 198.18.50.2:16101 after :16100;
+ * - a different target whose sysName a device already owns - the twelve
+ *   factory-default `switch`es of ruling 5, which the add path has named as
+ *   a collision since 2026-09-01 while the probe went on folding them into
+ *   "already known" and never let the add path see them.
+ *
+ * Same target is known whatever it is called now (an operator may have
+ * renamed it). A taken name on another target is its own outcome, with the
+ * way out: an explicit name for this one, or a rename of that one.
+ */
+export function probeStanding(
+    name: string, host: string, port: number, known: KnownDeviceRow[],
+): ProbeStanding {
+    if (known.some((k) => k.host === host && Number(k.snmp_port) === port)) return { kind: 'known' };
+    const owner = known.find((k) => k.name === name);
+    if (owner === undefined) return { kind: 'new' };
+    return {
+        kind: 'name-taken',
+        why: `device name ${JSON.stringify(name)} already belongs to the device at `
+            + `${owner.host}:${owner.snmp_port} - give this one its own name, or rename that device`,
+    };
+}
+
+/** A standing as the probe response's row fields: `known` kept for its readers. */
+export function standingFields(s: ProbeStanding): { known: boolean; nameTaken: string | null } {
+    return { known: s.kind === 'known', nameTaken: s.kind === 'name-taken' ? s.why : null };
+}
+
 /**
  * The device-name control-character class, OWNED HERE: C0 (0x00-0x1f) plus
  * DEL (0x7f). The rename route consumed its own regex-literal copy of this

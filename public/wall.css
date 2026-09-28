@@ -314,4 +314,53 @@ a.node[href]:focus-visible { outline: 2px solid var(--se-txt); outline-offset: 2
     padding: 10px 16px; font-size: 16px; font-weight: 600;
     background: var(--se-down); color: #fff;
 }
+/* ABOVE THE CANVAS, said explicitly (2026-09-27). Both bars come before the
+   canvas in the page and it is positioned too, so without a z-index the
+   canvas paints over them: on a glance grid the first row of tiles covered
+   the staleness bar and only slivers of red showed between them - the bar
+   that has to interrupt, hidden by the board it is warning about. Found
+   rendering the burn-in shift; the unshifted wall had it since the grid.
+   Below the settings panel (20), which is only open with somebody there. */
+#wall-stale, #wall-outliers { z-index: 10; }
 .hidden { display: none; }
+
+/* BURN-IN SHIFT (?shift=, 2026-09-27). With S = --shift, the whole wall is
+   laid out S in from every screen edge, and --sx/--sy (each within +-S) move
+   everything that draws a fixed edge - the header, the two banners, the
+   canvas, the empty-board message - together, so their spacing never
+   changes and no text or tile ever crosses a screen edge.
+
+   The bars are the subtle part: their text must keep that clearance, but
+   their COLOUR must still meet the screen edges wherever they sit, or a gap
+   opens beside them. So each bar's box reaches a further S past the edges
+   (the header also upward), and is padded 2S back in to its text: at rest
+   the text sits S inside, at either extreme it touches the ordinary 16px.
+   Measured at both corners of a 24px band before it shipped - the first
+   version padded S, and clipped the header's text at exactly those corners.
+
+   All of it is keyed on .shifting, which wall.js sets only when a shift is
+   asked for: the default wall renders pixel-for-pixel as it did. */
+#wall.shifting { overflow: hidden; }
+#wall.shifting #wall-head,
+#wall.shifting #wall-stale,
+#wall.shifting #wall-outliers {
+    left: calc(-1 * var(--shift)); right: calc(-1 * var(--shift));
+    padding-left: calc(16px + 2 * var(--shift)); padding-right: calc(16px + 2 * var(--shift));
+    transform: translate(var(--sx), var(--sy));
+}
+#wall.shifting #wall-head {
+    top: calc(-1 * var(--shift));
+    height: calc(44px + 2 * var(--shift));
+    padding-top: calc(2 * var(--shift));
+}
+#wall.shifting #wall-stale,
+#wall.shifting #wall-outliers { top: calc(44px + var(--shift)); }
+#wall.shifting #wall-canvas {
+    top: calc(44px + var(--gw-banner, 0px) + var(--shift));
+    left: var(--shift); right: var(--shift); bottom: var(--shift);
+    transform: translate(var(--sx), var(--sy));
+}
+#wall.shifting #wall-msg { transform: translate(var(--sx), var(--sy)); }
+/* Clear of the header at its lowest. The panel itself stays put: it is open
+   only while somebody is standing at the screen. */
+#wall.shifting #wall-panel { top: calc(46px + 2 * var(--shift)); }

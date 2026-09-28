@@ -25,7 +25,7 @@ import {
     isPartitionHealthy, isReporting, isFresh, isFrontierHealthy,
     isJobsHealthy, isHeartbeatHealthy, isKernelDropFree, JOB_FAILURES_ALARM,
     evaluateWorkers, WORKER_NAMES, STATS_STALE_MS, FRONTIER_STALE_MS,
-    isDbSelfHealthy, WRAPAROUND_ALARM_AGE,
+    isDbSelfHealthy, WRAPAROUND_ALARM_AGE, isRetentionEnforcing, isNotifyDelivering, NOTIFY_FAILURES_ALARM,
     type PartitionState, type FrontierState, type JobRecordState, type KernelUdpState,
     type WorkerName, type WorkerReport, type HealthVerdict, type DbSelfState,
 } from '../src/workers/protocol.ts';
@@ -185,6 +185,24 @@ for (const [label, input] of [
     const v = isFrontierHealthy({ ...freshFrontier, lagHours: 200 }, true);
     if (!v.healthy && /behind/i.test(v.problem)) ok('a frontier 200 hours behind is UNHEALTHY');
     else bad('a stalled frontier read as healthy', v);
+}
+{
+    // The young-install grace (2026-09-28): a brand-new install read red for
+    // its first hour, because the rollup cannot run before a complete hour.
+    const never = { ...freshFrontier, throughTs: null, lagHours: null };
+    const ago = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+    if (isFrontierHealthy({ ...never, devices: 40, firstDeviceAt: ago(0.5) }, true).healthy) {
+        ok('never ran, first device added 30 min ago: green - its first pass is not due yet');
+    } else bad('a young install went red');
+    const old = isFrontierHealthy({ ...never, devices: 40, firstDeviceAt: ago(5) }, true);
+    if (!old.healthy && /never run/i.test(old.problem)) ok('never ran, devices added 5 h ago: RED - it should have run');
+    else bad('an old never-ran rollup was excused', old);
+    if (isFrontierHealthy({ ...never, devices: 0, firstDeviceAt: null }, true).healthy) {
+        ok('no devices at all: green - nothing to roll up, nothing to expire');
+    } else bad('an empty install went red');
+    const noTimes = isFrontierHealthy({ ...never, devices: 40, firstDeviceAt: null }, true);
+    if (!noTimes.healthy) ok('devices with no add time (an old install) get no grace');
+    else bad('an install without add times was excused');
 }
 
 // A FROZEN READING MUST NOT PASS AS A CURRENT ONE.
@@ -777,6 +795,47 @@ console.log('\n  the three original wiring bugs, as regressions');
     if (noStat.some((v) => v.healthy === false && v.problem.includes('unmeasured for /x'))) {
         ok('db: an unstattable path is UNMEASURED with its path named');
     } else bad('a statfs failure read as healthy disk', noStat);
+}
+
+console.log('\nisRetentionEnforcing - a retention that succeeds every run by dropping nothing:');
+{
+    const job = (name: string, lastDetail: string): JobRecordState => ({ ...healthyJob, name, lastDetail });
+    const wouldDrop = [
+        job('retention:samples', 'would-drop: samples_20260901, samples_20260902'),
+        job('retention:messages', 'would-drop: messages_20260820 | kept-min-partitions: messages_20260821'),
+    ];
+    const red = isRetentionEnforcing(wouldDrop, true, true);
+    if (!red.healthy && /3 partition\(s\)/.test(red.problem) && /RETENTION_DRY_RUN=0/.test(red.problem)) {
+        ok('dry run with partitions past their keep date is RED, counts them, and names the fix');
+    } else bad('the unbounded-growth case read as healthy, or said nothing useful', red);
+    if (isRetentionEnforcing([job('retention:samples', 'nothing expired')], true, true).healthy) {
+        ok('dry run on a young install, nothing past its date yet, is green - nothing differs yet');
+    } else bad('a young dry-run install went red for nothing');
+    if (isRetentionEnforcing(wouldDrop, false, true).healthy) ok('real retention is never this predicate\'s business');
+    else bad('real retention went red');
+    if (isRetentionEnforcing(wouldDrop, true, false).healthy) ok('jobs off: no retention runs, nothing to judge');
+    else bad('jobs-off went red');
+    if (isRetentionEnforcing([job('alerts:scan', 'would-drop: x')], true, true).healthy) {
+        ok('only the two partition retention jobs are read');
+    } else bad('another job\'s detail was misread as retention');
+}
+
+console.log('\nisNotifyDelivering - a configured channel that has stopped getting through:');
+{
+    const email = (n: number) => [{ channel: 'email', trailingFailures: n,
+        lastDeliveredTs: '2026-09-28T04:06:36Z', lastAttemptTs: '2026-09-28T04:12:26Z' }];
+    const red = isNotifyDelivering(email(NOTIFY_FAILURES_ALARM));
+    if (!red.healthy && /"email"/.test(red.problem) && /nobody is being told/.test(red.problem)
+        && /04:06:36/.test(red.problem)) {
+        ok('three failures in a row is RED, names the channel and when it last delivered');
+    } else bad('a dead channel read as healthy, or said nothing useful', red);
+    if (isNotifyDelivering(email(NOTIFY_FAILURES_ALARM - 1)).healthy) ok('one short of that is a blip, not an outage');
+    else bad('a blip went red');
+    if (isNotifyDelivering(email(0)).healthy) ok('a delivering channel is green');
+    else bad('a delivering channel went red');
+    if (isNotifyDelivering(undefined).healthy && isNotifyDelivering([]).healthy) {
+        ok('no channels, or no ledger yet, is isNotifyConfigSane\'s business, not this one\'s');
+    } else bad('absent ledger went red');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

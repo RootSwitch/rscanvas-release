@@ -106,15 +106,17 @@ async function onboardPort(port) {
     const dev = (probe.body.devices ?? [])[0];
     if (probe.status !== 200 || dev === undefined) { failed++; failures.push(`${port}: probe http ${probe.status}`); return; }
     if (dev.ok !== true) { refused++; failures.push(`${port}: ${String(dev.error ?? 'did not answer').slice(0, 60)}`); return; }
-    // `known` IS HOST-SCOPED AND THIS FLEET IS ONE HOST, so it cannot be used
-    // to skip. Every mock agent lives on the same IP at a different PORT, so
-    // the moment one device exists on 127.0.0.1 the probe reports `known:true`
-    // for all 1,549 others - and an earlier version of this script duly
-    // "skipped" 90 devices it had never added. That is not an RSCanvas defect;
-    // a real fleet is one device per address and the flag is right there. It
-    // is this harness standing outside the shape the flag assumes.
+    // `known` WAS HOST-SCOPED, and this fleet is one host: every mock agent
+    // lives on the same IP at a different PORT, so the moment one device
+    // existed on 127.0.0.1 the probe reported `known:true` for all 1,549
+    // others - and an earlier version of this script duly "skipped" 90
+    // devices it had never added. It was written off here as the harness
+    // standing outside the flag's shape; it was an RSCanvas defect, which the
+    // operator met in the UI (a greyed-out row for 198.18.50.2:16101) and
+    // which was fixed on 2026-09-28: `known` now means the same address AND
+    // port (probeStanding, src/devices/onboard.ts).
     //
-    // So the ADD decides, not the probe. It is ON CONFLICT DO NOTHING
+    // The ADD still decides, not the probe. It is ON CONFLICT DO NOTHING
     // underneath and reports what it actually wrote, which makes a rerun safe
     // without needing a pre-check that cannot see ports.
     const add = await api('/api/devices', { probeToken: probe.body.probeToken, accept: [host] });

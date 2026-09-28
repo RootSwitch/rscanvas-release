@@ -50,8 +50,9 @@ eq(raiseBody({ kind: 'temp', label: 'sw1 Temp', severity: 'crit', value: 58, thr
         kind: 'device-down', label: 'U7-Pro-XG (a.b.c.d) device',
         severity: 'crit', value: null, threshold: null, unit: '',
     });
-    eq(body, 'U7-Pro-XG (a.b.c.d) device is crit: not reporting in the status feed (unreachable or powered off).',
-        'a down device reads as a plain statement');
+    eq(body, 'U7-Pro-XG (a.b.c.d) device is crit: not answering SNMP polls (if it still answers ping, '
+        + 'suspect the agent or its credential; if not, the device or the network).',
+        'a down device reads as a plain statement of what failed, and claims nothing it has not measured');
     if (!body.includes('--')) ok('and carries no "--" placeholders - the bug this module exists for');
     else bad('the -- placeholder came back', body);
 }
@@ -140,6 +141,14 @@ console.log('');
         const TEMPLATE = '{{label}}|{{host}}|{{metric}}|{{kind}}|{{code}}|{{value}}|{{unit}}'
             + '|{{threshold}}|{{severity}}|{{event}}|{{duration}}|{{detail}}|{{reading}}';
 
+        // DELIBERATE DEPARTURES, each with its reason. Such a case must still
+        // match the parent in every variable except `detail` (the 12th), so a
+        // departure is one sentence changed on purpose, never drift.
+        const DEPARTS: Record<string, string> = {
+            'device-down/raise': 'the parent said "unreachable or powered off" of a box that still answered '
+                + 'ping (2026-09-28 notification drill); the fork says what failed - the SNMP poll',
+        };
+        const withoutDetail = (s: string): string => s.split('|').filter((_, i) => i !== 11).join('|');
         let mismatches = 0;
         for (const c of cases) {
             // `time` is excluded: both sides call Date.now() independently and a
@@ -147,13 +156,25 @@ console.log('');
             // other variable is compared.
             const mine = render(TEMPLATE, varsFor(c.alert, c.event));
             const theirs = parent.render(TEMPLATE, parent.varsFor(c.alert, c.event));
+            const why = DEPARTS[`${c.alert.kind}/${c.event}`];
+            if (why !== undefined) {
+                if (mine !== theirs && withoutDetail(mine) === withoutDetail(theirs)) {
+                    ok(`${c.alert.kind}/${c.event} departs from the parent in its detail only, on purpose: ${why}`);
+                } else {
+                    mismatches++;
+                    bad(`${c.alert.kind}/${c.event} was to depart in its detail alone`,
+                        `\n         fork:   ${mine}\n         parent: ${theirs}`);
+                }
+                continue;
+            }
             if (mine !== theirs) {
                 mismatches++;
                 bad(`differential mismatch on ${c.alert.kind}/${c.event}`,
                     `\n         fork:   ${mine}\n         parent: ${theirs}`);
             }
         }
-        if (mismatches === 0) ok(`${cases.length} alert shapes render IDENTICALLY to the parent's JavaScript`);
+        const same = cases.filter((c) => DEPARTS[`${c.alert.kind}/${c.event}`] === undefined).length;
+        if (mismatches === 0) ok(`${same} alert shapes render IDENTICALLY to the parent's JavaScript`);
 
         let durMismatch = 0;
         for (const s of [0, 1, 59, 60, 61, 3599, 3600, 3601, 86399, 86400, 90061, 1_000_000]) {

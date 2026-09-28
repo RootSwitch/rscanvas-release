@@ -46,7 +46,93 @@ export const PREF_SPEC = {
     fcols: { def: 'auto', parse: (v) => (v === 'auto' ? 'auto' : clampNum(v, 1, 3, 1)) },
     blanks: { def: 'auto', parse: (v) => (v === 'show' ? 'show' : 'auto') },
     only: { def: 'all', parse: (v) => (v === 'problems' ? 'problems' : 'all') },
+    // Burn-in guards (2026-09-27), under the Canvas Suite kiosk's own names
+    // so a wall URL carries across: themes/themeInterval/themeOrder rotate
+    // the palette (themeRoster and shuffled below), shift/shiftInterval move
+    // the whole wall a few pixels (nextShift below). Two defaults differ
+    // from the kiosk: themeInterval is 5 minutes rather than 15, the
+    // operator's own setting on every wall they run, and the shift is
+    // capped at 50 px because here it is paid for in margin (a band that
+    // wide is kept clear on every side so nothing is ever clipped).
+    themes: { def: '', parse: (v) => String(v).trim() },
+    themeInterval: { def: 300, parse: (v) => clampNum(v, 30, 86400, 300) },
+    themeOrder: { def: 'list', parse: (v) => (String(v).toLowerCase() === 'shuffle' ? 'shuffle' : 'list') },
+    shift: { def: 0, parse: (v) => Math.round(clampNum(v, 0, 50, 0)) },
+    shiftInterval: { def: 300, parse: (v) => clampNum(v, 30, 3600, 300) },
 };
+
+/**
+ * The themes a ?themes= value rotates through, in order: 'all', or a csv
+ * whose items are each a theme key ('ink') or a GROUP name ('night').
+ *
+ * The kiosk's rule, including why items are matched one at a time: matching
+ * a group only when the WHOLE value was one meant `night,ink` silently
+ * rotated nothing. Case is ignored, an unknown name drops out rather than
+ * emptying the rotation, and a theme named twice (directly and by its group)
+ * comes round once.
+ */
+export function themeRoster(spec, themes) {
+    const keys = Object.keys(themes ?? {});
+    const s = String(spec ?? '').trim();
+    if (s === '') return [];
+    if (s.toLowerCase() === 'all') return keys;
+    const out = [];
+    for (const item of s.split(',')) {
+        const want = item.trim().toLowerCase();
+        if (want === '') continue;
+        for (const k of keys) {
+            const group = String(themes[k].group ?? '').toLowerCase();
+            if ((k.toLowerCase() === want || group === want) && !out.includes(k)) out.push(k);
+        }
+    }
+    return out;
+}
+
+/**
+ * A shuffled copy (Fisher-Yates), for ?themeOrder=shuffle. The themes are
+ * authored in groups, so a listed rotation spends its first hour in the
+ * pale Paper palettes before a dark one appears; shuffled, the groups mix
+ * from the first change. `notFirst` is the theme on screen when the ring
+ * wraps and is reshuffled: it must not come round again straight away,
+ * which would read as a rotation that stalled.
+ */
+export function shuffled(list, rand = Math.random, notFirst = undefined) {
+    const out = [...list];
+    for (let i = out.length - 1; i > 0; i--) {
+        const j = Math.min(i, Math.floor(rand() * (i + 1)));
+        [out[i], out[j]] = [out[j], out[i]];
+    }
+    if (out.length > 1 && out[0] === notFirst) {
+        const k = 1 + Math.min(out.length - 2, Math.floor(rand() * (out.length - 1)));
+        [out[0], out[k]] = [out[k], out[0]];
+    }
+    return out;
+}
+
+/**
+ * Where the wall moves next, for ?shift=: each axis a whole number of pixels
+ * drawn uniformly from [-n, n], never the spot it is leaving.
+ *
+ * Random rather than the kiosk's nine-point ring, deliberately. Burn-in
+ * follows the EDGES that never move - tile outlines, the header's rule - and
+ * a ring of radius n parks every edge on three lines per axis, a third of the
+ * time each. Uniform draws spread the same edge across 2n+1 lines, so no line
+ * of pixels holds it for more than its share. The move is a jump and never a
+ * slide: a tween would cost a small kiosk box real CPU for something meant to
+ * go unnoticed.
+ */
+export function nextShift(n, prev = { x: 0, y: 0 }, rand = Math.random) {
+    const r = Math.floor(Number(n));
+    if (!(r > 0)) return { x: 0, y: 0 };
+    const draw = () => Math.min(r, Math.floor(rand() * (2 * r + 1)) - r);
+    for (let i = 0; i < 8; i++) {
+        const p = { x: draw(), y: draw() };
+        if (p.x !== prev.x || p.y !== prev.y) return p;
+    }
+    // A generator stuck on one value still moves the wall: one pixel along
+    // x, inward, so the result stays in range.
+    return { x: prev.x > -r ? prev.x - 1 : prev.x + 1, y: prev.y };
+}
 
 export function fmtAge(ms) {
     const s = Math.round(ms / 1000);

@@ -230,6 +230,13 @@ export function parse(
             let msg = tail.slice(sdEnd);
             if (msg.startsWith(' ')) msg = msg.slice(1);
             if (msg.charCodeAt(0) === 0xFEFF) msg = msg.slice(1); // UTF-8 BOM
+            // rsyslog's RFC 5424 forwarding sends TWO spaces before a message
+            // it first received as RFC 3164 (its msg property keeps the space
+            // after the tag's colon), so every such line was stored with a
+            // leading space - and a rule anchored ^text matched the same line
+            // forwarded one way and not the other (2026-09-28, the real-agent
+            // drill). Leading spaces carry nothing a reader or a rule needs.
+            msg = msg.replace(/^ +/, '');
             // A well-formed header with no MSG is a legitimately EMPTY message -
             // the old `msg || tail || rest` resurrected the nil-SD marker ('-')
             // as the body. Only fall back to the raw line when the header itself

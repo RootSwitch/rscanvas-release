@@ -3860,11 +3860,14 @@ $('ob-probe').addEventListener('click', async () => {
 });
 
 function renderProbe(r) {
-    const ok = probed.filter((d) => d.ok && !d.known);
+    const ok = probed.filter((d) => d.ok && !d.known && !d.nameTaken);
     const known = probed.filter((d) => d.known);
+    const taken = probed.filter((d) => d.ok && !d.known && d.nameTaken);
     const failed = probed.filter((d) => !d.ok);
     $('ob-counts').textContent =
-        `${ok.length} new, ${known.length} already known, ${failed.length} did not answer`;
+        `${ok.length} new, ${known.length} already known, `
+        + (taken.length ? `${taken.length} name${taken.length === 1 ? '' : 's'} taken, ` : '')
+        + `${failed.length} did not answer`;
     $('ob-msg').textContent = '';
 
     const tbody = $('ob-table').querySelector('tbody');
@@ -3883,13 +3886,16 @@ function renderProbe(r) {
         // visible rather than filtered out, because "why is my device not
         // in the list" is a worse question than "why is that row greyed".
         box.disabled = d.known === true;
-        box.checked = d.ok && !d.known;
+        // A taken name starts unticked: added as it stands it is refused, so
+        // the tick comes with the name typed beside it.
+        box.checked = d.ok && !d.known && !d.nameTaken;
         if (!d.ok) box.dataset.force = '1';
         const boxCell = document.createElement('td');
         boxCell.appendChild(box);
 
         const outcome = !d.ok ? pill(d.errorKind ?? 'no answer', 'badge owed')
             : d.known ? pill('already known', 'badge')
+            : d.nameTaken ? pill('name taken', 'badge owed')
             : pill('will be added', 'badge ok');
         if (!d.ok) {
             outcome.title = 'tick the box to add it anyway - it polls as PENDING and '
@@ -3920,6 +3926,24 @@ function renderProbe(r) {
             why.className = 'muted small';
             why.textContent = d.error;
             oc.appendChild(why);
+        }
+        // A TAKEN NAME IS NOT "ALREADY KNOWN": another address, or another
+        // port on this one, already uses the name this device reports. The
+        // way out is a name of its own, typed here and sent as the add's
+        // `names` map; nothing is ever renamed for the operator.
+        if (!d.known && d.nameTaken) {
+            const why = document.createElement('div');
+            why.className = 'muted small';
+            why.textContent = d.nameTaken;
+            oc.appendChild(why);
+            const own = document.createElement('input');
+            own.type = 'text';
+            own.placeholder = 'a name of its own';
+            own.dataset.nameFor = d.host;
+            own.addEventListener('input', () => { box.checked = own.value.trim() !== ''; });
+            const nameCell = document.createElement('td');
+            nameCell.append(document.createTextNode(d.name), document.createElement('br'), own);
+            row.replaceChild(nameCell, row.children[2]);
         }
         // INDEX 7, THE RESULT COLUMN. This wrote to children[6] - the location
         // column - so every outcome badge landed one cell left of its header
@@ -4010,6 +4034,11 @@ $('ob-add').addEventListener('click', async () => {
         const chosen = (field?.value ?? '').trim();
         if (chosen !== '') locations[box.dataset.reported] = chosen;
     }
+    // Names of their own, for rows whose reported name another device owns.
+    const names = {};
+    for (const f of $('ob-table').querySelectorAll('input[type=text][data-name-for]')) {
+        if (f.value.trim() !== '') names[f.dataset.nameFor] = f.value.trim();
+    }
 
     $('ob-add-msg').textContent = 'adding...';
     // Slice 30: APPLICATION is typed once for the batch. Locations arrive
@@ -4023,6 +4052,7 @@ $('ob-add').addEventListener('click', async () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
             probeToken, accept, locations,
+            ...(Object.keys(names).length > 0 ? { names } : {}),
             ...(force.length > 0 ? { force } : {}),
             ...(application !== '' ? { application } : {}),
         }),

@@ -2339,6 +2339,12 @@ export const OPS = {
     }>('jobs', 'SELECT * FROM roll_up_chunk($1::int, $2::int)', [maxHours, settleMinutes]),
 
     /** The rollup frontier and job bookkeeping, for /api/health. */
+    /** How many devices there are and when the first was added: the young-
+     *  database signal for isFrontierHealthy. A two-row-scan-cheap stand-in
+     *  for "when did samples start", which on a big samples table is not. */
+    deviceAge: () => laneQuery<{ n: number; first: Date | null }>('jobs', `
+        SELECT count(*)::int AS n, min(added_ts) AS first FROM devices`),
+
     jobState: () => laneQuery<{
         job: string; through_ts: Date | null; last_run_ts: Date | null;
         last_ok_ts: Date | null; runs: string; failures: string;
@@ -2489,11 +2495,15 @@ export const OPS = {
             sysName, sysDescr, sysLocation, uptimeCode,
             kinds, indices, names, descrs, aliases, speeds, tracked, codes, extras]),
 
-    /** Which of these names or addresses are already known, for the report. */
+    /**
+     * Which of these names or addresses are already known, for the report.
+     * The port comes back too: a device is its address AND port, and
+     * probeStanding (src/devices/onboard.ts) makes that call.
+     */
     knownDevices: (names: string[], hosts: string[]) => laneQuery<{
-        name: string; host: string;
+        name: string; host: string; snmp_port: number;
     }>('interactive', `
-        SELECT name, host(host) AS host FROM devices
+        SELECT name, host(host) AS host, snmp_port FROM devices
          WHERE name = ANY($1::text[]) OR host = ANY($2::inet[])`, [names, hosts]),
 
     /**
@@ -3991,6 +4001,13 @@ export const OPS = {
 
     /** The enabled rules, for the ingest worker to compile. Ingest lane:
      *  the reload runs beside the flush, never against another worker. */
+    /** Every device's address, for attributing a trap to its device (the
+     *  ingest worker refreshes this with its event rules). Grouped, so an
+     *  address several devices share arrives as all of their names. */
+    deviceAddresses: () => laneQuery<{ address: string; names: string[] }>('ingest', `
+        SELECT host(host) AS address, array_agg(name ORDER BY name) AS names
+          FROM devices GROUP BY 1`),
+
     eventRules: () => laneQuery<{
         id: string; name: string; pattern: string; is_regex: boolean;
         source: string; severity: string;

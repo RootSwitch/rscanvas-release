@@ -38,6 +38,9 @@ const CASES: Case[] = [
     ['5424 with SD',         '<165>1 2026-07-18T12:00:00Z host app 42 ID [exampleSDID@0 x="y"] real msg', 'real msg', 'host', 'app', '42'],
     ['5424 nil host',        '<13>1 2026-07-18T12:00:00Z - app - - - just msg', 'just msg', null, 'app', null],
     ['5424 empty message',   '<13>1 2026-07-18T12:00:00Z host app - - -', '', 'host', 'app', null],
+    // rsyslog forwarding RFC 5424 sends two spaces before a message it first
+    // received as RFC 3164 - captured from rs-test-1's rsyslog, 2026-09-28.
+    ['5424 rsyslog double space', '<155>1 2026-09-28T03:51:36.412345+00:00 rs-test-1 drillapp - - -  drill forward rfc5424 marker-B', 'drill forward rfc5424 marker-B', 'rs-test-1', 'drillapp', null],
     ['3164 basic',           '<34>Oct 11 22:14:15 mymachine su: msg body', 'msg body', 'mymachine', 'su', null],
     ['3164 no PRI',          'Oct 11 22:14:15 host kernel: something', 'something', 'host', 'kernel', null],
     ['3164 tag with pid',    '<38>Jul 18 09:00:00 gw sshd[1234]: accepted', 'accepted', 'gw', 'sshd', '1234'],

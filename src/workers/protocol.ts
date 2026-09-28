@@ -197,6 +197,9 @@ export interface IngestStats {
     queued: number;
     flushes: number;
     flushFailures: number;
+    /** VERDICT, via databaseVerdict in health/work.ts: how long writes have
+     *  been failing, 0 once one succeeds. Optional for fixture compatibility. */
+    writeFailingMs?: number;
     laneBusyEvents: number;
     truncated: number;
     nulsStripped: number;
@@ -339,7 +342,21 @@ export interface FrontierState {
     readAt: string | null;
     /** VERDICT. The threshold lagHours is compared against, by MAIN rather than the worker. */
     alarmAboveHours: number;
+    /** VERDICT, for the never-ran grace: how many devices exist, and when the
+     *  first was added (null when none has an added time). Optional for
+     *  fixture compatibility; absent means no grace. */
+    devices?: number;
+    firstDeviceAt?: string | null;
 }
+
+/**
+ * How long a new install may have a rollup that has never run (2026-09-28,
+ * the chaos drill on a fresh database). The rollup takes complete hours after
+ * a five-minute settle, so its first pass comes 60-70 minutes after the first
+ * samples; until then "never ran" is simply true, and a brand-new install
+ * showed red health for its first hour - the first thing a new user sees.
+ */
+export const ROLLUP_FIRST_RUN_GRACE_MS = 2 * 3_600_000;
 
 export interface JobRecordState {
     /** DISPLAY. */
@@ -529,6 +546,12 @@ export function isFrontierHealthy(
         };
     }
     if (f.throughTs === null) {
+        // Young, or empty: nothing has had a complete hour to roll up yet. An
+        // install with devices but no recorded add time (from before that
+        // column) gets no grace, so a rollup broken on an old box still shows.
+        if (f.devices === 0) return { healthy: true };
+        const first = f.firstDeviceAt ? Date.parse(f.firstDeviceAt) : Number.NaN;
+        if (Number.isFinite(first) && Date.now() - first < ROLLUP_FIRST_RUN_GRACE_MS) return { healthy: true };
         return {
             healthy: false,
             problem: 'the rollup has never run, so no raw partition can ever be expired - '
@@ -611,6 +634,67 @@ export function isJobsHealthy(
     return {
         healthy: false,
         problem: `scheduled jobs are failing every run: ${named}`,
+    };
+}
+
+/**
+ * A CHANNEL THAT STOPPED DELIVERING (2026-09-28, the notification drill).
+ * Email pointed at a relay that could not do the STARTTLS it requires: every
+ * alert was refused - correctly, never sent in plaintext - and /api/health
+ * said ok:true throughout. The channel ledger (easy-win E6) already counted
+ * the failures and the page drew them red, but only on the page: a monitor
+ * polling health, and anyone not looking at that panel, learned nothing while
+ * alerts were raised and nobody was told. Three in a row, because the retry
+ * pass retries, and one refused connection is a blip rather than an outage.
+ */
+export const NOTIFY_FAILURES_ALARM = 3;
+
+export function isNotifyDelivering(
+    channels: Array<{ channel: string; trailingFailures: number; lastDeliveredTs?: string | null; lastAttemptTs?: string | null }> | null | undefined,
+): HealthVerdict {
+    const dead = (channels ?? []).filter((c) => c.trailingFailures >= NOTIFY_FAILURES_ALARM);
+    if (dead.length === 0) return { healthy: true };
+    return {
+        healthy: false,
+        problem: dead.map((c) => `notification channel "${c.channel}" has failed its last `
+            + `${c.trailingFailures} delivery attempts (last delivered ${c.lastDeliveredTs ?? 'never'}) - `
+            + 'alerts are being raised and nobody is being told; each alert\'s delivery history says why')
+            .join('; '),
+    };
+}
+
+/**
+ * RETENTION THAT ONLY TALKS (2026-09-28, found rebooting a test install).
+ *
+ * RETENTION_DRY_RUN defaults to 1 - "the first time this runs against a real
+ * deployment it should say what it would do" - and every lab script set it to
+ * 0 by hand. The installer never did. So every box installed the documented
+ * way, production included, has reported what it would drop every hour and
+ * dropped nothing: the database grows until the disk is full, and health was
+ * green the whole way, because a dry run succeeds.
+ *
+ * The installer now turns retention on for NEW installs (the operator's
+ * ruling); this is for the ones that already exist. Red only once the dry run
+ * has named something past its keep date - before that, dry run and real
+ * retention behave identically and there is nothing to warn about.
+ */
+export function isRetentionEnforcing(
+    jobs: JobRecordState[] | null | undefined, dryRun: boolean, jobsEnabled: boolean,
+): HealthVerdict {
+    if (!jobsEnabled || !dryRun || !jobs) return { healthy: true };
+    const kept: string[] = [];
+    for (const j of jobs) {
+        if (j.name !== 'retention:samples' && j.name !== 'retention:messages') continue;
+        const m = /would-drop: ([^|]*)/.exec(j.lastDetail ?? '');
+        if (m) kept.push(...(m[1] as string).split(',').map((s) => s.trim()).filter(Boolean));
+    }
+    if (kept.length === 0) return { healthy: true };
+    return {
+        healthy: false,
+        problem: `retention is in dry run (RETENTION_DRY_RUN=1): ${kept.length} partition(s) are past `
+            + `their keep date and are being kept (${kept.slice(0, 3).join(', ')}${kept.length > 3 ? ', ...' : ''}), `
+            + 'so the database grows until the disk is full - set RETENTION_DRY_RUN=0 in '
+            + '/etc/rscanvas/rscanvas.env and restart the service',
     };
 }
 

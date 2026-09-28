@@ -8,7 +8,7 @@
 // which is the same as no alarm. So the dead-tier case is pinned here with
 // the real measured numbers from the 30k run.
 
-import { workHealth, type CollectorLag } from '../src/health/work.ts';
+import { workHealth, databaseVerdict, type CollectorLag, type WriteSignals } from '../src/health/work.ts';
 
 let pass = 0;
 let fail = 0;
@@ -122,6 +122,63 @@ console.log('work liveness\n');
         && r.body.detail.includes('30s')) {
         ok('the detail states both the observed lag and the budget, in seconds');
     } else bad('the detail did not name the numbers', r.body.detail);
+}
+
+console.log('\ndatabaseVerdict - the 2026-09-28 outage drill, which answered 200 for three minutes:');
+{
+    const NOW = Date.parse('2026-09-28T03:19:50Z');
+    const healthyLag: CollectorLag = {
+        pollLagP50Ms: 400, pollLagP95Ms: 900, concurrency: 24, downConcurrency: 12,
+        inFlight: 3, inFlightDown: 0, skippedNoSlot: 0,
+    };
+    const scanAt = (okAgoS: number | null, fails: number): WriteSignals['scan'] => ({
+        lastOkAt: okAgoS === null ? null : new Date(NOW - okAgoS * 1000).toISOString(),
+        lastRunAt: new Date(NOW - 5000).toISOString(),
+        consecutiveFailures: fails,
+        lastDetail: 'connect ECONNREFUSED 127.0.0.1:5432',
+    });
+    const w = (scan: WriteSignals['scan'], ingest: WriteSignals['ingest']): WriteSignals =>
+        ({ scan, ingest, nowMs: NOW, limitMs: 60_000 });
+
+    // The drill itself: collector on time, scan failing for three minutes,
+    // ingest holding 9,031 rows. The collector alone said 200.
+    const drill = workHealth(healthyLag, LIMIT, true, w(scanAt(180, 6), { queued: 9031, writeFailingMs: 175_000 }));
+    if (drill.status === 503 && drill.body.reason === 'alert-scan-failing') ok('the drill\'s outage is a 503, reason alert-scan-failing');
+    else bad('the drill\'s outage did not go red', drill);
+    const d = String(drill.body.detail);
+    if (d.includes('180s') && d.includes('ECONNREFUSED') && d.includes('9,031')) ok('and the detail says how long, why, and what is held');
+    else bad('the detail is missing the numbers', d);
+
+    const blip = databaseVerdict(w(scanAt(40, 1), { queued: 300, writeFailingMs: 20_000 }));
+    if (!blip.failing) ok('one failed scan 40 s after the last good one is not an outage yet');
+    else bad('a blip went red', blip);
+
+    const quiet = databaseVerdict(w(scanAt(90, 3), { queued: 0, writeFailingMs: 0 }));
+    if (quiet.failing && quiet.reason === 'alert-scan-failing') ok('a quiet box with no syslog still goes red, from the scan alone');
+    else bad('the quiet box stayed green', quiet);
+
+    const noJobs = databaseVerdict(w(null, { queued: 5000, writeFailingMs: 61_000 }));
+    if (noJobs.failing && noJobs.reason === 'ingest-write-stalled') ok('with jobs off, ingest alone is enough');
+    else bad('jobs off hid the outage', noJobs);
+
+    const neverOk = databaseVerdict(w(scanAt(null, 2), null));
+    if (neverOk.failing) ok('a scan that has never succeeded since start goes red after two failures');
+    else bad('never-succeeded stayed green', neverOk);
+    const neverOkOnce = databaseVerdict(w(scanAt(null, 1), null));
+    if (!neverOkOnce.failing) ok('but not after one');
+    else bad('one never-succeeded failure went red', neverOkOnce);
+
+    const recovered = databaseVerdict(w(scanAt(5, 0), { queued: 0, writeFailingMs: 0 }));
+    if (!recovered.failing) ok('a recovered database is green again at once');
+    else bad('recovery stayed red', recovered);
+
+    const reporting = workHealth(null, LIMIT, false, w(scanAt(120, 4), { queued: 0 }));
+    if (reporting.status === 503) ok('a reporting-only instance with a dead database is red, not "collector-disabled"');
+    else bad('collector-disabled masked the outage', reporting);
+
+    const legacy = workHealth(healthyLag, LIMIT, true);
+    if (legacy.status === 200) ok('without write signals the verdict is the collector\'s alone, as before');
+    else bad('the old call shape changed meaning', legacy);
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

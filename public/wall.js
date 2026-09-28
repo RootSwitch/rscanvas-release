@@ -82,34 +82,69 @@ const STALE_AFTER_MS = numParam('staleAfter', 30, 5, 3600) * 1000;
 // parameters, so these are its names: ?theme=, ?themes=, ?themeInterval=.
 //
 // Rotation is the part that makes a corridor wall pleasant rather than a
-// fixture people stop seeing, and it costs a setInterval.
-const themeParam = new URLSearchParams(location.search).get('theme');
-const themesParam = new URLSearchParams(location.search).get('themes');
-const THEME_INTERVAL_MS = numParam('themeInterval', 900, 30) * 1000;
+// fixture people stop seeing, and it costs a setInterval. It is also the
+// cheapest guard against burn-in there is: it repaints the largest, most
+// constant areas of the screen - the backdrop and the header - on a timer.
+// The rotation's own settings (?themes=, ?themeInterval=, ?themeOrder=) are
+// display prefs like any other dial; see PREF_SPEC. Restartable, because
+// the panel changes them on a running wall.
+let themeTimer = null;
 
-function themeRoster() {
-    const all = Object.keys(window.Themes?.THEMES ?? {});
-    if (themesParam === null) return [];
-    if (themesParam.toLowerCase() === 'all') return all;
-    // A csv of names, filtered to ones that exist - a typo in one entry must
-    // not empty the rotation and leave the wall on whatever loaded first.
-    const want = themesParam.split(',').map((t) => t.trim()).filter(Boolean);
-    return want.filter((t) => all.includes(t));
-}
+// Painted, never saved: this page's state is its URL (themes.js says why).
+function showTheme(name) { window.Themes.applyTheme(name, { persist: false }); }
 
 function startTheming() {
     if (!window.Themes) return;
-    const roster = themeRoster();
-    if (themeParam !== null && (window.Themes.THEMES ?? {})[themeParam]) {
-        window.Themes.applyTheme(themeParam);
+    if (themeTimer !== null) { clearInterval(themeTimer); themeTimer = null; }
+    const themes = window.Themes.THEMES ?? {};
+    const single = new URLSearchParams(location.search).get('theme');
+    const ordered = themeRoster(prefs.themes, themes);
+    let ring = prefs.themeOrder === 'shuffle' ? shuffled(ordered) : ordered;
+    // Nothing to rotate: the one ?theme=, else this browser's own choice -
+    // which also puts the palette back when the panel turns rotation off.
+    if (ring.length === 0) {
+        showTheme(single !== null && themes[single] ? single : window.Themes.currentTheme());
+        return;
     }
-    if (roster.length < 2) return;
     let i = 0;
-    window.Themes.applyTheme(roster[0]);
-    setInterval(() => {
-        i = (i + 1) % roster.length;
-        window.Themes.applyTheme(roster[i]);
-    }, THEME_INTERVAL_MS);
+    showTheme(ring[0]);
+    if (ring.length < 2) return;
+    themeTimer = setInterval(() => {
+        i = (i + 1) % ring.length;
+        if (i === 0 && prefs.themeOrder === 'shuffle') ring = shuffled(ring, Math.random, ring[ring.length - 1]);
+        showTheme(ring[i]);
+    }, prefs.themeInterval * 1000);
+}
+
+// --- burn-in shift -------------------------------------------------------------
+//
+// Theme rotation repaints; it never MOVES anything, and burn-in follows the
+// edges that stay put. So, borrowed from the same kiosk under its names
+// (?shift=, ?shiftInterval=), the whole wall - header, banners, canvas -
+// jumps to a new offset within `shift` pixels on a slow timer. wall.css keeps
+// a band that wide clear on every side so nothing is ever clipped, and widens
+// the bars by it so their colour still meets every screen edge. Where it
+// jumps to, and why randomly, is nextShift's business.
+let shiftTimer = null;
+let shiftAt = { x: 0, y: 0 };
+
+function applyShift() {
+    const w = $('wall');
+    w.style.setProperty('--sx', `${shiftAt.x}px`);
+    w.style.setProperty('--sy', `${shiftAt.y}px`);
+}
+
+function startShifting() {
+    if (shiftTimer !== null) { clearInterval(shiftTimer); shiftTimer = null; }
+    // Starts somewhere random too: a kiosk rebooted nightly would otherwise
+    // spend the first interval of every day on the same pixels.
+    shiftAt = nextShift(prefs.shift, shiftAt);
+    applyShift();
+    if (prefs.shift <= 0) return;
+    shiftTimer = setInterval(() => {
+        shiftAt = nextShift(prefs.shift, shiftAt);
+        applyShift();
+    }, prefs.shiftInterval * 1000);
 }
 
 let lastOkAt = 0;
@@ -164,7 +199,7 @@ let allClear = null;
 // zero tests. This file keeps the DOM, the fetch loop, and the state.
 import {
     PREF_SPEC, clampNum, fmtAge, chooseCols, tileLineCount, visibleFields,
-    pickFcols, fitAxis,
+    pickFcols, fitAxis, themeRoster, shuffled, nextShift,
 } from './wall-logic.js';
 
 const prefs = {};
@@ -200,6 +235,10 @@ function applyPrefs() {
     // An explicit pin is board-independent and applies here like any dial.
     if (prefs.fcols !== 'auto') w.style.setProperty('--gw-fcols', String(prefs.fcols));
     document.getElementById('wall-canvas').classList.toggle('gwall-center', prefs.align === 'center');
+    // The band the burn-in shift moves within. Set before the render that
+    // follows, because it narrows the canvas the column choice fits into.
+    w.style.setProperty('--shift', `${prefs.shift}px`);
+    w.classList.toggle('shifting', prefs.shift > 0);
 }
 
 const hiddenFields = () => new Set(prefs.hide === '' ? [] : prefs.hide.split(','));
@@ -876,25 +915,97 @@ function sliderRow(panel, label, key, lo, hi, step, unit) {
     panel.appendChild(wrap);
 }
 
+/** A select's options plus the current value when the URL holds one the list
+ *  does not offer - shown as itself, so the select cannot claim a setting
+ *  the wall is not running. */
+function withCurrent(options, current, unit) {
+    return options.some(([v]) => String(v) === String(current))
+        ? options : [...options, [current, `${current} ${unit} (from the URL)`]];
+}
+
 function buildPanel() {
     const panel = $('wall-panel');
+    // Rebuilt in place when a choice adds or withdraws controls, so keep the
+    // reader where they were rather than jumping to the top.
+    const keepScroll = panel.scrollTop;
     panel.replaceChildren();
 
     // THEME. The engine has been here since the wall shipped (?theme= and the
     // ?themes= rotation, borrowed from PingCanvas's kiosk); what was missing
     // was a way to pick one without editing a URL by hand.
-    const names = Object.keys(window.Themes?.THEMES ?? {});
+    // 2026-09-27: and the rotation, which had the same gap - it existed only
+    // for someone who knew the URL words. Rotating or not is asked FIRST,
+    // because it decides which controls follow: the one-theme picker is
+    // withdrawn while a rotation runs, since it would change nothing.
+    const themes = window.Themes?.THEMES ?? {};
+    const names = Object.keys(themes);
     if (names.length > 0) {
         heading(panel, 'theme');
-        const cur = new URLSearchParams(location.search).get('theme') ?? '';
-        selectRow(panel, '', [['', 'default'], ...names.map((n) => [n, n])], cur, (v) => {
-            const url = new URL(location.href);
-            if (v === '') url.searchParams.delete('theme'); else url.searchParams.set('theme', v);
-            history.replaceState(null, '', url);
-            if (v !== '') window.Themes.applyTheme(v);
-            else location.reload();   // back to the app's own default
+        const groups = [...new Set(names.map((n) => themes[n].group).filter(Boolean))];
+        const ringOpts = [['', 'off - one theme'], ['all', 'every theme'],
+            ...groups.map((g) => [g.toLowerCase(), `${g} themes`])];
+        const ringCur = ringOpts.some(([v]) => v === prefs.themes.toLowerCase())
+            ? prefs.themes.toLowerCase() : prefs.themes;
+        // A hand-written list stays selectable as itself rather than being
+        // shown as "off" and lost at the next unrelated change.
+        if (!ringOpts.some(([v]) => v === ringCur)) ringOpts.push([ringCur, `the URL's list (${ringCur})`]);
+        selectRow(panel, 'rotate through', ringOpts, ringCur, (v) => {
+            setPref('themes', v);
+            startTheming();
+            buildPanel();
+        });
+        if (themeRoster(prefs.themes, themes).length >= 2) {
+            selectRow(panel, 'change every', withCurrent([
+                [60, '1 minute'], [120, '2 minutes'], [300, '5 minutes'], [600, '10 minutes'],
+                [900, '15 minutes'], [1800, '30 minutes'], [3600, '1 hour'],
+            ], prefs.themeInterval, 'seconds'), prefs.themeInterval, (v) => {
+                setPref('themeInterval', Number(v));
+                startTheming();
+            });
+            selectRow(panel, 'order', [['list', 'as listed'], ['shuffle', 'shuffled']],
+                prefs.themeOrder, (v) => {
+                    setPref('themeOrder', v);
+                    startTheming();
+                });
+        } else {
+            const cur = new URLSearchParams(location.search).get('theme') ?? '';
+            selectRow(panel, 'theme', [['', 'default'], ...names.map((n) => [n, n])], cur, (v) => {
+                const url = new URL(location.href);
+                if (v === '') url.searchParams.delete('theme'); else url.searchParams.set('theme', v);
+                history.replaceState(null, '', url);
+                // 'default' is this browser's own choice, which the wall no
+                // longer overwrites - so it can be painted rather than
+                // recovered by a reload.
+                startTheming();
+            });
+        }
+        panel.appendChild(el('div', 'note',
+            'A rotation repaints the backdrop and the header on a timer, which spreads wear across '
+            + 'a screen that otherwise shows one image for months.'));
+    }
+
+    // SCREEN SHIFT - the other half of the kiosk's burn-in pair. Offered on
+    // every board: a drawn board's outlines are exactly the fixed edges it
+    // guards against.
+    heading(panel, 'screen shift');
+    selectRow(panel, 'move the wall by up to', withCurrent([
+        [0, 'off'], [4, '4 px'], [8, '8 px'], [12, '12 px'], [16, '16 px'], [24, '24 px'],
+    ], prefs.shift, 'px'), prefs.shift, (v) => {
+        setPref('shift', Number(v));
+        startShifting();
+        buildPanel();
+    });
+    if (prefs.shift > 0) {
+        selectRow(panel, 'move every', withCurrent([
+            [60, '1 minute'], [120, '2 minutes'], [300, '5 minutes'], [600, '10 minutes'], [900, '15 minutes'],
+        ], prefs.shiftInterval, 'seconds'), prefs.shiftInterval, (v) => {
+            setPref('shiftInterval', Number(v));
+            startShifting();
         });
     }
+    panel.appendChild(el('div', 'note',
+        'Burn-in follows edges that never move: tile outlines, the header. This jumps the whole wall '
+        + 'to a random offset within that distance, keeping a margin that wide so nothing is cut off.'));
 
     // WHAT TO SHOW. Offered ONLY on a grid board, for the same reason the
     // stencil control is: a drawn board's geometry IS its information, so
@@ -1046,6 +1157,7 @@ function buildPanel() {
     panel.appendChild(el('div', 'note',
         'These settings live in the address bar of this page only. Nothing is written back to the board, '
         + 'and other displays of the same board are untouched.'));
+    panel.scrollTop = keepScroll;
 }
 
 $('wall-gear').addEventListener('click', () => {
@@ -1183,6 +1295,7 @@ async function poll() {
 loadPrefs();
 applyPrefs();
 startTheming();
+startShifting();
 poll();
 setInterval(poll, REFRESH_MS);
 setInterval(updateAge, 1000);
