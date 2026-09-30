@@ -40,7 +40,8 @@ import {
 import { socketStats, systemStats, describeRcvbuf, PROC_AVAILABLE } from '../net/udpstats.ts';
 import type { IngestStats } from './protocol.ts';
 import { makeFlushGate, failureBackoffMs, shouldLogFailure } from './flush-gate.ts';
-import { renderTrap, deviceForAddress } from '../syslog/trap.ts';
+import { renderTrap, renderValue, deviceForAddress, hostForMessage } from '../syslog/trap.ts';
+import { decodePet, petSyslogSeverity } from '../syslog/pet.ts';
 
 const FLUSH_MS = 300;
 const FLUSH_ROWS = 200;
@@ -180,9 +181,10 @@ function disarmRule(rule: EventRule, ms: number): void {
         + `Pattern: ${rule.pattern.slice(0, 120)}`);
 }
 
-// Which device is at which address, for traps (syslog/trap.ts). Refreshed on
-// the event rules' timer; a device added a moment ago is attributed within
-// 30 s, and until then its traps carry the address alone, as they always did.
+// Which device is at which address, for traps and for syslog lines that name
+// no host (syslog/trap.ts). Refreshed on the event rules' timer; a device
+// added a moment ago is attributed within 30 s, and until then its messages
+// carry the address alone, as they always did.
 let devicesByAddress = new Map<string, string[]>();
 async function reloadDeviceAddresses(): Promise<void> {
     const res = await OPS.deviceAddresses();
@@ -560,7 +562,8 @@ function bindSyslog(): dgram.Socket {
                 sourceIp: p.sourceIp,
                 facility: p.facility,
                 severity: p.severity,
-                host: p.host,
+                // The line's own hostname, else the device at its address.
+                host: hostForMessage(p.host, p.sourceIp, devicesByAddress),
                 app: p.app,
                 procid: p.procid,
                 proto: p.proto,
@@ -649,9 +652,10 @@ async function bindTraps(): Promise<TrapReceiver | null> {
                     sourceIp,
                     // A trap has no syslog PRI. Recording 0 would claim
                     // "kernel/emergency", which is a lie a dashboard would act
-                    // on; absent is the honest answer.
+                    // on; absent is the honest answer. An IPMI Platform Event
+                    // Trap states its own severity, and that one is kept.
                     facility: null,
-                    severity: null,
+                    severity: petSyslogSeverity(decodePet(pdu, now.getTime())),
                     // The device at that address, so an event alert raised
                     // from this trap is that device's - its window, its mute,
                     // its policy (syslog/trap.ts says what went wrong before).
@@ -659,13 +663,15 @@ async function bindTraps(): Promise<TrapReceiver | null> {
                     app: 'snmp-trap',
                     procid: null,
                     proto: 'trap',
-                    msg: renderTrap(pdu),
+                    msg: renderTrap(pdu, now.getTime()),
                     raw: JSON.stringify({
                         source: sourceIp,
                         ...(typeof pdu.enterprise === 'string' ? {
                             enterprise: pdu.enterprise, generic: pdu.generic, specific: pdu.specific, agentAddr: pdu.agentAddr,
                         } : {}),
-                        varbinds: varbinds.map((v) => ({ oid: v.oid, value: String(v.value) })),
+                        // renderValue, not String(): a binary varbind (a PET's
+                        // 47 bytes) came out of String() as mangled UTF-8.
+                        varbinds: varbinds.map((v) => ({ oid: v.oid, value: renderValue(v.value) })),
                     }),
                 });
             } catch (err) {

@@ -120,7 +120,27 @@ request silently. So a timeout from a device that answers ping usually
 means a credential, or an agent that only answers certain addresses, and
 the message says so.
 
-**Syslog** is accepted in RFC 3164 and RFC 5424 format on UDP 514.
+**Devices that are down cost polling time.** A device that does not answer
+SNMP holds a polling slot for the whole timeout on every poll: 5 seconds,
+tried twice. RSCanvas keeps half of its polling slots (12 of the default
+24) for devices that are not answering, so the ones that answer are never
+kept waiting by them. With the defaults that half polls about 36 silent
+devices every 30 seconds; past that, the silent devices themselves are
+polled less often. A few dozen devices that are often off - laptops, guest
+PCs - are nothing to worry about: mark them transient on the device page,
+and their absence raises no alert while their graphs resume whenever they
+are back. Hundreds of devices that are gone for good are worth disabling or
+removing. A ping-only device costs almost nothing when it is down.
+`POLL_CONCURRENCY` and `POLL_DOWN_CONCURRENCY` change the split
+(`src/config.ts` says how).
+
+**Syslog** is accepted in RFC 3164 and RFC 5424 format on UDP 514. A
+message's host is the hostname its header names; a message that names none
+takes the name of the device at its source address, when exactly one device
+has it. Some senders send no header at all (a MikroTik's remote logging
+action does unless its BSD syslog format is turned on), and then the
+message has no severity either, so turn the sender's header on where it
+has one. The source address is kept on every message, and `ip:` finds it.
 **Traps** are accepted as SNMP v1 and v2c on UDP 162, with any community.
 They are stored with the trap's name where it is a standard one (linkDown,
 coldStart and so on) and its trap OID, followed by the varbinds. A v1 trap
@@ -130,6 +150,17 @@ same trap OID as its v2 equivalent. An event rule matching
 from an address that belongs to one device is attributed to that device, so
 the device's maintenance window, mute and notify policy apply to alerts it
 raises. SNMPv3 traps are not accepted yet: they are refused and logged.
+
+**IPMI Platform Event Traps** (from a server's BMC) are decoded: a stored
+one reads like `IPMI Fan: Lower Critical going low, asserted - severity
+critical; sensor 0x41 on fan; raw reading 10, raw threshold 2; logged
+2025-10-07 16:21:17 by the BMC clock; seq 102; Supermicro`, followed by
+the trap header and its varbinds as for any trap, and its severity is kept
+as the message's, so `sev:` finds it. Readings stay raw, because turning
+them into RPM or degrees needs the sensor's record, which only the BMC
+holds. The time is the BMC's own clock. A BMC is rarely worth polling, but
+adding its address as a ping-only device gives its traps a device name and
+tells you when the BMC itself stops answering.
 
 ## 4. Upgrade
 

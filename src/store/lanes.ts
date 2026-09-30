@@ -44,6 +44,27 @@ export interface LaneSpec {
      */
     readonly connectionTimeoutMs: number;
     readonly onExhaustion: ExhaustionPolicy;
+    /**
+     * PostgreSQL's JIT compiler, per lane (2026-09-30, the 30k UI
+     * measurement). JIT compiles a query to machine code when its ESTIMATED
+     * cost passes jit_above_cost (100,000), and fully optimises it past
+     * 500,000. The alert queries splice in the maintenance, policy and group
+     * gates as per-row subplans; with 1,958 open alerts on lab-5 the planner
+     * costed /api/alerts at 980,000 - and PostgreSQL spent 730 ms compiling a
+     * query that runs in 24 ms, on every 10 s refresh of every open page, and
+     * the same again for the notify pass's owed-raise and renotify queues.
+     * The compile time also counts against statement_timeout, so the Alerts
+     * page would have started failing outright as alerts grew.
+     *
+     * false = '-c jit=off' on every connection: the lanes whose queries are
+     * short and frequent, where compiling can never pay for itself. null =
+     * the server's default: the lanes that aggregate millions of rows, where
+     * it measured as a gain - the Dashboard's windows about 8% faster with it,
+     * the hourly rollup's aggregation about 12% (8.3 s against 9.5 s at 30k).
+     * The rollup runs on jobs and pays that 12% once an hour; the notify pass
+     * on the same lane would pay two compiles every pass, so jobs is off.
+     */
+    readonly jit: false | null;
     readonly why: string;
 }
 
@@ -53,6 +74,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: 10_000,
         connectionTimeoutMs: 10_000,
         onExhaustion: 'wait-and-alarm',
+        jit: false,
         why: 'Reserved write capacity that web traffic can never consume. A generous wait, because failing to acquire is worse than waiting here.',
     },
     ingest: {
@@ -60,6 +82,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: 10_000,
         connectionTimeoutMs: 10_000,
         onExhaustion: 'wait-and-alarm',
+        jit: false,
         why: 'Never drop a datagram. Blocking briefly is survivable, refusing to write is not.',
     },
     alerts: {
@@ -67,6 +90,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: 15_000,
         connectionTimeoutMs: 5_000,
         onExhaustion: 'skip',
+        jit: false,
         why: 'A skipped scan costs one cycle of latency on an alert. Tolerates blocking by design.',
     },
     jobs: {
@@ -74,6 +98,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: null,
         connectionTimeoutMs: 30_000,
         onExhaustion: 'skip',
+        jit: false,
         why: 'Long, rare, blocking. Retention is never urgent, so it gives up and retries later rather than queueing the application behind itself.',
     },
     interactive: {
@@ -81,6 +106,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: 2_000,
         connectionTimeoutMs: 500,
         onExhaustion: 'http-503',
+        jit: false,
         why: 'Bounded queries only, which is what makes them interactive. A short wait ceiling because a dashboard that is queueing is already broken.',
     },
     heavy: {
@@ -88,6 +114,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: 30_000,
         connectionTimeoutMs: 2_000,
         onExhaustion: 'report-busy',
+        jit: null,
         why: 'Four simultaneous 90-day charts is a bad afternoon, not an outage, and the collector keeps its slots throughout. Two seconds because a human will wait two seconds and will not wait twenty.',
     },
     export: {
@@ -95,6 +122,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: null,
         connectionTimeoutMs: 1_000,
         onExhaustion: 'queue-job',
+        jit: null,
         why: 'A 400,000 row CSV is minutes. In the heavy lane one export would hold a quarter of capacity for its whole duration, so exports get their own lane and become jobs with ids.',
     },
     maintenance: {
@@ -102,6 +130,7 @@ export const LANES: Readonly<Record<Lane, LaneSpec>> = {
         statementTimeoutMs: null,
         connectionTimeoutMs: 30_000,
         onExhaustion: 'skip',
+        jit: null,
         why: 'DDL that must run in a session as an owning role: CREATE/DROP INDEX CONCURRENTLY cannot run inside a function, and a hardened app role owns no index. One connection, the admin credential (pool.ts maintenanceConnectionString), the jobs thread only - the one thread that never touches network input.',
     },
 } as const;

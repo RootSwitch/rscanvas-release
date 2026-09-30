@@ -236,6 +236,9 @@ function runtime(lane: Lane): LaneRuntime {
             '-c TimeZone=UTC',
             process.env.ALLOW_FIXTURE_DROPS === '1' ? '-c rscanvas.allow_fixture_drops=1' : null,
             spec.statementTimeoutMs === null ? null : `-c statement_timeout=${spec.statementTimeoutMs}`,
+            // Per lane, and lanes.ts says which and why: /api/alerts spent
+            // 730 of its 760 ms JIT-compiling at 30k alerts' worth of rows.
+            spec.jit === false ? '-c jit=off' : null,
         ].filter(Boolean).join(' '),
     });
     pool.on('error', (err) => {

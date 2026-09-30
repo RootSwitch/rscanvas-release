@@ -6,8 +6,11 @@
 //   node tools/test-respond.ts
 
 import { Readable } from 'node:stream';
-import type http from 'node:http';
-import { readJsonBody, readBodyOr400, containsNul } from '../src/http/respond.ts';
+import http from 'node:http';
+import zlib from 'node:zlib';
+import {
+    readJsonBody, readBodyOr400, containsNul, acceptsGzip, sendJsonGzip, GZIP_MIN_BYTES,
+} from '../src/http/respond.ts';
 
 // House rule since test-walk: fail unless the run reaches its verdict.
 process.exitCode = 1;
@@ -64,6 +67,53 @@ console.log('\nreadBodyOr400 - a body that cannot be read is refused, never rein
     const fine = fakeRes();
     const r3 = await readBodyOr400(body('{"cols":0}'), fine.res);
     ok('a good body passes through and nothing is written', r3 !== null && r3.cols === 0 && fine.status() === 0);
+}
+
+console.log('\nacceptsGzip - what a browser sends, and the refusals:');
+ok('a browser\'s list', acceptsGzip('gzip, deflate, br, zstd'));
+ok('case and spaces', acceptsGzip(' GZip ;q=0.5'));
+ok('q=0 refuses it', !acceptsGzip('gzip;q=0, deflate'));
+ok('q=0.000 refuses it too', !acceptsGzip('gzip; q=0.000'));
+ok('x-gzip is the same thing', acceptsGzip('x-gzip'));
+ok('no header, no gzip', !acceptsGzip(undefined));
+ok('* is not taken as a yes', !acceptsGzip('*'));
+ok('br alone is not gzip', !acceptsGzip('br'));
+ok('a repeated header is read whole', acceptsGzip(['deflate', 'gzip']));
+
+console.log('\nsendJsonGzip - through a real server:');
+{
+    const big = { ok: true, rows: Array.from({ length: 3000 }, (_, i) => ({ id: i, name: `lab-node-${i}`, status: 'up' })) };
+    const small = { ok: true, rows: [] };
+    const server = http.createServer((req, res) => sendJsonGzip(req, res, 200, req.url === '/big' ? big : small));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const get = (path: string, ae?: string) => new Promise<{ headers: http.IncomingHttpHeaders; raw: Buffer }>((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port, path, headers: ae === undefined ? {} : { 'accept-encoding': ae } }, (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (c: Buffer) => chunks.push(c));
+            res.on('end', () => resolve({ headers: res.headers, raw: Buffer.concat(chunks) }));
+        }).on('error', reject);
+    });
+    const plainLen = Buffer.byteLength(JSON.stringify(big));
+    ok('the test body is over the threshold', plainLen > GZIP_MIN_BYTES, String(plainLen));
+    const gz = await get('/big', 'gzip, deflate, br');
+    const unzipped = zlib.gunzipSync(gz.raw).toString('utf8');
+    ok('asked for gzip: it comes gzipped', gz.headers['content-encoding'] === 'gzip');
+    ok('content-length is the compressed length', Number(gz.headers['content-length']) === gz.raw.length);
+    ok('and it unzips to the same JSON', unzipped === JSON.stringify(big));
+    ok('much smaller', gz.raw.length < plainLen / 5, `${gz.raw.length} of ${plainLen}`);
+    ok('it says it varies by accept-encoding', gz.headers.vary === 'accept-encoding');
+    ok('the JSON headers are all still there', gz.headers['content-type'] === 'application/json; charset=utf-8'
+        && gz.headers['cache-control'] === 'no-store' && gz.headers['x-content-type-options'] === 'nosniff');
+    const plain = await get('/big');
+    ok('not asked: plain JSON', plain.headers['content-encoding'] === undefined && plain.raw.toString('utf8') === JSON.stringify(big));
+    ok('and it varies all the same', plain.headers.vary === 'accept-encoding');
+    const refused = await get('/big', 'gzip;q=0');
+    ok('refused with q=0: plain', refused.headers['content-encoding'] === undefined);
+    const tiny = await get('/small', 'gzip');
+    ok('a short answer goes as it is', tiny.headers['content-encoding'] === undefined && tiny.raw.toString('utf8') === JSON.stringify(small));
+    server.close();
+    server.closeAllConnections();
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

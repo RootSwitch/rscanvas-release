@@ -48,6 +48,7 @@ import { CONFIG } from '../config.ts';
 import { OPS, type AlertRecord } from '../store/index.ts';
 import { isGhostInterface } from './ghosts.ts';
 import { mergeOverrides } from './overrides.ts';
+import { groupConditions } from './groups.ts';
 import {
     evaluate, type Condition, type RulesConfig, type ScanDoc, type ScanInterface,
     type ScanMetric,
@@ -348,6 +349,26 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
         threshold: null,
         unit: '',
     });
+
+    // GROUP ALERTS (slice 55): one condition per opted-in location or
+    // application, crit while enough of its devices are down (alerts/groups.ts).
+    // A failed read skips them for this scan; an open group alert absent for
+    // one scan is forgiven by the missing count, not cleared.
+    //
+    // CAUGHT, NOT JUST CHECKED (found on lab-5, 2026-09-30, where the code
+    // arrived before its schema): laneQuery answers a lane refusal with
+    // ok:false but a driver error THROWS, and the undefined table stopped
+    // the WHOLE scan - device-down, interfaces, sensors - until slice 55 was
+    // applied. An optional feature's read must never cost the alerting it
+    // sits beside.
+    try {
+        const groupRows = await OPS.groupAlertCounts();
+        if (groupRows.ok) conditions.push(...groupConditions(groupRows.rows));
+        else console.warn(`[scan] group_alert_rules unreadable (${groupRows.reason}) - group alerts skipped this scan`);
+    } catch (err) {
+        console.warn(`[scan] group alerts skipped this scan: ${(err as Error).message}`
+            + ' - if the table is missing, the schema is behind the code: re-run the installer');
+    }
 
     const collapsed = dedupeConditions(conditions);
 

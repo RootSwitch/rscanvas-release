@@ -26,6 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actionsFor } from '../src/auth/authorize.ts';
+import { dress, extraAnswers } from '../docs/src/screenshots/dress.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = path.join(ROOT, 'public');
@@ -34,8 +35,12 @@ const OUT = path.join(ROOT, 'docs', 'images');
 const W = 1440, H = 900;
 const ZONE = 'America/Chicago';
 
-const fixture = (n) => JSON.parse(fs.readFileSync(path.join(FIXTURE, `${n}.json`), 'utf8'));
-const META = fixture('meta');
+// The lab's answers as captured, and as the pictures show them: dressed by
+// docs/src/screenshots/dress.mjs, which says what it changes and why.
+const raw = (n) => JSON.parse(fs.readFileSync(path.join(FIXTURE, `${n}.json`), 'utf8'));
+const fixture = (n) => dress(n, raw(n), raw);
+const EXTRA = extraAnswers(raw);
+const META = raw('meta');
 const T = Date.parse(META.capturedAt);
 
 // --- the page's server: the real client, the fixture's answers ---------------------
@@ -74,6 +79,7 @@ function serve(req, res) {
     if (p === '/api/device') { json(200, { ...fixture('device'), device: url.searchParams.get('name') }); return; }
     if (p === '/api/syslog/export') { json(200, { ok: true, jobs: [] }); return; }
     if (p === '/api/syslog/search') { json(200, { ok: true, rows: [], returned: 0, total: 0, timing: {} }); return; }
+    if (EXTRA[p]) { json(200, EXTRA[p]); return; }
     if (ROUTES[p]) { json(200, fixture(ROUTES[p])); return; }
     json(404, { ok: false, detail: `screenshot server: no ${p}` });
 }
@@ -143,12 +149,13 @@ const reportNames = META.reportCodes.map((c) => deviceJson.entities.find((e) => 
 const SHOTS = [
     {
         name: 'dashboard', path: '/',
-        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.querySelectorAll('#dash-alerts tbody tr').length > 0",
+        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.querySelectorAll('#dash-alerts tbody tr').length > 0"
+            + " && document.querySelectorAll('#dash-loc tbody tr').length > 0",
         setup: 'window.scrollTo(0, 0)',
     },
     {
         name: 'device', path: '/#device=lab-node-16100',
-        ready: "document.querySelectorAll('#entities tbody tr').length > 5 && document.querySelectorAll('#sensor-cards .card').length > 0",
+        ready: "document.querySelectorAll('#entities tbody tr').length >= 2 && document.querySelectorAll('#sensor-cards .card').length > 0",
         // An interface's chart open, the view an operator drills into.
         setup: `(async () => {
             document.querySelector('#entities tbody tr.clickable, #entities tbody tr').click();

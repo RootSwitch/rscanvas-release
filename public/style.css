@@ -66,7 +66,7 @@ a:hover { text-decoration: underline; }
 .topbar-spacer { flex: 1; }
 #topbar label { color: var(--se-txt-dim); font-size: 12px; }
 
-#theme-select {
+#theme-select, #width-select {
     background: var(--se-input);
     color: var(--se-txt);
     border: 1px solid var(--se-border);
@@ -91,6 +91,10 @@ a:hover { text-decoration: underline; }
     margin-bottom: 16px;
     overflow-x: auto; /* rule 7: a 48-port table scrolls here, not the page */
 }
+/* A wide table scrolls in its own box (2026-09-30): the panel's own scroll
+   above stays as the backstop, but it carried the device's name, banners and
+   charts sideways with the interface table in a narrow window. */
+.table-scroll { overflow-x: auto; }
 .panel h2 { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
 .panel h2 .muted { font-weight: normal; font-size: 12px; }
 .panel h3 {
@@ -172,6 +176,7 @@ table.list td {
 table.list tbody tr:last-child td { border-bottom: none; }
 table.list td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.list th.num { text-align: right; }
+table.list td.mid, table.list th.mid { text-align: center; }
 
 /* ===== State: a shape as well as a colour (rule 5) ===== */
 .sev {
@@ -372,6 +377,9 @@ tr.maint-row td { opacity: .82; }
 
 .cell-warn { color: var(--se-warn); font-weight: 600; }
 .cell-crit { color: var(--se-down); font-weight: 600; }
+/* The Dashboard's up counts (2026-09-28, operator): green, but not bold -
+   a column of healthy numbers should read calm beside the red. */
+.cell-ok { color: var(--se-up); }
 
 .allquiet { color: var(--se-txt-dim); padding: 10px 0; font-size: 13px; }
 
@@ -450,6 +458,7 @@ th.clickable:hover { text-decoration: underline; }
 #entities .card-gear { float: none; }
 .th-form { margin-top: .5em; gap: .3em; flex-wrap: wrap; font-size: .85em; }
 .th-form input[type=number] { width: 4.5em; }
+#group-alerts-table input[type=number] { width: 4.5em; }
 
 /* Untracked entities: present but dimmed - "we saw this and chose not to
  * watch it" must stay visible, or the untrack control has no way back. */

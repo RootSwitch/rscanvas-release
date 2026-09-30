@@ -8,14 +8,16 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.3).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.4).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
 15,000 syslog messages a second alongside that polling without losing one.
-Before this release it was drilled on clean servers: install, upgrade from
-each earlier alpha, backup and restore, uninstall, power loss, a database
-outage, a full disk, and a new user's first fifteen minutes in the browser.
+Before the third alpha it was drilled on clean servers: install, upgrade
+from each earlier alpha, backup and restore, uninstall, power loss, a
+database outage, a full disk, and a new user's first fifteen minutes in the
+browser. The fourth fixes what running the third on that network and on the
+30,000-entity lab turned up.
 `KNOWN-ISSUES.md` says what is missing or untested; `TESTING.md` says what
 was measured and how; `CHANGELOG.md` says what changed. This is public domain software
 (`LICENSE`, the Unlicense); the device-icon artwork carries its own notices
@@ -27,25 +29,27 @@ internally modular application.
 
 ## What it looks like
 
-![The Dashboard: open alerts, then the top 10 interfaces by traffic each way, errors and discards, CPU and memory over the last 24 hours, each with its change against the day before](docs/images/dashboard.png)
+![The Dashboard: open alerts, then every location and application with its devices up and down, then the top 10 interfaces by traffic each way, errors and discards, CPU and memory over the last 24 hours, each with its change against the day before](docs/images/dashboard.png)
 
-The Dashboard, where every sign-in lands. The fleet in these pictures is
-the synthetic 30,000-entity load-test fleet, so its links carry terabytes
-a day.
+The Dashboard, where every sign-in lands. The pictures come from the
+synthetic 30,000-entity load-test fleet, whose links carry terabytes a day,
+with its devices dressed as a network would look - a mix of kinds, most of
+them clean - since the fleet itself is one mock device repeated
+(`docs/src/screenshots/` says exactly what is composed).
 
 | | |
 |---|---|
-| ![A device page: its open alerts, sensor cards, and an interface's traffic chart](docs/images/device.png) | ![The device list, with transient and muted devices marked in the status column](docs/images/devices.png) |
-| A device: alerts, sensors, and an interface's chart | The device list |
+| ![A render workstation's device page: a warm GPU's alert, sensor cards for its CPU, memory, disks and two GPUs, and an interface's traffic chart](docs/images/device.png) | ![The device list, problems first: a transient virtual machine that is away, two devices down, three with an alert, then the clean ones](docs/images/devices.png) |
+| A device: its alert, sensors including GPUs, and an interface's chart | The device list, problems first |
 | ![An interface traffic report: GB in and out per day, peaks and coverage, with a CSV download](docs/images/report.png) | ![The System tab: health by thread and lane, with each section folded to its header](docs/images/system.png) |
 | A traffic report, by day, with its CSV | System: health first, the rest folded |
 
-![A wall display: 45 devices as a glance grid fitted to the screen, each tile with its type icon, CPU, memory, top traffic and ping; five dead devices in red](docs/images/wall.png)
+![A wall display: 45 devices as a glance grid fitted to the screen, each tile with its type icon, CPU, memory, top traffic and ping; most green, three amber with an alert each, two down in red, and one away transient dimmed](docs/images/wall.png)
 
 A wall display, as a screen in a NOC would show it: a glance grid that fits
-its tiles to the screen. The load-test fleet gives every device five dead
-links on purpose, which is why its healthy devices wear amber - each is
-carrying five open interface alerts - and the five dead devices are red.
+its tiles to the screen, each with the device's type. Green is clean, amber
+carries an alert, red is down, and a transient device that is away is
+dimmed rather than alarming.
 
 The pictures are rendered, not taken: `node tools/make-screenshots.mjs`
 serves this checkout's web client with the data in
@@ -69,17 +73,20 @@ so they show the page as the code now draws it.
   clearing state machine, maintenance windows that withhold notification,
   notify policies by device, location or application, escalation debt, and
   delivery by email, ntfy or syslog with a ledger of what is owed. A whole
-  device's alerts can be muted, one device or a selection at a time.
+  device's alerts can be muted, one device or a selection at a time. A location or application can raise one
+  group alert when enough of its devices are down, holding their own emails
+  while it is open.
 - **Dashboard and reports.** Open alerts first, then the top 10 interfaces
   by traffic received and sent and by errors and discards, and the top 10
   CPU and memory, over 6 hours, 24 hours or 7 days, each with its change
   against the window before. An interface traffic report gives GB in and
   out per day with peaks and coverage, on the page or as CSV.
-- **Boards and the wall.** Diagram boards drawn from your own layout and
-  glance grids generated from the device list, on a wall display that fits
-  its tiles to the screen, with capability tokens for kiosks and burn-in
-  guards for screens that never switch off: a timed theme rotation and a
-  small random shift of the whole wall.
+- **Boards and the wall.** Boards generated from the device list by location
+  or application - one group, several, or the whole fleet - laid out
+  automatically to fit each screen, on a wall display with capability
+  tokens for kiosks and burn-in guards for screens that never switch off: a
+  timed theme rotation and a small random shift of the whole wall. A board
+  notices when its group gains or loses devices and offers to catch up.
 - **Operations.** Per-user accounts with roles and an audit trail - each
   role sees only the controls it may use, and everyone can change their own
   password - TLS, an OpenMetrics endpoint, a one-command installer with hardened database

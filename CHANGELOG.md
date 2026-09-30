@@ -1,5 +1,197 @@
 # Changelog
 
+## 0.1.0-alpha.4 - 2026-09-30
+
+The fourth alpha: group alerts, device health on the Dashboard, and IPMI
+hardware traps decoded, with the fixes from two days of running the third on
+a real network and on the 30,000-entity lab. Interfaces were recorded that
+nobody tracked while tracked ones of other types were never read, the poll
+schedule ran a second late every cycle, a board's catch-up buttons had never
+worked, and the pages' cost at scale was measured and cut.
+
+### Upgrading
+
+Unpack the bundle over the install and re-run the installer, as `INSTALL.md`
+section 4 describes. Take a backup first with `rscanvas-backup.sh`, and
+reload open browser tabs afterwards.
+
+- **Two schema changes**, both applied by the installer: a table for group
+  alert rules, and a column holding each device's poll schedule.
+- **Untracked interfaces stop recording history.** What they recorded
+  before ages out with retention, and the page no longer shows it. If you
+  relied on one's history, track it on its device page.
+- **Tracked interfaces that are not Ethernet or link aggregates start
+  recording** - a Wi-Fi adapter, a tunnel, a VLAN interface someone ticked
+  and that was never actually read. Untrack any you do not want.
+- **The Boards panel no longer shows the controls for hand-placed
+  layouts.** `BOARDS_MANUAL_LAYOUT=1` in `/etc/rscanvas/rscanvas.env`, and
+  a service restart, brings them back; a board already drawn by hand renders
+  either way.
+- **Syslog from a sender that names no host now carries the device's
+  name**, so an event rule matching `host:` can start matching messages it
+  never saw a host on before.
+
+### New
+
+- **Boards are laid out from the start, and the Boards panel shows only
+  that.** Generate makes a board from a group that already fits each
+  display's screen; it used to arrive as a set of coordinates waiting for
+  someone to find the grid setting. The controls for hand-placed layouts -
+  the CrossCanvas layout export and import, empty boards, and drawing from
+  coordinates - are off the panel. They are kept, not deleted:
+  `BOARDS_MANUAL_LAYOUT=1` in the environment file brings them back, and a
+  board already drawn by hand still renders either way.
+- **Group alerts.** Tick a location or application on the System tab's
+  Group alerts panel, and when enough of its devices are down at once it
+  raises one alert instead of an email per device. Each group has a percent
+  (of its devices whose status is known) and a minimum count, 50% and 3
+  unless changed, so a small group cannot trip on one failure. The
+  devices' own alerts still raise and show on the Alerts page and the wall,
+  marked "held - group alert"; only their emails wait. The group's email
+  names the devices that are down, and any still down when the group
+  recovers are emailed then. A maintenance window or notify policy on the
+  location or application holds its group alert too. Transient and muted
+  devices are not counted. Off for every group until ticked.
+- **Device health on the Dashboard.** Between the alerts and the top 10,
+  every location and every application with its devices up and down, so
+  the Dashboard says how the whole environment stands at a glance.
+  Transient devices are left out, pending ones are counted rather than
+  dropped, and devices with no location or application are a group of
+  their own. The counts use the same status the device list shows and are
+  taken on the server, so they stay right past the device list's 5,000-row
+  page. Up counts are green and down counts red when not zero. A row opens
+  the device list on that group; a down count opens just the ones that are
+  down.
+- **`location:NAME` and `application:NAME`** in the device list's filter
+  match one group exactly (a plain word still matches names, addresses and
+  groups by substring). `location:` alone lists the devices with none set.
+- **`transient:` and `muted:`** in the same filter list the devices declared
+  so, and `transient:no` and `muted:no` the rest - the overview those two
+  declarations lacked, when each showed only on its own row. They combine
+  with a word or a group: `muted: PAM`, `transient: location:Lab`.
+- **IPMI Platform Event Traps are decoded.** A BMC reports a hardware event
+  (a fan below its threshold, a power supply failing, a chassis opened) as
+  a trap whose meaning is packed into its specific-trap number and one
+  binary varbind, which was stored as a hex string no one could read or
+  write a rule for. It is now stored as what happened (sensor type and
+  event, asserted or deasserted, severity), where (sensor, entity), the raw
+  reading and threshold, and when by the BMC's clock, ahead of the trap
+  header and varbinds as before. Its severity becomes the message's. Two
+  departures from the specification seen on real BMCs are handled and said:
+  a manufacturer ID sent low byte first, and a timestamp written as Unix
+  time.
+
+### Fixed
+
+- **Devices are polled on their interval, not a second later each time.**
+  A device was due one interval after its last poll finished, so every
+  cycle added the poll's own length and the wait for the next scheduling
+  tick: a 30-second device was polled every 31 seconds, 3% fewer readings
+  than configured, and a traffic report showed 97% coverage for an
+  interface that answered every poll. The schedule now steps by exactly the
+  interval from when each poll was due. A poll that starts well behind
+  schedule (after a restart, or a backlog) starts a fresh schedule instead
+  of catching up in a burst. This release adds one column to the devices
+  table; the installer applies it.
+- **The device page says where its lists stop, and lists interfaces in
+  order.** The interface table stopped at 100 rows while its heading counted
+  them all, and nothing said so; it now says "showing the first 100 of 260"
+  and points at the filter. Interfaces were listed 1, 10, 11 ... 19, 2, 20 on
+  any device with ten or more; they are in number order now, and a device
+  past the server's 500-entity limit says that too instead of being counted
+  short. A device's open alerts show the ten worst, with a button to the
+  rest on the Alerts page: a site outage used to put forty rows between the
+  device's name and its interfaces. In a narrow window a wide table scrolls
+  in its own box instead of carrying the whole panel sideways.
+- **The alert list and the device roster are sent gzipped.** At 30,000
+  entities each was about 1.4 MB, sent as it was every 10 seconds to every
+  page showing it; gzipped they are about 60 and 80 KB, a twentieth, which
+  matters over Wi-Fi or a VPN. The compression runs off the thread that
+  serves the pages, so it costs that thread 2-3 ms. Short answers and
+  clients that do not ask for gzip get plain JSON as before.
+- **Untracked interfaces were recorded anyway.** Tracking decides which
+  interfaces keep a history, and the poller never checked it: every
+  interface of an Ethernet or link-aggregate type wrote a sample on every
+  poll, tracked or not. On a 37-device network that was 232 untracked
+  interfaces against 104 tracked, about 40% of all the rows written, and an
+  access point's untracked virtual radio reached the Dashboard's top errors
+  with a chart its own device page would not open. Untracked interfaces now
+  write no history. Their counters and current state still update, so
+  tracking one later starts from a correct first reading. A device with no
+  tracked interface at all keeps one row per poll carrying its response
+  time, so its response-time chart survives. The Dashboard ranks tracked
+  interfaces only, which also hides what was already stored; the raw
+  samples age out with retention.
+- **Tracking a Wi-Fi adapter or a tunnel recorded nothing.** The poller read
+  only the interface types discovery tracks by default (Ethernet and link
+  aggregates) and skipped every other one even after someone ticked it: the
+  tick was saved and nothing else happened. On a production network two
+  laptops' Wi-Fi and a firewall's three OpenVPN interfaces had been tracked
+  for a week without one reading. A tracked interface is now read whatever
+  its type, and followed like any other when the agent renumbers it. A
+  Wi-Fi adapter's speed moves with its signal, so its utilization is
+  measured against a moving speed; its traffic and error counts are not
+  affected.
+- **An open page cost the server time whether or not anyone was looking at
+  it.** Every 10 seconds, every open tab fetched the whole alert list and
+  device roster - about 1.4 MB each on a 30,000-entity network, and 50-60 ms
+  each of the thread that serves the pages - even on the System or Logs tab,
+  and even in the background. Now each is fetched every 10 seconds only
+  while a view that shows it is open, and once a minute otherwise (other
+  views read them too); a tab in the background fetches nothing until it is
+  looked at again, and then catches up at once.
+- **The wide layout followed you to every tab with no sign of it.** Turned
+  on in the Devices columns panel, it widened every page, and the only way
+  back was that panel. A Width switch now sits beside Theme at the top right
+  of every page; the checkbox in the columns panel is the same setting.
+- **The Devices status column is centred**, so a "transient" badge and an
+  "up" badge line up on their middles instead of reading ragged.
+- **A power sensor's card showed a bare number** - a GPU drawing 287 W read
+  "287.0". It says watts now, as its alerts always did.
+- **Switching the Dashboard between 6 hours, 24 hours and 7 days was slow**
+  on a large network: 1.1 seconds for a day and 3 seconds for a week at
+  30,000 entities, on nearly every switch. The lists can only change when
+  the hourly rollup moves, but the answer was thrown away after a minute.
+  It is now kept until the rollup moves, and once anyone has opened the
+  Dashboard the other windows are computed in the background, and again
+  after each rollup - so a switch takes a few milliseconds. The first open
+  after a restart still computes its window.
+- **The Alerts list took most of a second to fetch at scale**, on every
+  10-second refresh of every open page: 850 ms with 1,958 open alerts at
+  30,000 entities. PostgreSQL was compiling the query to machine code (its
+  JIT) for 730 ms to run it in 24 ms, because checks for maintenance
+  windows, notify policies and group alerts made the query look expensive
+  to the planner. It now answers in about 60 ms. JIT is turned off for the
+  connections that run short, frequent queries (the page, alerting,
+  notifications, polling, ingest) and left on for the Dashboard, reports
+  and the hourly rollup, which measured faster with it. The same compile
+  cost was hitting the notification queues at that scale, and would have
+  eventually made the Alerts page time out as alerts grew.
+- **A board's add, drop and rebuild buttons never worked.** The boards
+  list has shown drift (devices missing from a group board, or moved away)
+  with a button for each fix since 0.1.0-alpha.1, and every one answered
+  "not found": the page sent its request as a GET with no body, and the
+  route only answers a POST. The server side was right all along. A new
+  check refuses that mistake anywhere in the page. Found adding three
+  ping-only devices to a network with an all-devices board.
+- **nodemailer 10.0.12**, from 9.1.1, for a moderate advisory
+  (GHSA-6vj9-mwq6-2f5v: a process-wide DNS cache reusing one mail server's
+  TLS name for another; RSCanvas talks to one relay, so it was not exposed).
+  The new version also stops a bare CR ending a message early at a
+  receiver that reads it as a line end (SMTP smuggling). Email was drilled
+  again in every security mode against a real server before release.
+- **A binary trap varbind was stored as mangled text** in the message's raw
+  record. It is kept as hex, as the message text always showed it.
+- **Syslog from a sender that names no host was nobody's.** A MikroTik with
+  its remote logging action at the default sends bare text with no syslog
+  header, so its messages were stored with an empty host: the Logs page's
+  host column was blank, `host:` could not find them, and an event rule
+  firing on one raised its alert against the bare address, outside the
+  device's maintenance window, mute and notify policy. A message that names
+  no host now takes the name of the device at its source address, when
+  exactly one device has it, as traps do since 0.1.0-alpha.3. A message
+  that names its host keeps it.
+
 ## 0.1.0-alpha.3 - 2026-09-28
 
 The third alpha: backup and restore, an uninstall, burn-in guards for the

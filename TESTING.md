@@ -89,10 +89,23 @@ The ingest ladder ran the same build twice, identical but for how message
 rows reached the socket, so the one-row-at-a-time cost was measured rather
 than inferred: a fifth of the ceiling, and the ingest thread's stalls.
 
+## Since the third alpha: the pages at scale, and the schedule
+
+Found by using the third alpha: the operator on every page of the 30k lab,
+and two days of its own network. Each is a measurement before and after a
+fix, on the Ryzen box above unless it says otherwise.
+
+| measurement | what it found |
+|---|---|
+| the pages at 30k | everything answered promptly but two. The Alerts refresh took 850 ms, 730 of them PostgreSQL compiling a 24 ms query to machine code (JIT); with JIT off for short queries, 60 ms. Switching the Dashboard's window took 1.6 s for a day and 2.9 s for a week; kept until the hourly rollup moves and warmed in the background, a few milliseconds |
+| the page thread's pauses | a CPU profile of the main thread, taken through the inspector without a restart, put every pause of 40-90 ms on an open tab's 10-second refresh: 52 and 58 ms of that thread's CPU to build the alert list and the roster, 1.4 MB each, fetched whatever the tab showed. Fetched now only where shown, and gzipped to 60 and 77 KB: ten minutes with a tab open on System, no pause over 50 ms, against about twenty in fifteen minutes before |
+| the poll cadence | 31.01 s between polls of a 30-second device, over 1,973 polls on the operator's network; each poll counted from when the last one finished. On a fixed schedule: 30.009 s on a 41-device box, and 30.005 s across 1,472 devices at 30k (30.574 before) |
+| interface tracking | on the operator's network 232 untracked interfaces were sampled every poll beside 104 tracked ones, and five tracked Wi-Fi and tunnel interfaces had never been read. After the fix, no untracked rows, and the five started recording |
+
 ## What was not tested
 
 High availability, failover, multi-tenancy, 30,000 entities on anything
 smaller than the 8-thread, 32 GB mini PC above, search latency under a heavy
-query load at the 30k scale, how quickly the pages answer at the 30k scale,
-and real-hardware SNMP beyond one operator's network of about forty devices.
+query load at the 30k scale, how quickly the pages answer to many people at
+once at the 30k scale (one operator used them), and real-hardware SNMP beyond one operator's network of about forty devices.
 Each is stated so that nothing above is read as covering it.

@@ -606,6 +606,20 @@ export const CONFIG = {
     // (the ingest worker owns both), but a box without net-snmp installed
     // should still be able to run the syslog path.
     trapsEnabled: num('TRAPS_ENABLED', 1) === 1,
+
+    /**
+     * The hand-placed board layout controls on the System tab's Boards
+     * panel (2026-09-30, the operator: "focus on its built in Auto-Layout
+     * functionality ... the manual layout controls are making the Boards and
+     * displays section a bit confusing", and "hold onto the code because
+     * manual layout might be something I want to revisit"). Off: boards are
+     * generated from a group and lay themselves out to fit the screen, and
+     * the panel shows only that. 1: the CrossCanvas round trip comes back -
+     * the layout CSV export and import, empty boards, and the grid editor's
+     * "drawn from coordinates" choice. The server keeps all of it either
+     * way, so a board already drawn by hand still renders.
+     */
+    boardsManualLayout: num('BOARDS_MANUAL_LAYOUT', 0) === 1,
 } as const;
 
 export type Config = typeof CONFIG;

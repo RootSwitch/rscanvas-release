@@ -6,7 +6,7 @@
     node tools/make-screenshots.mjs dashboard    one
 
 The script serves this checkout's real web client (`public/`) and answers
-its API from `fixture/`, then photographs it in headless Chrome or Edge at
+its API from `fixture/`, dressed by `dress.mjs` as it is loaded, then photographs it in headless Chrome or Edge at
 1440x900 - one canvas size for every picture - with the clock frozen at
 `fixture/meta.json`'s `capturedAt` and the zone set to America/Chicago, so
 relative times and window labels read the same on every run. No sign-in is
@@ -27,11 +27,20 @@ taken 2026-09-26 and trimmed to what the six pictures need:
   set to a glance grid - columns fitted to the screen, and type icon, CPU,
   memory, top traffic and ping on each tile. Its colours are the lab's own:
   every mock device has five dead links, so the healthy ones wear amber.
-- Lightly dressed, so the pictures show the states the page can draw: the
-  devices carry rack locations, one an application, two are declared
-  transient (one present, one away) and one is muted. Nothing else was
-  altered; the traffic is the mock fleet's own, which is why its links carry
-  terabytes a day.
+- Dressed by `dress.mjs` (2026-09-30), in code so the snapshot stays the
+  lab's and every change is there to read. The lab's devices are one mock
+  repeated - a two-core Linux box with 52 ports, five of them dead - which
+  made a wall of forty identical amber tiles. The dressing gives the 45
+  devices eight kinds (router, firewall, switches, servers, NAS, storage,
+  virtual machines, UPSes) across locations and applications; leaves most
+  of them clean, with one alert each on three and two down; makes
+  lab-node-16100 a render workstation with two GPUs and two ports named
+  eth0 and eth1; puts the transient and muted declarations on lab virtual
+  machines; rebuilds the Dashboard's CPU and memory lists from those
+  devices; and supplies the two answers the snapshot predates (the
+  Dashboard's device health and the System tab's group alerts). The
+  traffic, histories and report are still the lab's own, which is why its
+  links carry terabytes a day.
 - Addresses rewritten by the same rules `tools/make-public-tree.sh` applies
   to the public tree, before rendering - a picture cannot be scrubbed
   afterwards.

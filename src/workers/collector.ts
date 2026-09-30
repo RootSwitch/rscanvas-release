@@ -36,6 +36,7 @@ import {
 } from '../collector/reach.ts';
 import { tcpSweep } from '../collector/tcpcheck.ts';
 import { downBudget, liveBudget } from '../collector/lanes.ts';
+import { pollTiming } from '../collector/schedule.ts';
 import { fpingAvailable, runFpingSweep } from '../collector/fping.ts';
 import type { Target } from '../collector/snmp.ts';
 import type { CollectorStats } from './protocol.ts';
@@ -315,6 +316,8 @@ async function runPoll(device: {
     id: string; name: string; host: string; snmp_port: number; snmp_version: string;
     credential_ref: string; poll_interval_s: number; consecutive_failures: number;
     last_poll_ts: Date | null;
+    /** Slice 56: when the last poll was due - the schedule's grid. */
+    poll_anchor_ts: Date | null;
     /** Last ATTEMPT at the inventory read; null means never, so it is due. */
     inventory_ts: Date | null;
 }): Promise<void> {
@@ -329,12 +332,20 @@ async function runPoll(device: {
     // KEPT PER DEVICE from here on, not only folded into the fleet
     // percentile: the number that says WHICH device is hurting the scheduler
     // is worth a column, and this is where it is known.
-    let thisLagMs: number | null = null;
-    if (device.last_poll_ts !== null) {
-        const dueAt = device.last_poll_ts.getTime() + device.poll_interval_s * 1000;
-        thisLagMs = Math.max(0, Date.now() - dueAt);
-        pushSample(lagMs, thisLagMs);
-    }
+    // Against the schedule's grid since slice 56 (src/collector/schedule.ts
+    // says why), and the grid's next anchor decided here, where the start
+    // time is known.
+    const timing = pollTiming(
+        device.last_poll_ts?.getTime() ?? null, device.poll_anchor_ts?.getTime() ?? null,
+        device.poll_interval_s, Date.now(),
+    );
+    const thisLagMs = timing.lagMs;
+    if (thisLagMs !== null) pushSample(lagMs, thisLagMs);
+    const anchor = new Date(timing.anchorMs);
+    // The two failure paths record the same grid; lag stays null there, as before.
+    const recordFailed = () => OPS.recordDevicePoll(
+        device.id, false, null, null, null, false, null, null, null, null, null, null, null, null, anchor,
+    );
 
     const t0 = performance.now();
     try {
@@ -370,7 +381,7 @@ async function runPoll(device: {
             // like the success path: a refused write here has the same
             // consequence, and this path is the one most likely taken during
             // exactly the database trouble that makes writes refuse.
-            const rec = await OPS.recordDevicePoll(device.id, false, null, null, null, false, null);
+            const rec = await recordFailed();
             if (!rec.ok) {
                 log(`ALARM recordDevicePoll refused for ${device.name} (${rec.reason}) - `
                     + 'this device will be re-polled immediately and forever');
@@ -470,7 +481,7 @@ async function runPoll(device: {
             res.inventoryTried, res.cpuModel, thisLagMs, res.summary,
             res.uptimeS, res.cpuCores, res.ramKb,
             res.ok && res.rttMs > 0 ? res.rttMs : null,
-            res.stencil,
+            res.stencil, anchor,
         );
         if (!recorded.ok) {
             log(`ALARM recordDevicePoll refused for ${device.name} (${recorded.reason}) - `
@@ -484,7 +495,7 @@ async function runPoll(device: {
         // that blew up may not have reached the inventory read at all, and
         // stamping the timestamp here would silently skip a day's refresh
         // every time a device had a bad poll.
-        const rec = await OPS.recordDevicePoll(device.id, false, null, null, null, false, null);
+        const rec = await recordFailed();
         if (!rec.ok) {
             log(`ALARM recordDevicePoll refused for ${device.name} (${rec.reason}) - `
                 + 'this device will be re-polled immediately and forever');

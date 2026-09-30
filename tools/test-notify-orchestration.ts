@@ -77,6 +77,7 @@ let queues: {
 
 stub('settleInWindowClears', () => okRows<Row>([{ n: '0' }]));
 stub('settleUnderPolicyClears', () => okRows<Row>([{ n: '0' }]));
+stub('settleGroupCoveredClears', () => okRows<Row>([{ n: '0' }]));
 stub('alertsOwingRaise', () => okRows(queues.raise));
 stub('alertsOwingEscalate', () => okRows(queues.escalate));
 stub('alertsOwingClear', () => okRows(queues.clear));

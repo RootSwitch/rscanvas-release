@@ -6,7 +6,7 @@
 // exercise THE SAME CODE the browser runs rather than a re-implementation.
 
 import { cell, pill, badge, dotCell, rowEl } from './dom.js';
-import { parseHosts } from './parse.js';
+import { parseHosts, parseDeviceFilter, deviceMatches } from './parse.js';
 import * as Charts from './charts.js';
 
 const $ = (id) => document.getElementById(id);
@@ -148,6 +148,9 @@ function deliveryCell(a) {
     // next question differs - "when does it end" versus "who declared this
     // group unpaged". Same marker discipline: withheld must be visible.
     if (a.under_policy) return pill('unpaged - policy', 'badge policy');
+    // Slice 55: held under its group's alert, which names it. Same marker
+    // discipline - withheld must be visible, and say by what.
+    if (a.in_group) return pill('held - group alert', 'badge policy');
     return a.notify_attempts > 0
         ? pill(`owed (${a.notify_attempts} failed)`, 'badge owed')
         : pill('owed', 'badge owed');
@@ -195,7 +198,7 @@ function renderAlerts(data) {
             deliveryCell(a),
         ]);
         row.className = 'clickable';
-        if (a.in_maintenance || a.under_policy) row.classList.add('maint-row');
+        if (a.in_maintenance || a.under_policy || a.in_group) row.classList.add('maint-row');
         row.addEventListener('click', () => showAlert(a.id));
         tbody.appendChild(row);
     }
@@ -408,6 +411,38 @@ function renderAlertDetail(a, history) {
         d.className = 'hint';
         facts.appendChild(d);
     }
+    // Slice 55: a member held under its group's alert.
+    if (a.in_group) {
+        const d = factLine('group',
+            'its location or application has an open group alert - this alert is recorded'
+            + ' and visible, and its email is held: the group\'s email names it. If it is'
+            + ' still down when the group alert clears, it is emailed then.');
+        d.className = 'hint';
+        facts.appendChild(d);
+    }
+    // A group alert names its members as they stand now; the down ones open
+    // their device page.
+    if (a.group) {
+        const members = a.group.members || [];
+        const down = members.filter((m) => m.status === 'down');
+        const known = members.filter((m) => m.status === 'up' || m.status === 'down').length;
+        facts.appendChild(factLine(a.group.axis,
+            `${a.group.value} - ${down.length} of ${known} down now; trips at ${a.threshold}%`
+            + ` and ${a.group.minDown ?? '?'} down`));
+        if (down.length > 0) {
+            const line = factLine('down now', '');
+            const v = line.lastChild;
+            down.forEach((m, i) => {
+                if (i > 0) v.appendChild(document.createTextNode(', '));
+                const link = document.createElement('a');
+                link.href = '#';
+                link.textContent = m.name;
+                link.addEventListener('click', (ev) => { ev.preventDefault(); showSection('devices'); showDevice(m.name); });
+                v.appendChild(link);
+            });
+            facts.appendChild(line);
+        }
+    }
     facts.appendChild(factLine('first breach', fmtAgo(a.first_breach_ts)));
     facts.appendChild(factLine('raised',
         a.raised_ts ? fmtAgo(a.raised_ts) : 'never - still pending, nobody has been told'));
@@ -524,6 +559,16 @@ function showAlertList() {
 }
 
 $('alert-back').addEventListener('click', showAlertList);
+// From a device page with more alerts than it shows: the Alerts page, filtered
+// to the device's name, every open alert.
+$('device-alerts-all').addEventListener('click', () => {
+    if (currentDevice === null) return;
+    $('alert-filter').value = currentDevice;
+    $('alert-scope').value = 'open';
+    showAlertList();
+    showSection('alerts');
+    renderAlerts(null);
+});
 // The alert the detail panel last rendered, for the mute button's handler:
 // renderAlertDetail runs on every refresh, the listener is wired once.
 let detailAlert = null;
@@ -1084,7 +1129,7 @@ let deviceSort = null;      // null = use the scope selector's ordering
 // (SLICE-ROSTER-COLUMNS-PLAN.md), never a client-side fetch per row.
 const ROSTER_COLS = [
     { key: 'host', label: 'address', sort: 'host', on: true, cell: (d) => cell(d.host) },
-    { key: 'status', label: 'status', sort: 'status', on: true, cell: (d) => {
+    { key: 'status', label: 'status', th: 'mid', sort: 'status', on: true, cell: (d) => {
         // NEVER POLLED IS NOT UP. devices.status defaults to 'up' in the
         // schema, so a device added a second ago claims a state nothing has
         // measured. Pending says which it is, and the dot stays neutral.
@@ -1100,7 +1145,10 @@ const ROSTER_COLS = [
         // shape (the operator's own proposal). The dot beside the name keeps
         // the quiet "off" rendering, so a transient device that is away
         // still does not look like an outage at a glance.
+        // Centred (operator, 2026-09-29): 'transient' is three times the
+        // width of 'up', and left-aligned the column read ragged.
         const td = document.createElement('td');
+        td.className = 'mid';
         const cls = `badge ${d.status === 'up' ? 'ok' : d.status === 'down' ? 'fail' : ''}`;
         const b = unpolled ? badge('pending', 'badge')
             : d.transient === true ? badge('transient', cls)
@@ -1332,13 +1380,23 @@ function visibleCols() {
 }
 
 // Wide layout: a per-browser preference like the columns, applied as a body
-// class so every view inherits it.
+// class so every view inherits it. Two switches show the one setting: the
+// top bar's Width, on every tab, and the checkbox in the Devices columns
+// panel, where the need for it is usually noticed. The value is held here as
+// well as stored, so a browser that refuses storage still gets the switch for
+// the session instead of a control that springs back.
 const WIDE_KEY = 'rscanvas-wide';
+let wideOn = false;
+try { wideOn = localStorage.getItem(WIDE_KEY) === '1'; } catch { /* default */ }
 function applyWide() {
-    let on = false;
-    try { on = localStorage.getItem(WIDE_KEY) === '1'; } catch { /* default */ }
-    document.body.classList.toggle('wide', on);
-    $('wide-cb').checked = on;
+    document.body.classList.toggle('wide', wideOn);
+    $('wide-cb').checked = wideOn;
+    $('width-select').value = wideOn ? 'wide' : 'normal';
+}
+function setWide(on) {
+    wideOn = on;
+    try { localStorage.setItem(WIDE_KEY, on ? '1' : '0'); } catch { /* session only */ }
+    applyWide();
 }
 
 // The header past the two identity columns, rebuilt from the preference on
@@ -1411,10 +1469,8 @@ $('cols-btn').addEventListener('click', () => {
     if (opening) renderColsPanel();
     p.classList.toggle('hidden', !opening);
 });
-$('wide-cb').addEventListener('change', () => {
-    try { localStorage.setItem(WIDE_KEY, $('wide-cb').checked ? '1' : '0'); } catch { /* session only */ }
-    applyWide();
-});
+$('wide-cb').addEventListener('change', () => setWide($('wide-cb').checked));
+$('width-select').addEventListener('change', () => setWide($('width-select').value === 'wide'));
 applyWide();
 
 function renderDevices(data) {
@@ -1437,18 +1493,16 @@ function renderDevices(data) {
         fillReportDevices();
     }
     const all = lastDevices;
-    const q = $('device-filter').value.trim().toLowerCase();
+    const filter = parseDeviceFilter($('device-filter').value);
     const scope = $('device-scope').value;
 
     // The filter searches grouping too, which is what makes "PAM" find both
     // PAM Prod and PAM Dev - a compound application value is opaque to the
     // machine but not to a substring match, which is why two columns stretch
-    // as far as they do.
-    let rows = all.filter((d) => q === ''
-        || String(d.name).toLowerCase().includes(q)
-        || String(d.host).toLowerCase().includes(q)
-        || String(d.location ?? '').toLowerCase().includes(q)
-        || String(d.application ?? '').toLowerCase().includes(q));
+    // as far as they do. location:<name> and application:<name> match one
+    // group exactly, and transient: and muted: narrow to the declared devices
+    // (parse.js says why).
+    let rows = all.filter((d) => deviceMatches(d, filter));
     if (scope === 'only-problems') rows = rows.filter((d) => rank(d) <= 3);
     if (scope === 'down') rows = rows.filter((d) => d.status === 'down');
 
@@ -1531,6 +1585,8 @@ function renderDevices(data) {
 
 let currentDevice = null;
 let lastEntities = [];
+// The server sent its first UI_DEVICE_ENTITY_CAP and there were more.
+let lastEntitiesCapped = false;
 
 /** bits/s with a unit that keeps small values readable and large ones honest. */
 /**
@@ -1942,6 +1998,10 @@ function sensorPresentation(e) {
             return { value: none ? '-' : `${Number(v0).toFixed(1)} C`, pct: v0 };
         case 'fan':
             return { value: none ? '-' : `${Math.round(v0)} rpm` };
+        // Watts, as the alert scan has always called it; the card fell to
+        // the default and showed a bare number (a GPU's 287 read as nothing).
+        case 'power':
+            return { value: none ? '-' : `${fmtRate(v0)} W` };
         case 'battery':
         case 'gauge':
             return { value: none ? '-' : `${fmtRate(v0)}%`, pct: v0 };
@@ -2319,6 +2379,10 @@ function ifRuleControl(e, tr) {
 // same order as the Alerts section, because an operator who just read that
 // page should not have to re-learn the sort here. Rows click through to the
 // alert detail, the mirror of the device link on that page.
+// The device page shows its worst few alerts and hands the rest to the Alerts
+// page, which is built for a long list (index.html says why).
+const DEVICE_ALERTS_SHOWN = 10;
+
 function renderDeviceAlerts() {
     const block = $('device-alerts');
     if (currentDevice === null) { block.classList.add('hidden'); return; }
@@ -2332,7 +2396,11 @@ function renderDeviceAlerts() {
     $('device-alerts-title').textContent = `${mine.length} open alert${mine.length === 1 ? '' : 's'} on this device`;
     const tbody = block.querySelector('tbody');
     tbody.replaceChildren();
-    for (const a of mine) {
+    const more = mine.length - DEVICE_ALERTS_SHOWN;
+    $('device-alerts-more').classList.toggle('hidden', more <= 0);
+    $('device-alerts-more-text').textContent = more > 0
+        ? `showing the ${DEVICE_ALERTS_SHOWN} worst - ${more} more` : '';
+    for (const a of mine.slice(0, DEVICE_ALERTS_SHOWN)) {
         const val = cell(fmtValue(a.value, a.unit), 'num');
         if (a.severity === 'crit') val.classList.add('cell-crit');
         else if (a.severity === 'warn') val.classList.add('cell-warn');
@@ -2363,6 +2431,7 @@ function renderEntities(data) {
     if (document.querySelector('#entities input, #sensor-cards .th-form')) return;
     if (data) {
         lastEntities = data.entities || [];
+        lastEntitiesCapped = data.entitiesCapped === true;
         lastSnmpRtt = data.snmpRtt ?? null;
         lastPollSlots = data.pollSlots ?? null;
         lastAvailability = data.availability24h ?? null;
@@ -2384,6 +2453,18 @@ function renderEntities(data) {
         || String(e.descr ?? '').toLowerCase().includes(q));
 
     const shown = rows.slice(0, RENDER_CAP);
+    // SAID, NOT SILENT (2026-09-30): past the cap the table stopped at a
+    // hundred rows while the heading counted all of them. The server's own
+    // cap is named too - a chassis past it would otherwise be counted short.
+    const moreNote = [];
+    if (rows.length > shown.length) {
+        moreNote.push(`showing the first ${shown.length} of ${rows.length} interfaces, by index - type in the filter to find the rest`);
+    }
+    if (lastEntitiesCapped) {
+        moreNote.push('this device reports more interfaces and sensors than the page receives (the first 500)');
+    }
+    $('entities-more').textContent = moreNote.join('; ');
+    $('entities-more').classList.toggle('hidden', moreNote.length === 0);
     const tbody = $('entities').querySelector('tbody');
     tbody.replaceChildren();
     for (const e of shown) {
@@ -2513,8 +2594,9 @@ function renderEntities(data) {
     // count says so - "29 interface(s)" where 4 alert on nothing is the count
     // lying by omission.
     const untracked = lastEntities.filter((e) => !e.tracked).length;
+    const plus = lastEntitiesCapped ? '+' : '';
     const ifText = rows.length === ifTotal
-        ? `${ifTotal} interface(s)` : `${rows.length} of ${ifTotal} interface(s)`;
+        ? `${ifTotal}${plus} interface(s)` : `${rows.length} of ${ifTotal}${plus} interface(s)`;
     $('device-sub').textContent = (sensorTotal > 0
         ? `${ifText}, ${sensorTotal} sensor(s)` : ifText)
         + (untracked > 0 ? ` (${untracked} untracked)` : '');
@@ -2790,6 +2872,7 @@ async function showDevice(name) {
     $('entities').querySelector('tbody').replaceChildren();
     renderDeviceMaint();
     renderDeviceAlerts();
+    freshenShown();
     const r = await api(`/api/device?name=${encodeURIComponent(name)}`);
     if (r.status === 401) { showLogin(); return; }
     if (currentDevice !== name) return;
@@ -4140,17 +4223,19 @@ function showSection(name) {
     // copy is on screen; its alert list comes from data already in hand.
     if (name === 'dashboard') {
         renderDashAlerts();
+        loadDashGroups();
         fillReportDevices();
         syncReportControls();
         if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
     }
     // The rules live on System now; re-read them on each visit so an edit
     // made in another tab, or a rule the ingest worker disarmed, shows up.
-    if (name === 'system' && can('alertrule.read')) loadEventRules();
+    if (name === 'system' && can('alertrule.read')) { loadEventRules(); loadGroupAlerts(); }
     if (name === 'system' && isAdmin) {
         refreshAdmin();
         fillGroupSuggestions($('inv-axis').value, 'group-values');
     }
+    freshenShown();
 }
 
 for (const b of document.querySelectorAll('.navbtn')) {
@@ -4375,7 +4460,7 @@ function renderDashAlerts() {
             cell(a.raised_ts ? fmtAgo(a.raised_ts) : `breach ${fmtAgo(a.first_breach_ts)}`),
         ]);
         tr.className = 'clickable';
-        if (a.in_maintenance || a.under_policy) tr.classList.add('maint-row');
+        if (a.in_maintenance || a.under_policy || a.in_group) tr.classList.add('maint-row');
         tr.addEventListener('click', () => { showSection('alerts'); showAlert(a.id); });
         tbody.appendChild(tr);
     }
@@ -4391,6 +4476,179 @@ function renderDashAlerts() {
     const more = total - Math.min(SHOWN, sorted.length);
     $('dash-alerts-more').textContent = more > 0 ? `and ${more} more on the Alerts page` : '';
     $('dash-alerts-more').classList.toggle('hidden', more <= 0);
+}
+
+// --- device health by group (2026-09-28, operator) --------------------------------
+//
+// Below the alerts: every location and application with its devices up and
+// down, so the Dashboard says how the whole environment stands. Counted on
+// the server (/api/dashboard/groups) with the device list's own status and
+// without transient devices; fetched on arrival and with the 10 s refresh
+// while the Dashboard is on screen. Zero is shown, because zero down is a
+// measurement; the pending column appears only when some group has one.
+
+let dashGroupsGen = 0;
+
+/**
+ * Open the device list on one group, problems first or down only. The filter
+ * says location:<name> or application:<name>, an exact match: as a plain
+ * word "Lab" also matched every device named lab-node-... (parse.js).
+ */
+function openGroup(axis, value, scope) {
+    $('device-filter').value = `${axis}:${value ?? ''}`;
+    $('device-scope').value = scope;
+    showSection('devices');
+    showRoster();
+    renderDevices(null);
+}
+
+function renderDashGroup(tableId, groups, noneLabel) {
+    const table = $(tableId);
+    const tbody = table.querySelector('tbody');
+    tbody.replaceChildren();
+    const anyOther = groups.some((g) => g.other > 0);
+    table.querySelector('th.dash-other').classList.toggle('hidden', !anyOther);
+    if (groups.length === 0) {
+        const tr = rowEl([cell('no devices yet', 'muted small')]);
+        tr.firstChild.colSpan = 4;
+        tbody.appendChild(tr);
+        return;
+    }
+    for (const g of groups) {
+        const down = cell(String(g.down), g.down > 0 ? 'num cell-crit' : 'num muted');
+        const other = cell(String(g.other), g.other > 0 ? 'num cell-warn' : 'num muted');
+        if (!anyOther) other.classList.add('hidden');
+        const tr = rowEl([
+            // No location or application is a group of its own, last: leaving
+            // the untagged out would report better coverage than exists.
+            g.value === null ? cell(noneLabel, 'muted') : cell(g.value),
+            cell(String(g.up), g.up > 0 ? 'num cell-ok' : 'num muted'), down, other,
+        ]);
+        const axis = tableId === 'dash-loc' ? 'location' : 'application';
+        const what = g.value === null ? `with no ${axis}` : `in "${g.value}"`;
+        tr.className = 'clickable';
+        tr.title = `open the devices ${what}${g.value === null ? ' - set one on the device page, under Modify' : ''}`;
+        tr.addEventListener('click', () => openGroup(axis, g.value, 'problems'));
+        if (g.down > 0) {
+            down.title = `open only the ${g.down} down ${what}`;
+            down.addEventListener('click', (ev) => { ev.stopPropagation(); openGroup(axis, g.value, 'down'); });
+        }
+        tbody.appendChild(tr);
+    }
+}
+
+async function loadDashGroups() {
+    const gen = ++dashGroupsGen;
+    const r = await api('/api/dashboard/groups');
+    if (gen !== dashGroupsGen) return;
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('dash-groups-msg').textContent = r.detail || `could not load (${r.status})`; return; }
+    $('dash-groups-msg').textContent = '';
+    const locations = r.locations || [];
+    renderDashGroup('dash-loc', locations, 'no location');
+    renderDashGroup('dash-app', r.applications || [], 'no application');
+    // Every device sits in exactly one location group, so those rows sum to
+    // the whole.
+    const sum = (k) => locations.reduce((n, g) => n + (Number(g[k]) || 0), 0);
+    const up = sum('up'), down = sum('down'), other = sum('other');
+    $('dash-groups-sub').textContent = up + down + other === 0 ? ''
+        : `${up} up, ${down} down${other > 0 ? `, ${other} pending/unknown` : ''} - transient devices not counted`;
+}
+
+// --- group alerts (slice 55, 2026-09-29) ------------------------------------------
+//
+// Every location and application, a box to watch it, and its rule: the
+// percent of its known devices down and the minimum count. Each change saves
+// that one group at once - there is no form to forget to submit. Operators
+// read it; changing it needs alertrule.write, like the syslog and trap rules.
+
+async function loadGroupAlerts() {
+    const r = await api('/api/group-alerts');
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('group-alerts-msg').textContent = r.detail || `could not load (${r.status})`; return; }
+    $('group-alerts-msg').textContent = '';
+    renderGroupAlerts(r.groups || []);
+}
+
+function numberInput(value, min, max, title) {
+    const i = document.createElement('input');
+    i.type = 'number';
+    i.min = String(min);
+    if (max !== null) i.max = String(max);
+    i.step = '1';
+    i.value = String(value);
+    i.title = title;
+    return i;
+}
+
+function renderGroupAlerts(groups) {
+    const tbody = $('group-alerts-table').querySelector('tbody');
+    tbody.replaceChildren();
+    const writable = can('alertrule.write');
+    const watched = groups.filter((g) => g.enabled).length;
+    $('group-alerts-sub').textContent = groups.length === 0 ? '' : `${watched} of ${groups.length} watched`;
+    if (groups.length === 0) {
+        const tr = rowEl([cell('no locations or applications yet - set them on the device page, under Modify', 'muted small')]);
+        tr.firstChild.colSpan = 7;
+        tbody.appendChild(tr);
+        return;
+    }
+    for (const g of groups) {
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = g.enabled === true;
+        box.disabled = !writable;
+        box.title = `watch ${g.axis} "${g.value}"`;
+        const pct = numberInput(g.thresholdPct, 1, 100, 'percent of the devices whose status is known');
+        const min = numberInput(g.minDown, 1, null, 'devices down, at least');
+        pct.disabled = !writable;
+        min.disabled = !writable;
+        const state = cell('', 'muted small');
+        const save = async () => {
+            state.textContent = 'saving...';
+            const r = await api('/api/group-alerts', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    axis: g.axis, value: g.value, enabled: box.checked,
+                    thresholdPct: Number(pct.value), minDown: Number(min.value),
+                }),
+            });
+            if (r.status === 401) { showLogin(); return; }
+            state.textContent = r.ok ? (box.checked ? 'watched' : 'not watched') : (r.detail || `refused (${r.status})`);
+            if (r.ok) g.enabled = box.checked;
+            $('group-alerts-sub').textContent = `${groups.filter((x) => x.enabled).length} of ${groups.length} watched`;
+        };
+        box.addEventListener('change', save);
+        pct.addEventListener('change', save);
+        min.addEventListener('change', save);
+
+        const name = cell(g.value);
+        const axis = document.createElement('span');
+        axis.className = 'muted small';
+        axis.textContent = ` ${g.axis}`;
+        name.appendChild(axis);
+        if (g.gone) {
+            name.append(document.createTextNode(' '), badge('no devices now', 'badge'));
+        }
+        const boxCell = document.createElement('td');
+        boxCell.appendChild(box);
+        const pctCell = document.createElement('td');
+        pctCell.className = 'num';
+        pctCell.append(pct, document.createTextNode(' %'));
+        const minCell = document.createElement('td');
+        minCell.className = 'num';
+        minCell.append(min, document.createTextNode(' down'));
+        const tr = rowEl([
+            cell(''), name,
+            cell(String(g.up), g.up > 0 ? 'num cell-ok' : 'num muted'),
+            cell(String(g.down), g.down > 0 ? 'num cell-crit' : 'num muted'),
+            cell(''), cell(''), state,
+        ]);
+        tr.replaceChild(boxCell, tr.children[0]);
+        tr.replaceChild(pctCell, tr.children[4]);
+        tr.replaceChild(minCell, tr.children[5]);
+        tbody.appendChild(tr);
+    }
 }
 
 // --- the interface traffic report ----------------------------------------------
@@ -4869,7 +5127,13 @@ let auditLimit = 50;
 
 let currentBoard = null;
 
-function renderBoards(boards, gridFields, gridDefaults) {
+/** Whether the hand-placed layout controls are offered (BOARDS_MANUAL_LAYOUT). */
+let manualLayout = false;
+
+function renderBoards(boards, gridFields, gridDefaults, manual) {
+    manualLayout = manual === true;
+    for (const el of document.querySelectorAll('.manual-layout')) el.classList.toggle('hidden', !manualLayout);
+    if (!manualLayout) $('inv-board').value = '';
     lastBoards = boards;
     if (Array.isArray(gridFields)) lastGridFields = gridFields;
     if (Array.isArray(gridDefaults)) lastGridDefaults = gridDefaults;
@@ -4984,8 +5248,16 @@ function renderBoards(boards, gridFields, gridDefaults) {
         // ruled on), and each button names the count it will act on.
         if (b.source_axis !== null && (missing > 0 || extra > 0 || broken > 0)) {
             const rec = async (action, extra2) => {
-                const r = await api(`/api/boards/${encodeURIComponent(b.id)}/reconcile`,
-                    { action, ...(extra2 || {}) });
+                // A POST with a JSON body. This passed { action } as api()'s
+                // fetch OPTIONS, so every verb went out as a bodiless GET, met
+                // the router's catch-all and read "not found" - add, drop and
+                // rebuild never worked from the page (operator, 2026-09-28,
+                // "add 3" for three new ping-only devices).
+                // tools/check-api-calls.mjs now refuses that shape.
+                const r = await api(`/api/boards/${encodeURIComponent(b.id)}/reconcile`, {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ action, ...(extra2 || {}) }),
+                });
                 adminSay('boards-msg', r, `${b.name}: ${action} - now ${r.shapes} shape(s)`);
                 refreshAdmin();
             };
@@ -5124,7 +5396,9 @@ $('grid-auto').addEventListener('change', () => {
 $('grid-save').addEventListener('click', async () => {
     if (gridBoard === null) return;
     const raw = $('grid-cols').value.trim();
-    const cols = $('grid-auto').checked ? 0 : raw === '' ? null : Number(raw);
+    // Blank is "drawn from coordinates" only where manual layout is offered;
+    // otherwise a board always lays itself out, and blank means auto.
+    const cols = $('grid-auto').checked ? 0 : raw === '' ? (manualLayout ? null : 0) : Number(raw);
     const fields = [...$('grid-checks').querySelectorAll('input:checked')].map((x) => x.dataset.key);
     const r = await api(`/api/boards/${encodeURIComponent(gridBoard.id)}/grid`, {
         method: 'POST',
@@ -5206,6 +5480,10 @@ $('inv-export').addEventListener('click', async () => {
     // the operator went looking for and could not make. Blank alone still
     // means "just export the CSV", because a blank field is not a request.
     const wantAll = $('inv-all').checked;
+    if (!manualLayout && value === '' && !wantAll) {
+        $('inv-msg').textContent = 'name a group (or several, with commas), or tick "every group"';
+        return;
+    }
     if (boardId === '' && (value !== '' || wantAll)) {
         // Slice 27: commas declare a TEAM board - "PAM, Exchange, VOIP" makes
         // one board sectioned by those groups, in that order. One value stays
@@ -5230,20 +5508,26 @@ $('inv-export').addEventListener('click', async () => {
             // which means somebody generated this group before. Say that
             // rather than the raw refusal, and leave the download to them.
             $('inv-msg').textContent = `${made.detail || 'could not create the board'}`
-                + ' - if it already exists, pick it above to regenerate.';
+                + (manualLayout ? ' - if it already exists, pick it above to regenerate.'
+                    : ' - if a board for this group already exists, "rebuild" in the table above regenerates it.');
             return;
         }
         await refreshAdmin();
-        $('inv-board').value = made.id;
-        syncInventoryControls();
+        // Selecting the new board hands the picker to it - the CrossCanvas
+        // path's next step. Without manual layout the picker is hidden and the
+        // next Generate must make the next board, not export this one.
+        if (manualLayout) {
+            $('inv-board').value = made.id;
+            syncInventoryControls();
+        }
         // NO AUTOMATIC DOWNLOAD (slice 30). It made sense while boards were
         // born empty and the ferry was the only way to fill one; now the
         // board arrives populated and the CSV is one path of two, so pushing
         // a file into Downloads on every Generate was the tool assuming an
         // answer. The button below asks.
-        $('inv-msg').textContent = `created "${boardName}" with ${made.placed ?? 0} device(s) already placed - `
-            + 'set a grid on it in the table above and it is a live wall right now. '
-            + 'Want a drawn, polished layout instead? Export the CSV for CrossCanvas with the button.';
+        $('inv-msg').textContent = `created "${boardName}" with ${made.placed ?? 0} device(s), laid out to fit `
+            + 'each screen - open Displays beside it in the table above to put it on a wall.'
+            + (manualLayout ? ' Want a drawn, polished layout instead? Pick it above and export the CSV for CrossCanvas.' : '');
         return;
     }
 
@@ -5770,7 +6054,7 @@ async function refreshAdmin() {
     if (creds.ok) renderCredentials(creds);
     if (ths.ok) renderThresholds(ths);
     const boards = await api('/api/boards');
-    if (boards.ok) renderBoards(boards.boards || [], boards.gridFields, boards.gridDefaults);
+    if (boards.ok) renderBoards(boards.boards || [], boards.gridFields, boards.gridDefaults, boards.manualLayout);
 }
 
 let timer = null;
@@ -5785,20 +6069,55 @@ let timer = null;
 // (2026-09-01 review).
 let refreshGen = 0;
 
-async function refresh() {
+// WHAT THE OPEN TAB SHOWS DECIDES WHAT THE TIMER FETCHES (2026-09-29). The
+// alert list and the device roster are the two big answers - about 1.4 MB
+// each at 30,000 entities - and each costs the server's page thread 50-60 ms
+// to build. Fetched every 10 s by every open tab whatever it showed, one tab
+// left on System paused that thread for 40-90 ms every ten seconds (measured
+// on the lab box with a CPU profile and the thread's own CPU time). Now each
+// is fetched every 10 s only while a view that shows it is open, and once a
+// minute otherwise, because other views read them too (the device pickers,
+// the slowest agents on Health). A hidden tab fetches nothing, and catches up
+// the moment it is looked at. Any other refresh - an action's, sign-in's -
+// still fetches everything.
+const QUIET_MS = 60_000;
+let alertsFetchedAt = 0;
+let devicesFetchedAt = 0;
+function showsAlerts() {
+    return section === 'alerts' || section === 'dashboard' || (section === 'devices' && currentDevice !== null);
+}
+function showsDevices() { return section === 'devices'; }
+// Called when the view changes: a list the quiet cadence let go stale is
+// fetched now rather than at the next tick. Not before the first full
+// refresh has landed - sign-in runs that one itself.
+function freshenShown() {
+    if (devicesFetchedAt === 0) return;
+    const stale = (at) => Date.now() - at > 10_000;
+    if ((showsAlerts() && stale(alertsFetchedAt)) || (showsDevices() && stale(devicesFetchedAt))) {
+        refresh({ onlyShown: true });
+    }
+}
+
+async function refresh(opts = {}) {
+    const onlyShown = opts.onlyShown === true;
+    if (onlyShown && document.hidden) return;
     const gen = ++refreshGen;
+    const now = Date.now();
+    const wantAlerts = !onlyShown || showsAlerts() || now - alertsFetchedAt >= QUIET_MS;
+    const wantDevices = !onlyShown || showsDevices() || now - devicesFetchedAt >= QUIET_MS;
     const [alerts, devices, health, reachEv, maint, pol] = await Promise.all([
-        api('/api/alerts'), api('/api/devices'), api('/api/health'),
+        wantAlerts ? api('/api/alerts') : null, wantDevices ? api('/api/devices') : null, api('/api/health'),
         api('/api/reachability/events'), api('/api/maintenance'), api('/api/policy'),
     ]);
-    if (alerts.status === 401 || devices.status === 401) { showLogin(); return; }
+    if ([alerts, devices, reachEv].some((r) => r !== null && r.status === 401)) { showLogin(); return; }
     if (gen !== refreshGen) return;
-    if (alerts.ok) renderAlerts(alerts);
+    if (alerts?.ok) { alertsFetchedAt = now; renderAlerts(alerts); }
     if (section === 'dashboard') {
         renderDashAlerts();
+        loadDashGroups();
         if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
     }
-    if (devices.ok) renderDevices(devices);
+    if (devices?.ok) { devicesFetchedAt = now; renderDevices(devices); }
     if (reachEv.ok) renderReachEvents(reachEv);
     if (maint.ok) { maintData = maint.windows || []; renderMaint(); }
     if (pol.ok) { policyData = pol.policies || []; renderPolicies(); }
@@ -5919,8 +6238,13 @@ async function showApp(me) {
     if (deep !== null) await openDeepLink();
     if (can('alertrule.read')) loadEventRules();
     clearInterval(timer);
-    timer = setInterval(refresh, 10_000);
+    timer = setInterval(() => refresh({ onlyShown: true }), 10_000);
 }
+
+// Back to a tab that stopped refreshing while hidden: everything, now.
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !$('app').classList.contains('hidden')) refresh();
+});
 
 function showLogin() {
     clearInterval(timer);

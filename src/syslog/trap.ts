@@ -22,6 +22,8 @@
 // The varbinds follow unchanged, so a rule written against the old text
 // still matches.
 
+import { decodePet, petText } from './pet.ts';
+
 const SNMP_TRAP_OID = '1.3.6.1.6.3.1.1.4.1.0';
 const SNMP_TRAPS = '1.3.6.1.6.3.1.1.5';
 
@@ -68,7 +70,14 @@ export function v1TrapOid(enterprise: string, generic: number, specific: number)
     return generic >= 0 && generic <= 5 ? `${SNMP_TRAPS}.${generic + 1}` : `${enterprise}.0.${specific}`;
 }
 
-export function renderTrap(pdu: TrapPduLike): string {
+export function renderTrap(pdu: TrapPduLike, nowMs: number = Date.now()): string {
+    // An IPMI Platform Event Trap leads with what it means (syslog/pet.ts);
+    // the header and the varbinds follow as for any trap.
+    const pet = decodePet(pdu, nowMs);
+    return pet === null ? renderPlain(pdu) : `${petText(pet)} | ${renderPlain(pdu)}`;
+}
+
+function renderPlain(pdu: TrapPduLike): string {
     const varbinds = pdu.varbinds ?? [];
     const listed = varbinds.map((vb) => `${vb.oid}=${renderValue(vb.value)}`).join(' ');
     if (typeof pdu.enterprise === 'string' && typeof pdu.generic === 'number') {
@@ -97,4 +106,27 @@ export function deviceForAddress(address: string | null, byAddress: ReadonlyMap<
     if (address === null) return null;
     const names = byAddress.get(address.replace(/^::ffff:/, ''));
     return names !== undefined && names.length === 1 ? (names[0] as string) : null;
+}
+
+/**
+ * A syslog line's host: the one the line names, else the device at its
+ * source address, by the rule above.
+ *
+ * The header's hostname was the only source, so a sender that names none
+ * stored an empty host - a MikroTik with its remote action left at the
+ * default sends bare "topics message" text with no header at all (the
+ * operator's CRS317-Core, 2026-09-28). The Logs page's host column was blank
+ * and `host:` could not find it, and an event rule firing on such a line
+ * raised its alert against the bare address, outside the device's window,
+ * mute and notify policy - the trap defect again, by the other door.
+ *
+ * A name the line does carry is kept even when it differs from the
+ * device's: it is the sender's own claim, and a relay forwarding for
+ * others names each origin in the line it forwards.
+ */
+export function hostForMessage(
+    named: string | null | undefined, address: string | null, byAddress: ReadonlyMap<string, readonly string[]>,
+): string | null {
+    if (named !== null && named !== undefined && named !== '') return named;
+    return deviceForAddress(address, byAddress);
 }

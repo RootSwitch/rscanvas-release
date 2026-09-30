@@ -5,6 +5,7 @@
 // belong somewhere a later slice can reuse rather than copy.
 
 import type http from 'node:http';
+import zlib from 'node:zlib';
 import { authorize, type Action, type Principal, type Resource } from '../auth/authorize.ts';
 
 /** Bodies are tiny here (a username and a password). Anything larger is a probe. */
@@ -124,7 +125,10 @@ export function securityHeaders(tls: boolean): Record<string, string> {
 }
 
 export function sendJson(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-    const buf = Buffer.from(JSON.stringify(body), 'utf8');
+    writeJson(res, status, Buffer.from(JSON.stringify(body), 'utf8'), headers);
+}
+
+function writeJson(res: http.ServerResponse, status: number, buf: Buffer, headers: Record<string, string>): void {
     res.writeHead(status, {
         'content-type': 'application/json; charset=utf-8',
         'content-length': buf.length,
@@ -136,6 +140,57 @@ export function sendJson(res: http.ServerResponse, status: number, body: unknown
         ...headers,
     });
     res.end(buf);
+}
+
+/**
+ * GZIP FOR THE BIG LISTS (2026-09-30). The alert list and the device roster
+ * are about 1.4 MB each at 30,000 entities, refreshed every 10 s by a page
+ * showing them, and they compress to 4-5%: measured on the lab box's own
+ * answers, 1,378,855 B of alerts to 59,888 and 1,445,297 B of roster to
+ * 76,897 at level 3, in under 3 ms. Level 6 saves another 10 KB for three
+ * times the time; brotli another 15 KB for six times. Level 3 it is.
+ *
+ * ON THE THREAD POOL, NOT THE PAGE THREAD: zlib.gzip's callback form runs
+ * the deflate in libuv's pool, so the main thread pays only the
+ * serialisation it already paid. Below GZIP_MIN_BYTES an answer goes as it
+ * is - a short list is not worth the trip.
+ *
+ * Opt-in per route, and only for answers that hold no secret. Compressing a
+ * response that mixes a secret with text an attacker can influence is the
+ * BREACH shape; these two carry device-reported strings and no token,
+ * password or key, and a route that ever does must not use this.
+ */
+export const GZIP_MIN_BYTES = 16 * 1024;
+const GZIP_LEVEL = 3;
+
+/** Whether an Accept-Encoding header admits gzip (q=0 refuses it; * is not taken as a yes). */
+export function acceptsGzip(header: string | string[] | undefined): boolean {
+    const v = Array.isArray(header) ? header.join(',') : header ?? '';
+    for (const part of v.split(',')) {
+        const [coding, ...params] = part.split(';').map((s) => s.trim().toLowerCase());
+        if (coding !== 'gzip' && coding !== 'x-gzip') continue;
+        const q = params.find((p) => p.startsWith('q='));
+        return q === undefined || Number(q.slice(2)) > 0;
+    }
+    return false;
+}
+
+export function sendJsonGzip(
+    req: http.IncomingMessage, res: http.ServerResponse, status: number, body: unknown,
+    headers: Record<string, string> = {},
+): void {
+    const buf = Buffer.from(JSON.stringify(body), 'utf8');
+    const base = { vary: 'accept-encoding', ...headers };
+    if (buf.length < GZIP_MIN_BYTES || !acceptsGzip(req.headers['accept-encoding'])) {
+        writeJson(res, status, buf, base);
+        return;
+    }
+    zlib.gzip(buf, { level: GZIP_LEVEL }, (err, gz) => {
+        // The client can leave while the pool works; there is no one to answer.
+        if (res.destroyed || res.headersSent) return;
+        if (err) { writeJson(res, status, buf, base); return; }
+        writeJson(res, status, gz, { ...base, 'content-encoding': 'gzip' });
+    });
 }
 
 /**

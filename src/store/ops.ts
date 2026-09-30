@@ -959,6 +959,13 @@ export const GRID_DEFAULT_FIELDS: readonly string[] = ['cpu', 'mem', 'top', 'upt
  */
 export const UI_PAGE_CAP = 5000;
 
+/**
+ * The device page's entity cap: interfaces and sensors of ONE device. Hit only
+ * by a chassis-sized agent; when it is, the route says so (entitiesCapped)
+ * rather than letting the page count what arrived as if it were all.
+ */
+export const UI_DEVICE_ENTITY_CAP = 500;
+
 export const deviceStatusSql = (a: string): string => `
     CASE WHEN NOT ${a}.snmp_enabled
               THEN CASE ${a}.reach_state
@@ -1135,6 +1142,8 @@ export const OPS = {
         id: string; name: string; host: string; snmp_port: number; snmp_version: string;
         credential_ref: string; poll_interval_s: number; consecutive_failures: number;
         last_poll_ts: Date | null;
+        /** Slice 56: when the last poll was DUE - the schedule's grid (src/collector/schedule.ts). */
+        poll_anchor_ts: Date | null;
         /** Last ATTEMPT at the slow-changing inventory read; null = never. */
         inventory_ts: Date | null;
     }>('collector', `
@@ -1144,6 +1153,7 @@ export const OPS = {
         -- address. host() returns just the address.
         SELECT id::text AS id, name, host(host) AS host, snmp_port, snmp_version,
                credential_ref, poll_interval_s, consecutive_failures, last_poll_ts,
+               poll_anchor_ts,
                -- One more column on a row already being read, so the caller
                -- can decide whether the inventory refresh is due.
                inventory_ts
@@ -1162,9 +1172,13 @@ export const OPS = {
            -- without this they come back due on every tick and occupy
            -- candidate slots that cannot be used.
            AND NOT (id = ANY($3::bigint[]))
+           -- Due one interval after the schedule's anchor (slice 56), not
+           -- after the last poll finished: that drifted by a poll's length
+           -- and a tick every cycle. Never polled (or reset by an address
+           -- change) is due at once, and first in line.
            AND (last_poll_ts IS NULL
-                OR last_poll_ts <= now() - (poll_interval_s || ' seconds')::interval)
-         ORDER BY last_poll_ts NULLS FIRST
+                OR coalesce(poll_anchor_ts, last_poll_ts) <= now() - (poll_interval_s || ' seconds')::interval)
+         ORDER BY last_poll_ts IS NOT NULL, coalesce(poll_anchor_ts, last_poll_ts)
          LIMIT $1`, [limit, downAfter, busy]),
 
     /**
@@ -1242,9 +1256,14 @@ export const OPS = {
         snmpRttMs: number | null = null,
         // Slice 32: the device-type guess from sysDescr, for wall icons.
         stencil: string | null = null,
+        // Slice 56: the schedule's anchor for this poll, from pollTiming()
+        // (src/collector/schedule.ts). A caller that has none stamps now(),
+        // which is the old finish-anchored behaviour.
+        pollAnchor: Date | null = null,
     ) => laneQuery('collector', `
         UPDATE devices
            SET last_poll_ts = now(),
+               poll_anchor_ts = coalesce($15::timestamptz, now()),
                poll_lag_ms  = $8,
                cpu_pct       = CASE WHEN $9::jsonb IS NULL THEN cpu_pct ELSE ($9::jsonb->>'cpu_pct')::real END,
                mem_pct       = CASE WHEN $9::jsonb IS NULL THEN mem_pct ELSE ($9::jsonb->>'mem_pct')::real END,
@@ -1283,7 +1302,7 @@ export const OPS = {
          WHERE id = $1::bigint`,
         [id, ok, sysName, sysDescr, sysLocation, inventoryTried, cpuModel, pollLagMs,
             summary === null ? null : JSON.stringify(summary), uptimeS, cpuCores, ramKb,
-            snmpRttMs, stencil]),
+            snmpRttMs, stencil, pollAnchor]),
 
     /**
      * Create a PING-ONLY device (slice 35).
@@ -3039,6 +3058,40 @@ export const OPS = {
          ORDER BY 1 NULLS LAST`, [axis]),
 
     /**
+     * The Dashboard's health by group (2026-09-28, operator): every location
+     * and every application with its devices up and down, so the page says
+     * how the whole environment stands below the alerts. Both axes in ONE
+     * pass (GROUPING SETS), counted here rather than in the page from the
+     * device list, because that list stops at UI_PAGE_CAP and the page would
+     * quietly undercount past it.
+     *
+     * Status is deviceStatusSql, the ONE definition the device list shows.
+     * The devices counted are the device list's (enabled), without the
+     * transient ones: a laptop that went home is not a site going dark.
+     * Pending and unknown are counted, not dropped - the device list's header
+     * rule (E10), a ladder that sums to its denominator. No location or
+     * application is its own group, NULL, sorted last: dropping the untagged
+     * reports better coverage than exists.
+     */
+    groupHealth: () =>
+        laneQuery<{ axis: 'location' | 'application'; value: string | null; up: number; down: number; other: number }>('interactive', `
+        WITH s AS (
+            SELECT nullif(btrim(d.location), '') AS location,
+                   nullif(btrim(d.application), '') AS application,
+                   ${deviceStatusSql('d')} AS st
+              FROM devices d
+             WHERE d.enabled = true AND d.transient IS NOT TRUE
+        )
+        SELECT CASE WHEN GROUPING(location) = 0 THEN 'location' ELSE 'application' END AS axis,
+               CASE WHEN GROUPING(location) = 0 THEN location ELSE application END AS value,
+               count(*) FILTER (WHERE st = 'up')::int AS up,
+               count(*) FILTER (WHERE st = 'down')::int AS down,
+               count(*) FILTER (WHERE st IS DISTINCT FROM 'up' AND st IS DISTINCT FROM 'down')::int AS other
+          FROM s
+         GROUP BY GROUPING SETS ((location), (application))
+         ORDER BY 1 DESC, 2 NULLS LAST`),
+
+    /**
      * WHAT RETENTION WOULD DO RIGHT NOW - asked of the function that will
      * actually do it, never recomputed alongside it.
      *
@@ -3670,10 +3723,14 @@ export const OPS = {
      *  Carries the maintenance flag because the immediate-dispatch path in
      *  jobs.ts must consult the same gate the owed queues apply - see the
      *  comment there for why the gap only shows on a LIVE raise. */
-    getAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean }>('jobs',
+    getAlert: (id: string) => laneQuery<AlertRecord & {
+        in_maintenance: boolean; under_policy: boolean; in_group: boolean; group_overlap: boolean;
+    }>('jobs',
         `SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
-               ${ALERT_UNDER_POLICY} AS under_policy
+               ${ALERT_UNDER_POLICY} AS under_policy,
+               ${ALERT_IN_GROUP_OUTAGE} AS in_group,
+               ${ALERT_GROUP_OVERLAP} AS group_overlap
           FROM alerts WHERE id = $1::bigint`, [id]),
 
     /**
@@ -4169,9 +4226,8 @@ export const OPS = {
         WITH settled AS (
             UPDATE alerts SET notified_clear = true
              WHERE state = 'cleared' AND NOT notified_clear AND NOT notified_raise
-               AND alerts.host IS NOT NULL
                AND cleared_ts > now() - interval '1 day'
-               AND EXISTS (
+               AND ((alerts.host IS NOT NULL AND EXISTS (
                    SELECT 1 FROM maintenance_windows w
                     WHERE alerts.cleared_ts >= w.starts_ts
                       AND alerts.cleared_ts < w.ends_ts
@@ -4181,7 +4237,13 @@ export const OPS = {
                                SELECT 1 FROM devices d
                                 WHERE d.name = alerts.host
                                   AND w.target = CASE w.scope WHEN 'location' THEN d.location
-                                                              ELSE d.application END))))
+                                                              ELSE d.application END)))))
+                 -- A group alert has no host; it is its group's (slice 55).
+                 OR (alerts.kind = 'group-down' AND EXISTS (
+                   SELECT 1 FROM maintenance_windows w
+                    WHERE alerts.cleared_ts >= w.starts_ts
+                      AND alerts.cleared_ts < w.ends_ts
+                      AND (w.scope = 'all' OR alerts.alert_key = 'group:' || w.scope || ':' || w.target))))
             RETURNING 1
         ) SELECT count(*)::text AS n FROM settled`),
 
@@ -4239,6 +4301,90 @@ export const OPS = {
             RETURNING 1
         ) SELECT count(*)::text AS n FROM settled`),
 
+    // --- group alerts (slice 55) ------------------------------------------------
+
+    /**
+     * Settle the clears of member alerts a group alert stood in for: a
+     * device-down whose raise was held under an open group alert and never
+     * told, and whose outage overlapped the group's. The group's own
+     * notification named it and the group's clear closes it; a "resolved"
+     * for a raise nobody received is noise with a false implication - the
+     * window and policy settles' reasoning. Matched on the SPAN, like the
+     * window form, because the group has usually cleared by the time the
+     * member's clear is looked at. A member whose raise WAS told (it went
+     * down before the group tripped, or was still down when the group
+     * cleared and was sent then) keeps its clear.
+     */
+    settleGroupCoveredClears: () => laneQuery<{ n: string }>('jobs', `
+        WITH settled AS (
+            UPDATE alerts SET notified_clear = true
+             WHERE state = 'cleared' AND NOT notified_clear AND NOT notified_raise
+               AND cleared_ts > now() - interval '1 day'
+               AND ${ALERT_GROUP_OVERLAP}
+            RETURNING 1
+        ) SELECT count(*)::text AS n FROM settled`),
+
+    /**
+     * Every opted-in group with its counts, for the scan. The devices
+     * counted are the ones that can raise device-down: enabled, not
+     * transient, not muted. Status is deviceStatusSql, the one definition;
+     * the share is taken over up + down by groupTripped (alerts/groups.ts).
+     * Groups are compared trimmed, as the Dashboard counts them.
+     */
+    groupAlertCounts: () => laneQuery<{
+        axis: string; value: string; enabled: boolean; threshold_pct: number; min_down: number;
+        up: number; down: number;
+    }>('alerts', `
+        WITH s AS (
+            SELECT nullif(btrim(d.location), '') AS location,
+                   nullif(btrim(d.application), '') AS application,
+                   ${deviceStatusSql('d')} AS st
+              FROM devices d
+             WHERE d.enabled = true AND d.transient IS NOT TRUE AND d.alerts_muted IS NOT TRUE
+        )
+        SELECT r.axis, r.value, r.enabled, r.threshold_pct, r.min_down,
+               count(*) FILTER (WHERE s.st = 'up')::int AS up,
+               count(*) FILTER (WHERE s.st = 'down')::int AS down
+          FROM group_alert_rules r
+          LEFT JOIN s ON (r.axis = 'location' AND s.location = r.value)
+                      OR (r.axis = 'application' AND s.application = r.value)
+         GROUP BY r.id, r.axis, r.value, r.enabled, r.threshold_pct, r.min_down`),
+
+    /**
+     * One group's members, with their status and the group's rule: the list
+     * a group notification names, and the alert page shows. Lane chosen by
+     * the caller - the dispatch runs on jobs, the page on interactive.
+     */
+    groupMembers: (lane: 'jobs' | 'interactive', axis: string, value: string) => laneQuery<{
+        name: string; st: string; min_down: number | null;
+    }>(lane, `
+        SELECT d.name, ${deviceStatusSql('d')} AS st,
+               (SELECT r.min_down FROM group_alert_rules r WHERE r.axis = $1 AND r.value = $2) AS min_down
+          FROM devices d
+         WHERE d.enabled = true AND d.transient IS NOT TRUE AND d.alerts_muted IS NOT TRUE
+           AND (CASE WHEN $1 = 'location' THEN nullif(btrim(d.location), '')
+                     ELSE nullif(btrim(d.application), '') END) = $2
+         ORDER BY d.name`, [axis, value]),
+
+    groupAlertRules: () => laneQuery<{
+        axis: string; value: string; enabled: boolean; threshold_pct: number; min_down: number;
+        updated_by: string | null; updated_ts: Date;
+    }>('interactive', `
+        SELECT axis, value, enabled, threshold_pct, min_down, updated_by, updated_ts
+          FROM group_alert_rules ORDER BY axis, value`),
+
+    /** One group's rule, created or changed; unticking keeps the row. */
+    setGroupAlertRule: (
+        axis: string, value: string, enabled: boolean, thresholdPct: number, minDown: number, by: string,
+    ) => laneQuery<{ axis: string; value: string; enabled: boolean; threshold_pct: number; min_down: number }>('interactive', `
+        INSERT INTO group_alert_rules (axis, value, enabled, threshold_pct, min_down, updated_by)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (axis, value) DO UPDATE
+           SET enabled = EXCLUDED.enabled, threshold_pct = EXCLUDED.threshold_pct,
+               min_down = EXCLUDED.min_down, updated_by = EXCLUDED.updated_by, updated_ts = now()
+        RETURNING axis, value, enabled, threshold_pct, min_down`,
+        [axis, value, enabled, thresholdPct, minDown, by]),
+
     // --- transient (slice 25, quiet 2) ----------------------------------------
 
     setDeviceTransient: (name: string, transient: boolean) => laneQuery<{ name: string }>(
@@ -4254,7 +4400,8 @@ export const OPS = {
         `SELECT ${ALERT_COLUMNS} FROM alerts
           WHERE state = 'active' AND NOT notified_raise
             AND NOT ${ALERT_IN_MAINTENANCE}
-            AND NOT ${ALERT_UNDER_POLICY}`),
+            AND NOT ${ALERT_UNDER_POLICY}
+            AND NOT ${ALERT_IN_GROUP_OUTAGE}`),
     // The clear side gates on the same predicate: a clear withheld during a
     // window is still owed afterwards when its raise WAS delivered; clears
     // of never-delivered raises are settled silently by settleInWindowClears
@@ -4282,7 +4429,8 @@ export const OPS = {
           WHERE state = 'active' AND notified_raise
             AND escalated_ts IS NOT NULL AND NOT notified_escalate
             AND NOT ${ALERT_IN_MAINTENANCE}
-            AND NOT ${ALERT_UNDER_POLICY}`),
+            AND NOT ${ALERT_UNDER_POLICY}
+            AND NOT ${ALERT_IN_GROUP_OUTAGE}`),
 
     /**
      * The renotify generator's queue (DECISIONS-2026-09-01 ruling 2). CRIT
@@ -4305,7 +4453,8 @@ export const OPS = {
                          COALESCE(renotified_ts, raised_ts))
                 < now() - make_interval(hours => $1::int)
             AND NOT ${ALERT_IN_MAINTENANCE}
-            AND NOT ${ALERT_UNDER_POLICY}`, [hours]),
+            AND NOT ${ALERT_UNDER_POLICY}
+            AND NOT ${ALERT_IN_GROUP_OUTAGE}`, [hours]),
 
     /**
      * The flap report (easy-win E11): raise/clear cycles per key over the
@@ -4436,10 +4585,11 @@ export const OPS = {
     // dashboard must never compete with the machinery it is watching.
 
     /** Open alerts for the UI, worst first, newest within a severity. */
-    uiOpenAlerts: (limit: number = UI_PAGE_CAP) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean }>('interactive', `
+    uiOpenAlerts: (limit: number = UI_PAGE_CAP) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean }>('interactive', `
         SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
-               ${ALERT_UNDER_POLICY} AS under_policy
+               ${ALERT_UNDER_POLICY} AS under_policy,
+               ${ALERT_IN_GROUP_OUTAGE} AS in_group
           FROM alerts
          WHERE state != 'cleared'
          ORDER BY CASE severity WHEN 'crit' THEN 0 ELSE 1 END,
@@ -4481,10 +4631,11 @@ export const OPS = {
      * screen, or the operator's click lands on an error at exactly the
      * moment the thing they were watching resolved.
      */
-    uiAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean }>('interactive', `
+    uiAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean }>('interactive', `
         SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
-               ${ALERT_UNDER_POLICY} AS under_policy
+               ${ALERT_UNDER_POLICY} AS under_policy,
+               ${ALERT_IN_GROUP_OUTAGE} AS in_group
           FROM alerts WHERE id = $1::bigint`, [id]),
 
     /**
@@ -4576,8 +4727,16 @@ export const OPS = {
           FROM entities e
           JOIN devices d ON d.id = e.device_id
          WHERE d.name = $1
-         ORDER BY e.snmp_index NULLS LAST, e.name
-         LIMIT 500`, [deviceName]),
+         -- SENSORS FIRST, THEN INTERFACES BY NUMBER (2026-09-30). snmp_index
+         -- is text, so the old ORDER BY listed 1, 10, 100, 101 ... 11, 110 ...
+         -- 2, 20 - and on a device past the page's 100-row table that chose
+         -- an arbitrary hundred. Sensors lead because the cap below counts
+         -- them too, and a chassis's 600 ports must not push its four
+         -- sensors off the end; the page splits the two by kind anyway.
+         ORDER BY (e.kind = 'if'),
+                  CASE WHEN e.snmp_index ~ '^[0-9]{1,18}$' THEN e.snmp_index::bigint END NULLS LAST,
+                  e.snmp_index NULLS LAST, e.name
+         LIMIT ${UI_DEVICE_ENTITY_CAP}`, [deviceName]),
 
     /**
      * One entity's history, RAW samples bucketed - the recent view.
@@ -4703,7 +4862,11 @@ export const OPS = {
                    sum(least(1, coalesce(coalesce(h.n0, h.n) * d.poll_interval_s / 3600.0, 0)))
                        FILTER (WHERE h.hour_ts < $2) AS p_cov_h
               FROM samples_hourly h
-              JOIN entities e ON e.id = h.entity_id AND e.kind = 'if'
+              -- Tracked interfaces only: an untracked one is not watched, and
+              -- until 2026-09-30 the poll stored its history anyway (poll.ts,
+              -- "UNTRACKED MEANS NO HISTORY"), which put an access point's
+              -- virtual radio in the top errors.
+              JOIN entities e ON e.id = h.entity_id AND e.kind = 'if' AND e.tracked
               JOIN devices d ON d.id = e.device_id
              WHERE h.hour_ts >= $1 AND h.hour_ts < $3
              GROUP BY h.entity_id
@@ -5172,7 +5335,7 @@ const ALERT_COLUMNS = `id::text AS id, alert_key, state, severity, kind, host, c
  * any scope - 'all' included - can ever match one. If the monitor itself
  * dies at 02:30, the operator still hears about it.
  */
-const ALERT_IN_MAINTENANCE = `(alerts.host IS NOT NULL AND EXISTS (
+const ALERT_IN_MAINTENANCE = `((alerts.host IS NOT NULL AND EXISTS (
     SELECT 1 FROM maintenance_windows w
      WHERE now() >= w.starts_ts AND now() < w.ends_ts
        AND (w.scope = 'all'
@@ -5181,7 +5344,14 @@ const ALERT_IN_MAINTENANCE = `(alerts.host IS NOT NULL AND EXISTS (
                 SELECT 1 FROM devices d
                  WHERE d.name = alerts.host
                    AND w.target = CASE w.scope WHEN 'location' THEN d.location
-                                               ELSE d.application END)))))`;
+                                               ELSE d.application END)))))
+  -- A GROUP alert (slice 55) has no host but is not a watchdog: it belongs to
+  -- its location or application, so a window on that group - or on
+  -- everything - holds it. Matched by its key, group:<scope>:<target>.
+  OR (alerts.kind = 'group-down' AND EXISTS (
+    SELECT 1 FROM maintenance_windows w
+     WHERE now() >= w.starts_ts AND now() < w.ends_ts
+       AND (w.scope = 'all' OR alerts.alert_key = 'group:' || w.scope || ':' || w.target))))`;
 
 // Quiet 1 (slice 25): a STANDING policy - the alert raises, shows, and is
 // never delivered while a covering row exists. Same shape as the window
@@ -5190,11 +5360,45 @@ const ALERT_IN_MAINTENANCE = `(alerts.host IS NOT NULL AND EXISTS (
 // cancelled window does. The watchdog is exempt structurally (host IS NULL),
 // which matters more here than for windows - a policy has no expiry to save
 // you from having silenced the smoke detector.
-const ALERT_UNDER_POLICY = `(alerts.host IS NOT NULL AND EXISTS (
+const ALERT_UNDER_POLICY = `((alerts.host IS NOT NULL AND EXISTS (
     SELECT 1 FROM notify_policy p
      WHERE (p.scope = 'device' AND p.target = alerts.host)
         OR (p.scope IN ('location', 'application') AND EXISTS (
             SELECT 1 FROM devices d
              WHERE d.name = alerts.host
                AND p.target = CASE p.scope WHEN 'location' THEN d.location
-                                           ELSE d.application END))))`;
+                                           ELSE d.application END))))
+  -- A group alert under a policy for its own group (slice 55).
+  OR (alerts.kind = 'group-down' AND EXISTS (
+    SELECT 1 FROM notify_policy p WHERE alerts.alert_key = 'group:' || p.scope || ':' || p.target)))`;
+
+/**
+ * Is this device-down alert's device in a group whose GROUP alert is open?
+ * (slice 55, the operator's amendment of ruling 7, 2026-09-29)
+ *
+ * The member still raises and shows; this holds its DELIVERY - raise,
+ * escalate, renotify - the way a window or a policy does, and it is
+ * evaluated live for the same reason: when the group alert clears, a member
+ * still active is owed on the next pass and sent, which is what the
+ * operator ruled ("yes, email them then"). Pending counts as open: a group
+ * breaches on the scan that first sees its devices down, and the members
+ * raise a scan or two later, so their raises land under a group that is
+ * already pending - and if the group never raises, they are owed at once.
+ */
+const ALERT_IN_GROUP_OUTAGE = `(alerts.kind = 'device-down' AND alerts.host IS NOT NULL AND EXISTS (
+    SELECT 1 FROM devices d
+      JOIN alerts g ON g.alert_key IN ('group:location:' || d.location, 'group:application:' || d.application)
+     WHERE d.name = alerts.host AND g.kind = 'group-down'
+       AND g.state IN ('pending', 'active', 'clearing')))`;
+
+/**
+ * Did this device-down alert's outage overlap a group alert of its group?
+ * The SPAN form of the gate above, for clears: by the time a member's clear
+ * is looked at, the group has usually cleared too.
+ */
+const ALERT_GROUP_OVERLAP = `(alerts.kind = 'device-down' AND alerts.host IS NOT NULL AND EXISTS (
+    SELECT 1 FROM devices d
+      JOIN alerts g ON g.alert_key IN ('group:location:' || d.location, 'group:application:' || d.application)
+     WHERE d.name = alerts.host AND g.kind = 'group-down'
+       AND g.first_breach_ts <= COALESCE(alerts.cleared_ts, now())
+       AND COALESCE(g.cleared_ts, now()) >= alerts.first_breach_ts))`;

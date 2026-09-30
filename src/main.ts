@@ -23,7 +23,7 @@ import { CONFIG } from './config.ts';
 import { startHeartbeat, type HeartbeatStats } from './heartbeat.ts';
 import { installSafetyNet } from './safety.ts';
 import {
-    OPS, GRID_FIELDS, GRID_DEFAULT_FIELDS, UI_PAGE_CAP, allLaneStates, closeAll,
+    OPS, GRID_FIELDS, GRID_DEFAULT_FIELDS, UI_PAGE_CAP, UI_DEVICE_ENTITY_CAP, allLaneStates, closeAll,
     type SearchFilters,
 } from './store/index.ts';
 import { currentResidency, DISKSTATS_AVAILABLE } from './residency.ts';
@@ -45,6 +45,7 @@ import { encrypt, decrypt, credentialStoreReady, CredentialKeyMissing } from './
 import { validateProfile, isPermittedEnvRef, type ProfileView } from './credentials/profiles.ts';
 import { loadRulesConfig } from './alerts/scan.ts';
 import { mergeOverrides } from './alerts/overrides.ts';
+import { GROUP_KIND, parseGroupKey } from './alerts/groups.ts';
 import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS } from './alerts/rules.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
@@ -57,7 +58,7 @@ import { serializeMetrics } from './health/metrics.ts';
 // can actually probe.
 import { SUPPORTED_CHECKS } from './collector/reach.ts';
 import {
-    sendJson, enforce, readJsonBody, readBodyOr400, containsNul, clientIp, inetOrNull, BODY_CAP_BULK, BODY_CAP_DOC, securityHeaders,
+    sendJson, sendJsonGzip, enforce, readJsonBody, readBodyOr400, containsNul, clientIp, inetOrNull, BODY_CAP_BULK, BODY_CAP_DOC, securityHeaders,
 } from './http/respond.ts';
 import * as authRoutes from './http/routes-auth.ts';
 import * as exportRoutes from './http/routes-export.ts';
@@ -76,13 +77,28 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const STARTED = Date.now();
 
 // The Dashboard's top lists (/api/dashboard) and the interface report.
-// Ten rows a list, as the operator's SolarWinds widgets had. The cache holds
-// one answer per window for a minute: the lists can only move when the hourly
-// rollup does, and every open Dashboard would otherwise repeat a fleet-wide
-// scan on the heavy lane. A report is capped at 50 interfaces and a year.
+// Ten rows a list, as the operator's SolarWinds widgets had. A report is
+// capped at 50 interfaces and a year.
+//
+// ONE ANSWER PER WINDOW PER ROLLUP HOUR (2026-09-30, the operator: "the only
+// thing that took any time was changing the Dashboard to different time
+// scales"). The lists read the hourly rollup and end at its frontier, so
+// the answer for a window cannot change until the frontier moves - once an
+// hour. The cache used to expire after a minute anyway, and every switch
+// after that recomputed a fleet-wide aggregate on the heavy lane: at 30,000
+// entities 1.1 s for a day and 3 s for a week, every time. It is now keyed
+// by the frontier hour, concurrent asks share one computation, and the
+// other windows are computed in the background as soon as anyone opens the
+// Dashboard, and again when the frontier moves - so a switch finds its
+// answer waiting. Background work stops a day after the last visit. A
+// device renamed mid-hour shows its new name at the next rollup.
 const DASHBOARD_TOP_N = 10;
-const DASHBOARD_CACHE_MS = 60_000;
-const dashboardCache = new Map<number, { at: number; body: unknown }>();
+const DASHBOARD_WARM_IDLE_MS = 24 * 3600_000;
+type DashboardAnswer = { ok: true; body: Record<string, unknown> } | { ok: false; reason: string };
+const dashboardCache = new Map<number, { hi: number; body: Record<string, unknown> }>();
+const dashboardInflight = new Map<string, Promise<DashboardAnswer>>();
+let dashboardLastAsked = 0;
+let dashboardWarming = false;
 const REPORT_MAX_INTERFACES = 50;
 const REPORT_MAX_DAYS = 366;
 
@@ -1049,7 +1065,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             // someone retunes the config. Same computed-not-typed rule the
             // derived constants live under: the denominator ships from the
             // config the machine itself reads.
-            sendJson(res, 200, {
+            sendJsonGzip(req, res, 200, {
                 ok: true,
                 open: open.rows,
                 flaps,
@@ -1158,7 +1174,22 @@ const server = createWebServer(tlsPair, (req, res) => {
                     }
                 } catch { /* garnish - the page renders without it */ }
             }
-            sendJson(res, 200, { ok: true, alert: { ...a, ...provenance }, history: history.rows });
+            // A GROUP alert (slice 55) names its members as they stand now:
+            // the page is where an operator acts on "6 of 10 down", and the
+            // six are the answer to "which". Garnish like provenance - a
+            // refused lookup leaves the list off, never the page.
+            let group: Record<string, unknown> | null = null;
+            const gk = a.kind === GROUP_KIND ? parseGroupKey(a.alert_key) : null;
+            if (gk !== null) {
+                const m = await OPS.groupMembers('interactive', gk.axis, gk.value).catch(() => null);
+                if (m !== null && m.ok) {
+                    group = {
+                        axis: gk.axis, value: gk.value, minDown: m.rows[0]?.min_down ?? null,
+                        members: m.rows.map((x) => ({ name: x.name, status: x.st })),
+                    };
+                }
+            }
+            sendJson(res, 200, { ok: true, alert: { ...a, ...provenance, ...(group ? { group } : {}) }, history: history.rows });
             return;
         }
         if (path === '/api/devices' && method === 'GET') {
@@ -1175,7 +1206,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                     devCapped = total > devices.rows.length;
                 }
             }
-            sendJson(res, 200, { ok: true, devices: devices.rows, capped: devCapped, total });
+            sendJsonGzip(req, res, 200, { ok: true, devices: devices.rows, capped: devCapped, total });
             return;
         }
         // The U3 events lane (slice 9). Behind alerts.read because that is
@@ -1289,19 +1320,13 @@ const server = createWebServer(tlsPair, (req, res) => {
         // discards; top 10 CPU and memory - over 6 hours, 24 hours or 7 days,
         // each with the previous window's figure for the trend. Everyone who
         // can read devices can read this: it is the same data as the charts,
-        // summed. Cached per window for DASHBOARD_CACHE_MS, because every
-        // open Dashboard asks and the answer can only change when the hourly
-        // rollup moves - which it does once an hour.
+        // summed. One answer per window per rollup hour, computed once and
+        // warmed in the background (DASHBOARD_WARM_IDLE_MS says why).
         if (path === '/api/dashboard' && method === 'GET') {
             if (!enforce(res, principal, 'devices.read')) return;
             const hours = parseWindowHours(url.searchParams.get('window'));
             if (hours === null) {
                 sendJson(res, 400, { ok: false, detail: `window must be one of ${DASHBOARD_WINDOWS.join(', ')} hours` });
-                return;
-            }
-            const cached = dashboardCache.get(hours);
-            if (cached !== undefined && Date.now() - cached.at < DASHBOARD_CACHE_MS) {
-                sendJson(res, 200, cached.body);
                 return;
             }
             const f = await OPS.rollupFrontier();
@@ -1312,52 +1337,14 @@ const server = createWebServer(tlsPair, (req, res) => {
                     detail: 'the hourly rollup has not completed an hour yet - the lists appear after it does' });
                 return;
             }
-            const H = 3600_000;
-            const hi = new Date(Math.floor(new Date(through).getTime() / H) * H);
-            const lo = new Date(hi.getTime() - hours * H);
-            const prevLo = new Date(lo.getTime() - hours * H);
-            const t0 = performance.now();
-            const [ifs, sens] = await Promise.all([
-                OPS.dashboardInterfaces(prevLo, lo, hi, DASHBOARD_TOP_N),
-                OPS.dashboardSensors(prevLo, lo, hi, DASHBOARD_TOP_N),
-            ]);
-            if (!ifs.ok || !sens.ok) {
-                const reason = !ifs.ok ? ifs.reason : !sens.ok ? sens.reason : '';
-                sendJson(res, 503, { ok: false, detail: `store refused (${reason})` });
-                return;
-            }
-            const ifRow = (r: (typeof ifs.rows)[number]) => ({
-                device: r.device, code: r.code, name: r.name, alias: r.alias,
-                speedBps: r.speed_bps === null ? null : Number(r.speed_bps),
-                inBytes: bytesFromHourlyBps(r.in_s), outBytes: bytesFromHourlyBps(r.out_s),
-                peakInBps: r.pk_in, peakOutBps: r.pk_out,
-                errors: countFromHourlyRate(r.err_s), discards: countFromHourlyRate(r.disc_s),
-                coverage: coverage(r.cov_h, hours),
-                // Per covered hour on each side, and none against a thin
-                // previous window (trend() says why).
-                trendIn: trend(r.in_s, r.p_in_s, r.cov_h, r.p_cov_h, hours),
-                trendOut: trend(r.out_s, r.p_out_s, r.cov_h, r.p_cov_h, hours),
-                trendErrs: trend(r.err_s === null && r.disc_s === null ? null : (r.err_s ?? 0) + (r.disc_s ?? 0),
-                    r.p_ed_s, r.cov_h, r.p_cov_h, hours),
-            });
-            const sensRow = (r: (typeof sens.rows)[number]) => ({
-                device: r.device, code: r.code, name: r.name,
-                meanPct: r.mean_pct, peakPct: r.peak_pct,
-                coverage: coverage(r.cov_h, hours),
-                trend: trend(r.mean_pct, r.p_mean_pct, null, r.p_cov_h, hours),
-            });
-            const body = {
-                ok: true,
-                window: { hours, from: lo.toISOString(), to: hi.toISOString() },
-                rx: ifs.rows.filter((r) => r.list === 'rx').map(ifRow),
-                tx: ifs.rows.filter((r) => r.list === 'tx').map(ifRow),
-                errs: ifs.rows.filter((r) => r.list === 'errs').map(ifRow),
-                cpu: sens.rows.filter((r) => r.list === 'cpu').map(sensRow),
-                mem: sens.rows.filter((r) => r.list === 'mem').map(sensRow),
-                ms: Math.round(performance.now() - t0),
-            };
-            dashboardCache.set(hours, { at: Date.now(), body });
-            sendJson(res, 200, body);
+            const hiMs = Math.floor(new Date(through).getTime() / 3600_000) * 3600_000;
+            dashboardLastAsked = Date.now();
+            const answer = await dashboardFor(hours, hiMs);
+            if (!answer.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${answer.reason})` }); return; }
+            sendJson(res, 200, answer.body);
+            // The windows not yet computed for this hour, in the background,
+            // so the next switch finds its answer waiting.
+            warmDashboards(hiMs);
             return;
         }
         // --- the interface traffic report (2026-09-25, operator) -------------
@@ -1416,6 +1403,59 @@ const server = createWebServer(tlsPair, (req, res) => {
             return;
         }
         // --- event alert rules (slice 10) ----------------------------------
+        // --- group alerts (slice 55) ------------------------------------------
+        //
+        // Every location and application with its counts, and the rule for
+        // each that has one (a rule for a group that no longer has devices is
+        // listed too, so it can be switched off). Read with the event rules'
+        // right; written with theirs.
+        if (path === '/api/group-alerts' && method === 'GET') {
+            if (!enforce(res, principal, 'alertrule.read')) return;
+            const [groups, rules] = await Promise.all([OPS.groupHealth(), OPS.groupAlertRules()]);
+            if (!groups.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${groups.reason})` }); return; }
+            if (!rules.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${rules.reason})` }); return; }
+            const byKey = new Map(rules.rows.map((r) => [JSON.stringify([r.axis, r.value]), r]));
+            const out: Array<Record<string, unknown>> = [];
+            for (const g of groups.rows) {
+                if (g.value === null) continue;   // "no location" is not a group a rule can name
+                const r = byKey.get(JSON.stringify([g.axis, g.value]));
+                byKey.delete(JSON.stringify([g.axis, g.value]));
+                out.push({
+                    axis: g.axis, value: g.value, up: g.up, down: g.down, other: g.other,
+                    enabled: r?.enabled ?? false, thresholdPct: r?.threshold_pct ?? 50, minDown: r?.min_down ?? 3,
+                    hasRule: r !== undefined,
+                });
+            }
+            for (const r of byKey.values()) {
+                out.push({
+                    axis: r.axis, value: r.value, up: 0, down: 0, other: 0,
+                    enabled: r.enabled, thresholdPct: r.threshold_pct, minDown: r.min_down, hasRule: true, gone: true,
+                });
+            }
+            sendJson(res, 200, { ok: true, groups: out });
+            return;
+        }
+        if (path === '/api/group-alerts' && method === 'POST') {
+            if (!enforce(res, principal, 'alertrule.write')) return;
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
+            const axis = body.axis === 'location' || body.axis === 'application' ? body.axis : null;
+            const value = typeof body.value === 'string' ? body.value.trim() : '';
+            const pct = Number(body.thresholdPct);
+            const minDown = Number(body.minDown);
+            if (axis === null) { sendJson(res, 400, { ok: false, detail: 'axis must be location or application' }); return; }
+            if (value === '' || value.length > 200) { sendJson(res, 400, { ok: false, detail: 'value must name a group (1 to 200 characters)' }); return; }
+            if (!Number.isInteger(pct) || pct < 1 || pct > 100) { sendJson(res, 400, { ok: false, detail: 'thresholdPct must be a whole percent, 1 to 100' }); return; }
+            if (!Number.isInteger(minDown) || minDown < 1 || minDown > 100000) { sendJson(res, 400, { ok: false, detail: 'minDown must be a whole number of devices, at least 1' }); return; }
+            const enabled = body.enabled === true;
+            const w = await OPS.setGroupAlertRule(axis, value, enabled, pct, minDown, principal.kind === 'user' ? principal.username : 'unknown');
+            if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+            await auth.audit(principal, 'grouprule.set', `${axis}:${value}`,
+                { enabled, thresholdPct: pct, minDown }, inetOrNull(clientIp(req)));
+            sendJson(res, 200, { ok: true, rule: w.rows[0] });
+            return;
+        }
+
         if (path === '/api/alert-rules' && method === 'GET') {
             if (!enforce(res, principal, 'alertrule.read')) return;
             const rules = await OPS.listEventRules();
@@ -1852,6 +1892,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             const probes = Number(availRow?.probes ?? 0);
             sendJson(res, 200, {
                 ok: true, device: name, entities, ifRuleDefaults,
+                entitiesCapped: rows.rows.length >= UI_DEVICE_ENTITY_CAP,
                 availability24h: probes > 0
                     ? { probes, misses: Number(availRow?.misses ?? 0) }
                     : null,
@@ -3910,6 +3951,21 @@ const server = createWebServer(tlsPair, (req, res) => {
             sendJson(res, 200, { ok: true, axis, groups: r.rows });
             return;
         }
+        if (path === '/api/dashboard/groups' && method === 'GET') {
+            // The Dashboard's health by location and application: live, on
+            // the interactive lane, fetched with the page's 10 s refresh -
+            // not the top-10 lists' cached heavy-lane answer, because up and
+            // down move between rollups.
+            if (!enforce(res, principal, 'devices.read')) return;
+            const r = await OPS.groupHealth();
+            if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            sendJson(res, 200, {
+                ok: true,
+                locations: r.rows.filter((g) => g.axis === 'location'),
+                applications: r.rows.filter((g) => g.axis === 'application'),
+            });
+            return;
+        }
 
         // --- boards and capability tokens (slice 8 / U5) -----------------------
         //
@@ -3931,6 +3987,9 @@ const server = createWebServer(tlsPair, (req, res) => {
             sendJson(res, 200, {
                 ok: true, boards: r.rows,
                 gridFields: GRID_FIELDS, gridDefaults: GRID_DEFAULT_FIELDS,
+                // Whether the page offers the hand-placed layout controls
+                // (BOARDS_MANUAL_LAYOUT, config.ts says why it is off).
+                manualLayout: CONFIG.boardsManualLayout,
             });
             return;
         }
@@ -3980,6 +4039,12 @@ const server = createWebServer(tlsPair, (req, res) => {
                     const wrote = await OPS.rawSetBoardDoc(String(newId), JSON.stringify({ shapes }));
                     if (wrote.ok) placed = shapes.length;
                 }
+                // BORN LAID OUT (2026-09-30): a generated board is an
+                // automatic glance grid from its first minute - columns
+                // fitted to each display's screen, the default fields -
+                // rather than a set of coordinates that waited for someone
+                // to find the grid editor. The grid editor still changes it.
+                await OPS.setBoardGrid(String(newId), 0, JSON.stringify(GRID_DEFAULT_FIELDS));
             }
             await auth.audit(principal, 'board.create', name,
                 { collection, sourceAxis: axis, sourceValues: values, placed }, inetOrNull(clientIp(req)));
@@ -4389,6 +4454,100 @@ server.listen(CONFIG.httpPort, () => {
         log(`notification channels: ${channels.enabled.join(', ')}`);
     }
 });
+
+/** One window's lists for the rollup hour ending at hiMs, computed once. */
+async function computeDashboard(hours: number, hiMs: number): Promise<DashboardAnswer> {
+    const H = 3600_000;
+    const hi = new Date(hiMs);
+    const lo = new Date(hi.getTime() - hours * H);
+    const prevLo = new Date(lo.getTime() - hours * H);
+    const t0 = performance.now();
+    const [ifs, sens] = await Promise.all([
+        OPS.dashboardInterfaces(prevLo, lo, hi, DASHBOARD_TOP_N),
+        OPS.dashboardSensors(prevLo, lo, hi, DASHBOARD_TOP_N),
+    ]);
+    if (!ifs.ok || !sens.ok) {
+        return { ok: false, reason: !ifs.ok ? ifs.reason : !sens.ok ? sens.reason : '' };
+    }
+    const ifRow = (r: (typeof ifs.rows)[number]) => ({
+        device: r.device, code: r.code, name: r.name, alias: r.alias,
+        speedBps: r.speed_bps === null ? null : Number(r.speed_bps),
+        inBytes: bytesFromHourlyBps(r.in_s), outBytes: bytesFromHourlyBps(r.out_s),
+        peakInBps: r.pk_in, peakOutBps: r.pk_out,
+        errors: countFromHourlyRate(r.err_s), discards: countFromHourlyRate(r.disc_s),
+        coverage: coverage(r.cov_h, hours),
+        // Per covered hour on each side, and none against a thin
+        // previous window (trend() says why).
+        trendIn: trend(r.in_s, r.p_in_s, r.cov_h, r.p_cov_h, hours),
+        trendOut: trend(r.out_s, r.p_out_s, r.cov_h, r.p_cov_h, hours),
+        trendErrs: trend(r.err_s === null && r.disc_s === null ? null : (r.err_s ?? 0) + (r.disc_s ?? 0),
+            r.p_ed_s, r.cov_h, r.p_cov_h, hours),
+    });
+    const sensRow = (r: (typeof sens.rows)[number]) => ({
+        device: r.device, code: r.code, name: r.name,
+        meanPct: r.mean_pct, peakPct: r.peak_pct,
+        coverage: coverage(r.cov_h, hours),
+        trend: trend(r.mean_pct, r.p_mean_pct, null, r.p_cov_h, hours),
+    });
+    const body = {
+        ok: true,
+        window: { hours, from: lo.toISOString(), to: hi.toISOString() },
+        rx: ifs.rows.filter((r) => r.list === 'rx').map(ifRow),
+        tx: ifs.rows.filter((r) => r.list === 'tx').map(ifRow),
+        errs: ifs.rows.filter((r) => r.list === 'errs').map(ifRow),
+        cpu: sens.rows.filter((r) => r.list === 'cpu').map(sensRow),
+        mem: sens.rows.filter((r) => r.list === 'mem').map(sensRow),
+        ms: Math.round(performance.now() - t0),
+    };
+    return { ok: true, body };
+}
+
+/**
+ * The answer for a window at this rollup hour: cached, or being computed
+ * (join it), or computed now. A refusal is not cached - the next ask tries
+ * again.
+ */
+function dashboardFor(hours: number, hiMs: number): Promise<DashboardAnswer> {
+    const cached = dashboardCache.get(hours);
+    if (cached !== undefined && cached.hi === hiMs) return Promise.resolve({ ok: true, body: cached.body });
+    const key = `${hours}@${hiMs}`;
+    const running = dashboardInflight.get(key);
+    if (running !== undefined) return running;
+    const p = computeDashboard(hours, hiMs)
+        .then((r) => { if (r.ok) dashboardCache.set(hours, { hi: hiMs, body: r.body }); return r; })
+        .catch((err: unknown): DashboardAnswer => ({ ok: false, reason: (err as Error).message }))
+        .finally(() => dashboardInflight.delete(key));
+    dashboardInflight.set(key, p);
+    return p;
+}
+
+/**
+ * Compute, one after another, the windows not yet answered for this hour.
+ * One at a time on purpose: the heavy lane is four connections shared with
+ * charts, searches and reports, and a warm-up is never urgent.
+ */
+function warmDashboards(hiMs: number): void {
+    if (dashboardWarming) return;
+    dashboardWarming = true;
+    void (async () => {
+        for (const w of DASHBOARD_WINDOWS) {
+            if (dashboardCache.get(w)?.hi === hiMs) continue;
+            const r = await dashboardFor(w, hiMs);
+            if (!r.ok) { log(`dashboard warm-up of ${w} h refused (${r.reason}) - it computes on the next visit`); break; }
+        }
+    })().catch((err: unknown) => log('dashboard warm-up failed:', (err as Error).message))
+        .finally(() => { dashboardWarming = false; });
+}
+
+// When the rollup moves, the lists move with it: refill them in the
+// background while the Dashboard is in use (visited in the last day).
+setInterval(() => {
+    if (Date.now() - dashboardLastAsked > DASHBOARD_WARM_IDLE_MS) return;
+    OPS.rollupFrontier().then((f) => {
+        const through = f.ok ? f.rows[0]?.through_ts ?? null : null;
+        if (through !== null) warmDashboards(Math.floor(new Date(through).getTime() / 3600_000) * 3600_000);
+    }).catch(() => { /* the next minute tries again */ });
+}, 60_000).unref();
 
 // First-run bootstrap, then a session prune on a slow timer. Expired sessions
 // are already rejected on validation, so this is housekeeping rather than a

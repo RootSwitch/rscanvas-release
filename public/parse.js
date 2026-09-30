@@ -51,3 +51,49 @@ export function parseHosts(text) {
     // for one device, which reads as two devices.
     return [...new Set(out)];
 }
+
+/**
+ * The device list's filter box, read (2026-09-28). A plain word matches a
+ * device's name, address, location or application by substring - which is
+ * what makes "PAM" find both PAM Prod and PAM Dev. `location:<name>` and
+ * `application:<name>` match that group EXACTLY (ignoring case and the
+ * spaces around it), and an empty name matches the devices with none set.
+ *
+ * The exact form exists for the Dashboard's health tables, which open the
+ * device list on one group: as a substring, the location "Lab" matched every
+ * device named lab-node-..., so a click on Lab's 15 down listed 78.
+ *
+ * `transient:` and `muted:` (2026-09-29) list the devices declared so, and
+ * `transient:no` and `muted:no` the rest - the overview those declarations
+ * lacked, since each showed only on its own row. They are words of their
+ * own, anywhere in the box, and narrow whatever else it holds: "muted: PAM"
+ * is the muted devices of both PAM applications, "transient:
+ * location:Lab" the transient ones in Lab. They are taken out before the
+ * rest is read, so a group name with spaces in it still reads whole.
+ */
+const FLAG = /(^|\s)(transient|muted):(yes|no)?(?=\s|$)/gi;
+
+export function parseDeviceFilter(text) {
+    const flags = {};
+    const t = String(text ?? '').replace(FLAG, (_all, lead, name, value) => {
+        flags[name.toLowerCase()] = (value ?? 'yes').toLowerCase() === 'yes';
+        return lead;
+    }).trim();
+    const m = /^(location|application):(.*)$/i.exec(t);
+    if (m) return { kind: 'group', axis: m[1].toLowerCase(), value: m[2].trim().toLowerCase(), flags };
+    return { kind: 'text', q: t.toLowerCase(), flags };
+}
+
+/** Whether one device row passes a filter from parseDeviceFilter. */
+export function deviceMatches(d, f) {
+    const flags = f.flags ?? {};
+    if (flags.transient !== undefined && (d.transient === true) !== flags.transient) return false;
+    if (flags.muted !== undefined && (d.alerts_muted === true) !== flags.muted) return false;
+    if (f.kind === 'group') return String(d[f.axis] ?? '').trim().toLowerCase() === f.value;
+    const q = f.q;
+    return q === ''
+        || String(d.name ?? '').toLowerCase().includes(q)
+        || String(d.host ?? '').toLowerCase().includes(q)
+        || String(d.location ?? '').toLowerCase().includes(q)
+        || String(d.application ?? '').toLowerCase().includes(q);
+}

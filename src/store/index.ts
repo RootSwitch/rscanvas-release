@@ -48,6 +48,7 @@ export {
     GRID_FIELDS,
     GRID_DEFAULT_FIELDS,
     UI_PAGE_CAP,
+    UI_DEVICE_ENTITY_CAP,
     copyMessages,
     exportProbe,
     streamExportCsv,

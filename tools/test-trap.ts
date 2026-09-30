@@ -4,7 +4,8 @@
 //
 //   node tools/test-trap.ts
 
-import { renderTrap, deviceForAddress, v1TrapOid, renderValue } from '../src/syslog/trap.ts';
+import { renderTrap, deviceForAddress, hostForMessage, v1TrapOid, renderValue } from '../src/syslog/trap.ts';
+import { parse } from '../src/syslog/parse.ts';
 import { explainCommunityTimeout } from '../src/credentials/v3.ts';
 
 // House rule since test-walk: fail unless the run reaches its verdict.
@@ -71,6 +72,31 @@ console.log('\ndeviceForAddress - a trap belongs to a device only when the addre
     eq('several devices on one address: none, rather than a guess', deviceForAddress('198.18.50.1', map), null);
     eq('an unknown address: none', deviceForAddress('192.0.2.9', map), null);
     eq('no address: none', deviceForAddress(null, map), null);
+}
+
+console.log('\nhostForMessage - a syslog line with no hostname belongs to the device at its address:');
+{
+    const map = new Map<string, string[]>([
+        ['192.0.2.250', ['CRS317-Core']],
+        ['192.0.2.3', ['TrueNASMain']],
+        ['198.18.50.1', ['lab-node-16100', 'lab-node-16101']],
+    ]);
+    // The shape production stored on 2026-09-28 from a MikroTik whose remote
+    // logging action sends no syslog header: no PRI, no timestamp, no host.
+    const bare = parse('system,info,account user admin logged out from 192.0.2.10 via winbox', '192.0.2.250');
+    eq('a bare RouterOS line parses with no host', bare.host, null);
+    eq('and no severity (there is no PRI to read one from)', bare.severity, null);
+    eq('so it takes the device at its address', hostForMessage(bare.host, bare.sourceIp, map), 'CRS317-Core');
+    const named = parse('<78>Sep 28 20:05:00 TrueNASMain cron[42]: job ran', '192.0.2.3');
+    eq('a line that names its host keeps it', hostForMessage(named.host, named.sourceIp, map), 'TrueNASMain');
+    eq('even when the device at that address is called something else (a relay names each origin)',
+        hostForMessage('edge-7', '192.0.2.250', map), 'edge-7');
+    eq('an empty name is no name', hostForMessage('', '192.0.2.250', map), 'CRS317-Core');
+    eq('no name from an address no device has: none, as before', hostForMessage(null, '192.0.2.99', map), null);
+    eq('no name from an address several devices share: none, rather than a guess',
+        hostForMessage(null, '198.18.50.1', map), null);
+    const v5424 = parse('<14>1 2026-09-28T20:05:00Z - app 1 - - text', '192.0.2.250');
+    eq('an RFC 5424 nil hostname falls back the same way', hostForMessage(v5424.host, v5424.sourceIp, map), 'CRS317-Core');
 }
 
 console.log('\nrenderValue and the v2c timeout hint:');

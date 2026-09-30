@@ -322,10 +322,17 @@ export async function pollDevice(
         // src/collector/rekey.ts for the rule and what it refuses to do.
         {
             const seen: Array<{ idx: string; name: string }> = [];
+            // A tracked interface of any type is seen too (see "THE TYPE LIST
+            // IS DISCOVERY'S" below), by its index or by its name, so one the
+            // agent renumbers is followed like any Ethernet port.
+            const trackedIdx = new Set(existing.rows.filter((r) => r.tracked).map((r) => r.snmp_index));
+            const trackedNames = new Set(existing.rows.filter((r) => r.tracked).map((r) => r.name));
             for (const [idx, typeVal] of types) {
                 const t = asNumber(typeVal);
-                if (t === null || !DEFAULT_TRACKED_IFTYPES.has(t)) continue;
-                seen.push({ idx, name: asString(names.get(idx) ?? null) ?? asString(descrs.get(idx) ?? null) ?? `if${idx}` });
+                const nm = asString(names.get(idx) ?? null) ?? asString(descrs.get(idx) ?? null) ?? `if${idx}`;
+                const ofTrackedType = t !== null && DEFAULT_TRACKED_IFTYPES.has(t);
+                if (!ofTrackedType && !trackedIdx.has(idx) && !trackedNames.has(nm)) continue;
+                seen.push({ idx, name: nm });
             }
             const plan = planRekey(seen, existing.rows.map((r) => ({
                 id: r.id, snmp_index: r.snmp_index, name: r.name,
@@ -368,10 +375,22 @@ export async function pollDevice(
         }
 
         const now = new Date();
+        // See "UNTRACKED MEANS NO HISTORY" below.
+        let trackedSampled = false;
+        let rttCarrier: { entityId: string; status: number | null } | null = null;
 
         for (const [idx, typeVal] of types) {
             const ifType = asNumber(typeVal);
-            if (ifType === null || !DEFAULT_TRACKED_IFTYPES.has(ifType)) continue;
+            // THE TYPE LIST IS DISCOVERY'S, NOT THE OPERATOR'S (2026-09-30).
+            // DEFAULT_TRACKED_IFTYPES decides which NEW interfaces become
+            // entities here; it also skipped every existing one of another
+            // type, tracked or not, so ticking "track" on a Wi-Fi adapter
+            // (ieee80211) or a tunnel saved the tick and read nothing. The
+            // operator's A17 and RSAlly Wi-Fi, tracked on 2026-09-22, and
+            // FW-1's three OpenVPN interfaces had never had one reading. An
+            // interface someone tracked is polled whatever its type.
+            const ofTrackedType = ifType !== null && DEFAULT_TRACKED_IFTYPES.has(ifType);
+            if (!ofTrackedType && byIndex.get(idx)?.tracked !== true) continue;
 
             // ifName is the operator-facing name and the one a board annotation
             // binds by; ifDescr is the fallback for agents that omit ifXTable.
@@ -548,7 +567,24 @@ export async function pollDevice(
                     + 'untrusted, utilization suspended (set a speed override to restore it)');
             }
 
-            result.samples.push({ entityId: row.id, ts: now, status: operStatus, rttMs: result.rttMs, v });
+            // UNTRACKED MEANS NO HISTORY (2026-09-30). Slice 23's schema note
+            // says tracked gates the poll's sample writes, and the poll never
+            // checked it: every interface of a tracked TYPE wrote a row every
+            // poll, tracked or not. On the operator's network that was 232
+            // untracked interfaces against 104 tracked - two thirds of the
+            // interface rows - and an access point's untracked virtual radio
+            // reached the Dashboard's top errors with a chart nobody could
+            // open from its device page. Counters and current values still
+            // move for an untracked interface: the rekey planner reads lv_ts
+            // as evidence of which generation is live, and the first rate
+            // after someone tracks it must span one poll, not the months it
+            // sat untracked.
+            if (row.tracked) {
+                result.samples.push({ entityId: row.id, ts: now, status: operStatus, rttMs: result.rttMs, v });
+                trackedSampled = true;
+            } else if (rttCarrier === null) {
+                rttCarrier = { entityId: row.id, status: operStatus };
+            }
             ifReadings.push({
                 name, tracked: row.tracked, operStatus, adminStatus,
                 inBps: v[0] ?? null, outBps: v[1] ?? null, inErrs: v[2] ?? null, outErrs: v[3] ?? null,
@@ -566,6 +602,19 @@ export async function pollDevice(
             // tell "0 bps" from "we have not heard about this port".
             result.lastValues.push({
                 id: row.id, ts: now, status: operStatus, rttMs: result.rttMs, v,
+            });
+        }
+
+        // The device's response time is stored on its interface rows, so a
+        // device with no tracked interface (a Wi-Fi-only laptop, the
+        // operator's A17) would lose its response-time chart with them. It
+        // keeps ONE row per poll, on its first interface, carrying the
+        // response time and no readings: no traffic or error history for an
+        // interface nobody asked to watch.
+        if (!trackedSampled && rttCarrier !== null) {
+            result.samples.push({
+                entityId: rttCarrier.entityId, ts: now, status: rttCarrier.status, rttMs: result.rttMs,
+                v: [null, null, null, null, null, null],
             });
         }
 

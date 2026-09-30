@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.3
+# Known issues, as of 0.1.0-alpha.4
 
-Written 2026-09-15 for the first alpha and revised 2026-09-26 and
-2026-09-28 for the second and third. Everything here is known and unbuilt;
+Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28
+and 2026-09-30 for the second, third and fourth. Everything here is known and unbuilt;
 nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
 what each alpha fixed.
@@ -18,14 +18,18 @@ what each alpha fixed.
 - **SNMPv3 traps are not accepted.** v1 and v2c traps are; a v3 trap is
   refused and logged. SNMPv3 polling is supported and documented in
   INSTALL.md section 3.
-- **The device page's long tables** (audit, messages, reachability) are not
-  capped, and in a narrow window the device panel scrolls sideways under its
-  interface table.
-- **Transient and muted devices have no overview.** Each shows on its own
-  row of the device list and on its device page; there is no filter or table
-  of them.
 - **A device mute covers polled alerts only** - device-down, interfaces,
   sensors. Syslog and trap rule alerts are governed by their rules.
+- **A device that stops answering is polled on its full schedule** until
+  the half of the polling slots kept for silent devices fills (about 36
+  devices at the defaults); past that they are polled less often, and the
+  devices that answer are never slowed. INSTALL.md section 3 says what it
+  costs. A per-device polling backoff was considered and not built
+  (2026-09-30): the down-lane cap already keeps the cost where it belongs.
+- **A group alert holds its devices' device-down emails only.** Other
+  alerts an outage causes - the interface on a core switch that faced the
+  dead site, a syslog rule matching its link-down message - still email on
+  their own.
 - **The Boards and Thresholds panels are admin-only** in the page, although
   the server lets operators edit boards and read thresholds.
 - **The Dashboard reads the hourly rollup**, so its windows end at the last
@@ -36,14 +40,16 @@ what each alpha fixed.
 - **A traffic report covers an interface's tracked history only.** An
   interface the discovery defaults leave untracked (some sub-interface
   types) has none until it is tracked.
-- **At tens of thousands of entities the notify job logs "still running,
-  skipping this one" every scan.** Nothing is behind - its own counters show
-  every run completing - but it fills the log.
 
 ## Findings still open
 
-- **The interactive-latency criterion** - how quickly the pages answer - was
-  not exercised at the 30,000-entity scale.
+- **The alert list and the device roster are about 1.4 MB each at 30,000
+  entities** (with about 2,000 open alerts; 60 and 80 KB gzipped, which is
+  how a browser receives them), and each takes the server's page thread
+  50-60 ms to build. A view showing one
+  refreshes it every 10 seconds, which the health report shows as pauses of
+  40-90 ms on that thread, inside its limits. Other views fetch them once a
+  minute, and a tab in the background not at all.
 - **One 426 ms gap on the collector thread**, once, a few minutes after a
   restart, with the other threads undisturbed and nothing logged. It is
   under the health report's 500 ms acute limit, has not recurred, and is
@@ -65,20 +71,24 @@ what each alpha fixed.
   16,400 and 13,700 on a mini PC, the ingest thread never stalling, and any
   loss above the ceiling counted by the application rather than hidden in
   the kernel.
+- **The pages at 30,000 entities** were exercised on 2026-09-29, the
+  operator using every page against the lab box. Two answers were slow: the
+  Alerts refresh (about 0.85 s, nearly all of it PostgreSQL compiling a 24 ms
+  query to machine code) and switching the Dashboard window (1.6 s for a
+  day, 2.9 s for a week). They now take about 60 ms and, once warm, a few
+  milliseconds. The same compile cost was behind the notify job logging
+  "still running, skipping this one" every five seconds at that scale: 720
+  lines an hour before, none since.
 - **The slower median poll time** seen on a four-core box after an upgrade
   was attributed on two identical boxes: mostly the test fleet sharing the
   poller's CPU, and the rest the sensors and counters the newer build reads.
 
 ## Decisions deferred, not built
 
-- **Group alerts** (many devices down at once as one alert). Ruled out for
-  now; the open word is raise versus suppress.
 - **Per-board access rules** are described in three documents and enforced
   nowhere. Enforce or amend.
 - **The stale-band fix for alerts** (a threshold that no longer matches its
   reading keeps its band).
-- **Per-device polling backoff**, the complement to the proportional
-  down-lane cap.
 - **A try-all-credentials onboarding probe**, and hardening of interface
   identity on agents that report no physical address.
 - **The ingest queue bound for bursts.** 50,000 rows in memory; a burst of

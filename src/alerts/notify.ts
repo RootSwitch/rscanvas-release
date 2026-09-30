@@ -36,12 +36,15 @@
 
 import dgram from 'node:dgram';
 import os from 'node:os';
-import nodemailer from 'nodemailer';
+// nodemailer 10 ships its own declarations (it was rewritten in TypeScript);
+// @types/nodemailer is gone, and Transporter is a named type export there.
+import nodemailer, { type Transporter } from 'nodemailer';
 import type SMTPTransport from 'nodemailer/lib/smtp-transport/index.js';
 import { CONFIG } from '../config.ts';
 import { OPS, type AlertRecord } from '../store/index.ts';
 import { NOTIFIER_APP } from './events.ts';
 import { varsFor, render, type AlertEvent, type Alert } from './templates.ts';
+import { GROUP_KIND, parseGroupKey, groupDetail } from './groups.ts';
 
 const NL = String.fromCharCode(10);
 
@@ -217,7 +220,7 @@ async function sendMail(subject: string, body: string): Promise<SendResult> {
     if (from === '') return { ok: false, detail: 'no From address configured' };
     if (to.length === 0) return { ok: false, detail: 'no recipients configured' };
 
-    let transport: nodemailer.Transporter | null = null;
+    let transport: Transporter | null = null;
     try {
         transport = nodemailer.createTransport(cfg);
         const info = await transport.sendMail({ from, to, subject, text: body });
@@ -351,6 +354,20 @@ export async function dispatchEvent(
 ): Promise<boolean> {
     const vars = varsFor(toTemplateAlert(alert), event);
     const isClear = event === 'clear';
+    // A group alert (slice 55) names the devices it stands in for, looked up
+    // as it is sent: the member notifications it holds would each have
+    // named one. A refused lookup keeps the generic detail, never the send.
+    if (alert.kind === GROUP_KIND && !isClear) {
+        const g = parseGroupKey(alert.alert_key);
+        // Caught as well as checked: a driver error throws, and the names are
+        // garnish on a send that must still happen.
+        const m = g === null ? null
+            : await OPS.groupMembers('jobs', g.axis, g.value).catch(() => null);
+        if (m !== null && m.ok) {
+            const down = m.rows.filter((x) => x.st === 'down').map((x) => x.name);
+            vars.detail = groupDetail(down, Number(alert.threshold ?? 0), Number(m.rows[0]?.min_down ?? 0));
+        }
+    }
     const title = render(isClear ? TMPL.subjectClear : TMPL.subjectRaise, vars);
     const line = render(isClear ? TMPL.syslogClear : TMPL.syslogRaise, vars);
 
@@ -464,6 +481,11 @@ export async function retryPass(now = new Date()): Promise<RetryReport> {
     // about an incident nobody was told of.
     const settledPolicy = await OPS.settleUnderPolicyClears();
     if (!settledPolicy.ok) throw new Error(`lane refused the policy settle (${settledPolicy.reason})`);
+    // Slice 55: the group twin. A member whose raise was held under its
+    // group alert, and never told, has its clear waived: the group's email
+    // named it and the group's clear closes it.
+    const settledGroup = await OPS.settleGroupCoveredClears();
+    if (!settledGroup.ok) throw new Error(`lane refused the group settle (${settledGroup.reason})`);
     let sent = 0;
     const raises = await OPS.alertsOwingRaise();
     if (!raises.ok) throw new Error(`lane refused the raise queue (${raises.reason})`);

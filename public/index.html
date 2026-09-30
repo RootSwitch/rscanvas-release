@@ -45,6 +45,15 @@
     <button id="logout" class="hidden">Sign out</button>
     <label for="theme-select">Theme</label>
     <select id="theme-select"></select>
+    <!-- Width sits beside the theme because, like the theme, it reaches every
+         tab (operator, 2026-09-29): switched on from the Devices columns
+         panel alone, it followed the operator to every other tab with no
+         sign of where it came from or how to undo it. -->
+    <label for="width-select">Width</label>
+    <select id="width-select" title="Wide lets every page use the whole window width - a per-browser preference">
+        <option value="normal">normal</option>
+        <option value="wide">wide</option>
+    </select>
 </div>
 
 <div id="main">
@@ -103,6 +112,34 @@
             </table>
             <div id="dash-alerts-more" class="muted small hidden"></div>
             <div id="dash-no-alerts" class="allquiet hidden">nothing open - no alert is active, pending or clearing</div>
+        </div>
+
+        <!-- HEALTH BY GROUP (2026-09-28, operator): below the alerts, every
+             location and every application with its devices up and down, so
+             the Dashboard says how the whole environment stands at a glance.
+             Counted on the server with the device list's own status; transient
+             devices are left out. A row opens the device list filtered to it. -->
+        <div class="panel" data-section="dashboard" id="dash-groups-panel">
+            <h2>Device health <span id="dash-groups-sub" class="muted"></span></h2>
+            <div class="dash-grid">
+                <div class="widget">
+                    <h3>Locations</h3>
+                    <table class="list compact" id="dash-loc">
+                        <thead><tr><th>location</th><th class="num">up</th><th class="num">down</th>
+                            <th class="num dash-other hidden" title="pending first contact, or reachability not yet known">pending</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="widget">
+                    <h3>Applications</h3>
+                    <table class="list compact" id="dash-app">
+                        <thead><tr><th>application</th><th class="num">up</th><th class="num">down</th>
+                            <th class="num dash-other hidden" title="pending first contact, or reachability not yet known">pending</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+            <div id="dash-groups-msg" class="muted small"></div>
         </div>
 
         <div class="panel" data-section="dashboard" id="dash-top-panel">
@@ -544,7 +581,8 @@
             <h2>Devices <span id="device-counts" class="muted"></span></h2>
             <div class="row">
                 <input type="text" id="device-filter" class="grow"
-                       placeholder="filter by name or address" autocomplete="off">
+                       placeholder="filter by name or address" autocomplete="off"
+                       title="a word matches names, addresses, locations and applications; location:NAME or application:NAME matches one group exactly; transient: and muted: list the devices declared so (transient:no and muted:no the rest), alone or with the rest">
                 <select id="device-scope">
                     <option value="problems" selected>problems first</option>
                     <option value="only-problems">problems only</option>
@@ -561,7 +599,7 @@
                  (localStorage) like the sort: it changes what YOU see. -->
             <div id="cols-panel" class="hints hidden">
                 <div id="cols-list"></div>
-                <label class="small"><input type="checkbox" id="wide-cb"> wide layout - let the page use the whole window width (for many columns on a big screen)</label>
+                <label class="small"><input type="checkbox" id="wide-cb"> wide layout - let every page use the whole window width (for many columns on a big screen; also the Width switch at the top right)</label>
                 <button type="button" id="cols-reset" class="small"
                         title="Forget this browser's column order and visibility - back to the out-of-the-box table">Reset to default</button>
             </div>
@@ -729,13 +767,23 @@
                  views. Hidden when empty: blank, not placeholder. -->
             <div id="device-alerts" class="hidden">
                 <h3 id="device-alerts-title"></h3>
-                <table class="list">
-                    <thead><tr>
-                        <th>severity</th><th>state</th><th>alert</th>
-                        <th class="num">value</th><th class="num">threshold</th><th>raised</th>
-                    </tr></thead>
-                    <tbody></tbody>
-                </table>
+                <div class="table-scroll">
+                    <table class="list">
+                        <thead><tr>
+                            <th>severity</th><th>state</th><th>alert</th>
+                            <th class="num">value</th><th class="num">threshold</th><th>raised</th>
+                        </tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <!-- Past DEVICE_ALERTS_SHOWN the worst are shown and the rest
+                     are one click away on the Alerts page (2026-09-30): a
+                     site outage put forty rows between the device's name and
+                     its interfaces. -->
+                <div id="device-alerts-more" class="row small hidden">
+                    <span id="device-alerts-more-text" class="muted"></span>
+                    <button type="button" id="device-alerts-all" class="small">show them all on the Alerts page</button>
+                </div>
             </div>
             <!-- Sensor cards (the sensors slice): current reading plus a bar,
                  above the interface table - the parent's layout, which the
@@ -781,15 +829,18 @@
                        placeholder="filter interfaces" autocomplete="off">
             </div>
             <div id="device-msg" class="allquiet hidden"></div>
-            <table class="list" id="entities">
-                <thead><tr>
-                    <th>interface</th><th>description</th><th class="num">speed</th><th>state</th>
-                    <th class="num">in</th><th class="num">out</th>
-                    <th class="num">errors/s</th><th class="num">discards/s</th>
-                    <th>last reading</th><th></th>
-                </tr></thead>
-                <tbody></tbody>
-            </table>
+            <div class="table-scroll">
+                <table class="list" id="entities">
+                    <thead><tr>
+                        <th>interface</th><th>description</th><th class="num">speed</th><th>state</th>
+                        <th class="num">in</th><th class="num">out</th>
+                        <th class="num">errors/s</th><th class="num">discards/s</th>
+                        <th>last reading</th><th></th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div id="entities-more" class="muted small hidden"></div>
         </div>
 
         <!-- Maintenance windows (slice 22). Deliberately NOT admin-only: a
@@ -990,6 +1041,29 @@
             </div>
             <div id="rules-msg" class="muted small"></div>
         </div>
+        <!-- GROUP ALERTS (slice 55, 2026-09-29, the operator's amendment of
+             ruling 7): one alert for a location or application when enough
+             of its devices are down, instead of an email per device. The
+             members still raise and show; only their emails are held. -->
+        <div class="panel hidden" data-section="system" id="group-alerts-panel" data-can="alertrule.read">
+            <h2>Group alerts <span id="group-alerts-sub" class="muted"></span></h2>
+            <p class="muted small">One alert for a location or application when enough of its
+               devices are down at once, instead of an email for each. Tick a group to watch it.
+               It trips when at least the percent shown of its devices are down - counting only
+               devices whose status is known - and at least the minimum number, so a small group
+               cannot trip on one failure. While the group alert is open, its devices' own alerts
+               still raise and show, but their emails are held: the group's email names them.
+               Any still down when the group recovers are emailed then. Transient and muted
+               devices are not counted.</p>
+            <table class="list compact" id="group-alerts-table">
+                <thead><tr>
+                    <th>watch</th><th>group</th><th class="num">up</th><th class="num">down</th>
+                    <th class="num">trips at</th><th class="num">and at least</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="group-alerts-msg" class="muted small"></div>
+        </div>
         <div class="panel hidden admin-only" data-section="system" id="credentials-panel">
             <h2>Credentials <span id="cred-sub" class="muted"></span></h2>
             <!-- READ-ONLY, said once and plainly at the point of entry. The
@@ -1102,8 +1176,8 @@
                     <label for="grid-cols">or exactly</label>
                     <input type="number" id="grid-cols" min="1" max="24" placeholder="off">
                     <span class="muted small">auto fits the display's own screen (the field set fixes the
-                        tile height, so the arithmetic is exact); a number forces it; both blank = drawn
-                        board from coordinates</span>
+                        tile height, so the arithmetic is exact); a number forces it<span class="manual-layout hidden">;
+                        both blank = drawn board from coordinates</span></span>
                 </div>
                 <div id="grid-checks" class="row wrap"></div>
                 <div class="row">
@@ -1112,10 +1186,10 @@
                     <span id="grid-msg" class="muted small"></span>
                 </div>
             </div>
-            <!-- The export that feeds CrossCanvas. RSCanvas builds no layout
-                 engine; this hands the inventory to the tool that already has
-                 one. Choosing the axis here is what decides whether the board
-                 comes out as a floor plan or an application health view. -->
+            <!-- Generate: a board from a group, laid out automatically to fit
+                 each display (2026-09-30). The CrossCanvas round trip for a
+                 hand-placed layout - the picker below, the CSV import, empty
+                 boards - is kept behind BOARDS_MANUAL_LAYOUT (config.ts). -->
             <h3>Generate a board from a group</h3>
             <div class="row">
                 <label for="inv-axis">group by</label>
@@ -1130,7 +1204,7 @@
                      inferred from a blank field - "I meant everything" and
                      "I left it empty" must not be the same request. -->
                 <label class="small"><input type="checkbox" id="inv-all"> every group (one board of the whole fleet)</label>
-                <select id="inv-board">
+                <select id="inv-board" class="manual-layout hidden">
                     <option value="">first generation (auto-place everything)</option>
                 </select>
                 <button type="button" id="inv-export" class="btn-primary">Generate</button>
@@ -1141,16 +1215,16 @@
                  export carries x/y/width/height and the device fields, so
                  RSCanvas never parses .xcanvas and never couples to its file
                  version. -->
-            <div class="row">
+            <div class="row manual-layout hidden">
                 <label for="imp-board">import layout into</label>
                 <select id="imp-board"></select>
                 <input type="file" id="imp-file" accept=".csv,text/csv,text/tab-separated-values">
                 <button type="button" id="imp-go">Import layout</button>
             </div>
-            <div id="imp-msg" class="muted small"></div>
+            <div id="imp-msg" class="muted small manual-layout hidden"></div>
             <div id="imp-unmatched" class="hints hidden"></div>
 
-            <form id="new-board-form" class="row">
+            <form id="new-board-form" class="row manual-layout hidden">
                 <input type="text" id="nb-name" autocomplete="off" required
                        placeholder="new EMPTY board name - boards from your groups come from Generate above">
                 <select id="nb-collection">

@@ -446,6 +446,16 @@ async function alertNotify(): Promise<string> {
         // apply, or a policy quiets the queue while the scan's own event
         // stream pages anyway.
         if (rec.rows[0].in_maintenance || rec.rows[0].under_policy) continue;
+        // And the group gate (slice 55), in both of its forms. A member's
+        // raise (or escalate) while its group alert is open is held - the
+        // owed queue delivers it if the member is still down when the group
+        // clears. A member's CLEAR whose raise was never told, under or
+        // across a group outage, is not told either: settleGroupCoveredClears
+        // waives it on this same pass, and dispatching it here first would
+        // send "resolved" for an incident only the group email named.
+        const r0 = rec.rows[0];
+        if (ev.type !== 'clear' && r0.in_group) continue;
+        if (ev.type === 'clear' && !r0.notified_raise && r0.group_overlap) continue;
         if (await dispatchEvent(ev.type, rec.rows[0])) sent++;
     }
     const r = await retryPass();
