@@ -18,9 +18,12 @@ export async function login(req: http.IncomingMessage, res: http.ServerResponse)
 
     // Checked BEFORE the password is verified. The point of the limiter is to
     // bound how often the expensive path runs, and checking afterwards would
-    // let an attacker spend our scrypt budget while locked out.
-    if (!auth.loginAllowed(ip)) {
-        fail(res, 429, 'Too many failed attempts. Try again in a minute.');
+    // let an attacker spend our scrypt budget while locked out. The address
+    // is checked before the body is even read; the account, which needs the
+    // body, is checked and the attempt RESERVED before scrypt (auth/index.ts,
+    // the rate limiting header, says why the reservation matters).
+    if (!auth.loginAllowed(auth.addressKey(ip))) {
+        fail(res, 429, 'Too many failed attempts. Try again later.');
         return;
     }
 
@@ -34,10 +37,21 @@ export async function login(req: http.IncomingMessage, res: http.ServerResponse)
 
     const username = str(body, 'username');
     const password = str(body, 'password');
-    const user = await auth.checkLogin(username, password);
+    // One message whichever key refused: saying "this account is locked"
+    // would confirm the name exists - it is counted whether it exists or not.
+    const attempt = auth.beginLoginAttempt(ip, username);
+    if (attempt === null) {
+        fail(res, 429, 'Too many failed attempts. Try again later.');
+        return;
+    }
+    let user: Awaited<ReturnType<typeof auth.checkLogin>> = null;
+    try {
+        user = await auth.checkLogin(username, password);
+    } finally {
+        auth.endLoginAttempt(attempt, user !== null);
+    }
 
     if (!user) {
-        auth.recordLoginFailure(ip);
         // One message for every failure mode: no such user, wrong password,
         // disabled account. Saying which would turn this into an account
         // enumeration endpoint, and the timing pad in checkLogin exists to stop
@@ -47,7 +61,6 @@ export async function login(req: http.IncomingMessage, res: http.ServerResponse)
         return;
     }
 
-    auth.recordLoginSuccess(ip);
     const token = await auth.createSession(
         user.id,
         (req.headers['user-agent'] ?? '').slice(0, 256) || null,
@@ -183,9 +196,19 @@ export async function setPassword(
 
     // Changing your own password requires the current one. An admin resetting
     // someone else's does not - they are not proving they are that person.
+    //
+    // THROUGH THE SIGN-IN LIMITER, under the same address and account keys
+    // (review F8). It had no limit: a stolen session cookie could guess the
+    // real password - often reused elsewhere - as fast as scrypt allowed.
     if (own) {
-        const current = str(body, 'currentPassword');
-        const check = await auth.checkLogin(target, current);
+        const attempt = auth.beginLoginAttempt(clientIp(req), target);
+        if (attempt === null) { fail(res, 429, 'Too many failed attempts. Try again later.'); return; }
+        let check: Awaited<ReturnType<typeof auth.checkLogin>> = null;
+        try {
+            check = await auth.checkLogin(target, str(body, 'currentPassword'));
+        } finally {
+            auth.endLoginAttempt(attempt, check !== null);
+        }
         if (!check) { fail(res, 403, 'Current password is incorrect.'); return; }
     }
 

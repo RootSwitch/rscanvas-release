@@ -22,6 +22,8 @@
 #   --user NAME      service account            (default: rscanvas)
 #   --http-port N    web port                   (default: 18080)
 #   --high-ports     syslog 5514 / traps 15162, no privilege needed
+#   --raw-days N     keep raw per-poll samples N days    (default 14, at least 7)
+#   --message-days N keep syslog and trap messages N days (default 30, at least 7)
 #   --no-service     stop before installing the systemd unit
 #   --tls            https on the web port: a self-signed pair is minted ONCE
 #                    into /etc/rscanvas/tls and reused on every re-run. Sticky:
@@ -37,6 +39,9 @@
 #                    rscanvas-backup.sh set aside), the roles, /etc/rscanvas and
 #                    the service account. Backups and packages are never removed.
 #   --yes            do not prompt
+#
+#   --raw-days and --message-days are written to the env file when given and
+#   left as they are when not, so a re-run keeps whatever days the box keeps.
 #
 #   --db, --dir, --http-port, --high-ports and --user are STICKY too: a later
 #   run without them keeps what the install already uses (read from the env
@@ -74,6 +79,8 @@ ENV_FILE=/etc/rscanvas/rscanvas.env
 SET_DB=0; SET_USER=0; SET_HTTP=0; SET_PORTS=0; SET_DIR=0
 DO_UNINSTALL=0
 DO_PURGE=0
+RAW_DAYS=""
+MSG_DAYS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -85,6 +92,8 @@ while [ $# -gt 0 ]; do
         --user)        SVC_USER="$2"; SET_USER=1; shift ;;
         --http-port)   HTTP_PORT="$2"; SET_HTTP=1; shift ;;
         --high-ports)  SYSLOG_PORT=5514; TRAP_PORT=15162; SET_PORTS=1 ;;
+        --raw-days)    RAW_DAYS="$2"; shift ;;
+        --message-days) MSG_DAYS="$2"; shift ;;
         --no-service)  DO_SERVICE=0 ;;
         --tls)         DO_TLS=1 ;;
         --tls-cert)    DO_TLS=1; TLS_CERT_SRC="$2"; shift ;;
@@ -103,6 +112,17 @@ if [ "$DO_PURGE" = 1 ] && [ "$DO_UNINSTALL" = 0 ]; then
     echo "--purge only means something with --uninstall: sudo $0 --uninstall --purge" >&2
     exit 2
 fi
+# Checked before anything changes. Retention never keeps less than 7 days
+# (RETENTION_MIN_KEEP_DAYS): a shorter horizon is refused by the retention
+# function itself, so the service would keep everything and say so hourly.
+check_days() {
+    [ -z "$2" ] && return 0
+    if [[ "$2" =~ ^[0-9]{1,4}$ ]] && [ "$2" -ge 7 ] && [ "$2" -le 3650 ]; then return 0; fi
+    echo "--$1 takes a whole number of days from 7 to 3650 (retention never keeps less than 7), got: $2" >&2
+    exit 2
+}
+check_days raw-days "$RAW_DAYS"
+check_days message-days "$MSG_DAYS"
 
 B=$'\033[1m'; Y=$'\033[33m'; R=$'\033[31m'; G=$'\033[32m'; N=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
@@ -146,6 +166,58 @@ disk_for() {
         return
     fi
     printf '%s' "$out"
+}
+
+# WHERE THE DATA LIVES (2026-10-01, the three questions that belong to whoever
+# installs). The database's disk, a WAL archive's, and the days kept, which
+# together size the disk. The installer cannot move PostgreSQL's data after
+# the fact - a separate disk has to be mounted at the data directory BEFORE
+# PostgreSQL is installed - so the useful thing it can do is say, before it
+# installs anything, where the data is going and what that disk holds, and
+# ask once when the answer is the system disk and there is still time to
+# choose. Reported by --check too.
+pg_base() {   # where the distribution puts PostgreSQL's data
+    if [ -d /var/lib/pgsql ] || [ -d /usr/pgsql-18 ]; then printf '/var/lib/pgsql'; else printf '/var/lib/postgresql'; fi
+}
+pg_data_dir() {
+    local d
+    d=$(q 'SHOW data_directory')
+    if [ -n "$d" ]; then printf '%s' "$d"; else pg_base; fi
+}
+mount_of() {   # the filesystem a path is on - or will be, from its nearest existing parent
+    local p="$1" m
+    while [ "$p" != "/" ] && ! sudo -n test -e "$p" 2>/dev/null && [ ! -e "$p" ]; do p=$(dirname "$p"); done
+    m=$(df -P "$p" 2>/dev/null | awk 'NR==2{print $6}')
+    [ -n "$m" ] || m=$(sudo -n df -P "$p" 2>/dev/null | awk 'NR==2{print $6}')
+    printf '%s' "${m:-?}"
+}
+keep_days() {   # the days a box keeps: this command line, else its env file, else the default
+    local given="$1" key="$2" dflt="$3" v
+    if [ -n "$given" ]; then printf '%s' "$given"; return; fi
+    v="$(prev_env "$key")"
+    if [[ "$v" =~ ^[0-9]{1,4}$ ]]; then printf '%s' "$v"; else printf '%s' "$dflt"; fi
+}
+ON_SYSTEM_DISK=0
+storage_report() {
+    local dir mnt free raw msg rawgb
+    dir=$(pg_data_dir); mnt=$(mount_of "$dir")
+    free=$(df -h -P "$mnt" 2>/dev/null | awk 'NR==2{printf "%s free of %s on %s (%s)", $4, $2, $6, $1}')
+    ON_SYSTEM_DISK=0; [ "$mnt" = "/" ] && ON_SYSTEM_DISK=1
+    say "  data       $dir"
+    if [ "$ON_SYSTEM_DISK" = 1 ]; then
+        warn "the database shares the system disk: ${free:-unmeasured}"
+        warn "a full database then fills the system too; a separate disk mounted at $(pg_base) by UUID,"
+        warn "before PostgreSQL is installed, keeps them apart (INSTALL.md, What you need)"
+    else
+        good "the database has a filesystem of its own: ${free:-unmeasured}"
+    fi
+    raw=$(keep_days "$RAW_DAYS" RAW_RETENTION_DAYS 14)
+    msg=$(keep_days "$MSG_DAYS" MESSAGE_RETENTION_DAYS 30)
+    rawgb=$(( (6 * raw + 7) / 14 ))
+    say "  keeps      raw samples $raw days, syslog and traps $msg days, the hourly rollup for good (--raw-days, --message-days)"
+    say "  sizing     about $rawgb GB of raw samples per 1,000 entities at $raw days, plus 1.6 GB of rollup per 1,000"
+    say "             entities a year and about 0.6 KB per syslog or trap message for $msg days"
+    say "  WAL        no archive (PostgreSQL's default); one that is turned on later belongs on another disk"
 }
 
 # ----- sticky choices: what the existing install already uses ------------------
@@ -213,6 +285,16 @@ if [ "$DO_CHECK" = 1 ]; then
     say "  node       $(command -v node >/dev/null && node -v || echo 'NOT INSTALLED')"
     if command -v fping >/dev/null; then say "  fping      $(fping -v 2>&1 | head -1 | grep -oE '[0-9][0-9.]*' | head -1)"
     else bad "fping NOT INSTALLED - reachability is off, every device reads unknown"; fi
+    # The layout this installer has written since 2026-10-01 (review F6/F17).
+    if [ -d "$APP_DIR" ]; then
+        o="$(stat -c %U "$APP_DIR" 2>/dev/null)"
+        if [ "$o" = root ]; then say "  app dir    $APP_DIR is root's"
+        else warn "$APP_DIR is owned by $o - root runs scripts from it; re-run the installer to give it to root"; fi
+    fi
+    if [ -f /etc/systemd/system/rscanvas.service ]; then
+        if grep -q '^NoNewPrivileges=yes' /etc/systemd/system/rscanvas.service; then say "  sandbox    the unit is hardened (NoNewPrivileges, ProtectSystem=strict)"
+        else warn "the rscanvas unit predates its sandbox - re-run the installer"; fi
+    fi
     rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
     if [ "$rmem" -ge 8388608 ]; then say "  rmem_max   $rmem (the 8 MB syslog and trap buffers fit)"
     else warn "net.core.rmem_max is $rmem - the syslog and trap sockets are CLAMPED to it; rerun the installer or raise it"; fi
@@ -254,6 +336,9 @@ if [ "$DO_CHECK" = 1 ]; then
         fi
         say "  disk       $(disk_for "$pgdata")"
     fi
+
+    step "storage"
+    storage_report
 
     step "application"
     if [ -d "$APP_DIR" ]; then
@@ -324,6 +409,29 @@ if [ "$DO_CHECK" = 1 ]; then
     exit 0
 fi
 
+# What the application directory is allowed to be. `rm -rf` on a path nobody
+# verified is how an uninstaller deletes /opt: a wrong --dir, or a hand-edited
+# unit, must leave the directory alone and say why. The install uses it too
+# (2026-10-01): it now makes the directory root's, recursively, and a chown -R
+# on a wrong --dir is the same accident by another command.
+app_dir_state() {
+    case "$APP_DIR" in
+        ""|/|/opt|/opt/|/usr|/usr/*|/home|/home/|/root|/etc|/etc/*|/var|/srv|/srv/|/bin|/sbin|/lib*|/boot*|/tmp|/tmp/)
+            echo refuse; return ;;
+    esac
+    [[ "$APP_DIR" = /* ]] || { echo refuse; return; }
+    [ -e "$APP_DIR" ] || { echo absent; return; }
+    [ -d "$APP_DIR" ] && [ -z "$(ls -A "$APP_DIR" 2>/dev/null)" ] && { echo empty; return; }
+    { [ -f "$APP_DIR/src/main.ts" ] && grep -q '"name": *"rscanvas"' "$APP_DIR/package.json" 2>/dev/null; } \
+        || { echo foreign; return; }
+    [ -d "$APP_DIR/.git" ] && { echo checkout; return; }
+    echo ours
+}
+
+# Where the service may write, and nowhere else (review F6): systemd creates it
+# from StateDirectory= and gives it to the service account. Exports go here.
+STATE_DIR=/var/lib/rscanvas
+
 # ----- uninstall: take RSCanvas off the box, keep (or purge) its data ----------
 #
 # KEEP IS THE DEFAULT (the operator's ruling, 2026-09-28). An uninstall is
@@ -348,21 +456,6 @@ if [ "$DO_UNINSTALL" = 1 ]; then
     NODE_BIN="$(command -v node || true)"
     BACKUP_DIR=/var/backups/rscanvas
 
-    # What the application directory is allowed to be. `rm -rf` on a path
-    # nobody verified is how an uninstaller deletes /opt: a wrong --dir, or a
-    # hand-edited unit, must leave the directory alone and say why.
-    app_dir_state() {
-        case "$APP_DIR" in
-            ""|/|/opt|/opt/|/usr|/usr/*|/home|/home/|/root|/etc|/etc/*|/var|/srv|/srv/|/bin|/sbin|/lib*|/boot*|/tmp|/tmp/)
-                echo refuse; return ;;
-        esac
-        [[ "$APP_DIR" = /* ]] || { echo refuse; return; }
-        [ -e "$APP_DIR" ] || { echo absent; return; }
-        { [ -f "$APP_DIR/src/main.ts" ] && grep -q '"name": *"rscanvas"' "$APP_DIR/package.json" 2>/dev/null; } \
-            || { echo foreign; return; }
-        [ -d "$APP_DIR/.git" ] && { echo checkout; return; }
-        echo ours
-    }
     APP_STATE="$(app_dir_state)"
     PG_UP=0; [ -n "$(q 'SELECT 1')" ] && PG_UP=1
     [ "$DO_PURGE" = 1 ] && [ "$PG_UP" = 0 ] && \
@@ -387,6 +480,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
     case "$APP_STATE" in
         ours)     say "  removes    $APP_DIR, the application (the bundle you installed from puts it back)" ;;
         absent)   say "  already    $APP_DIR is not there" ;;
+        empty)    say "  removes    $APP_DIR (empty)" ;;
         checkout) warn "$APP_DIR is a git checkout - left where it is" ;;
         foreign)  warn "$APP_DIR does not look like an RSCanvas install - left where it is" ;;
         refuse)   warn "$APP_DIR is not a directory an uninstaller should remove - left where it is" ;;
@@ -399,11 +493,13 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         [ -n "$DBS" ] && say "  DROPS      database$( [ "$(wc -w <<< "$DBS")" -gt 1 ] && echo s) $DBS"
         say "  DROPS      the roles rscanvas_owner, rscanvas and rscanvas_admin, unless they own something else"
         [ -d /etc/rscanvas ] && say "  DELETES    /etc/rscanvas - the env file with its secrets, and the TLS pair"
+        [ -d "$STATE_DIR" ] && say "  DELETES    $STATE_DIR - the service's working files (exports waiting to be downloaded)"
         [ -n "$ASIDE_ETC" ] && say "  DELETES    $ASIDE_ETC (set aside by a restore)"
         id -u "$SVC_USER" >/dev/null 2>&1 && say "  DELETES    the service account $SVC_USER"
     else
         [ -n "$DBS" ] && say "  keeps      database$( [ "$(wc -w <<< "$DBS")" -gt 1 ] && echo s) $DBS and the three roles"
         [ -d /etc/rscanvas ] && say "  keeps      /etc/rscanvas - RSCANVAS_SECRET, the database passwords, the TLS pair"
+        [ -d "$STATE_DIR" ] && say "  keeps      $STATE_DIR - the service's working files"
         id -u "$SVC_USER" >/dev/null 2>&1 && say "  keeps      the service account $SVC_USER, which the TLS files belong to"
     fi
     say "  never      backups ($BACKUP_DIR: ${NBACKUPS:-0}) or packages"
@@ -447,6 +543,8 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         # file open, so removing it here does not cut the run short.
         rm -rf -- "$APP_DIR"
         good "$APP_DIR removed"
+    elif [ "$APP_STATE" = empty ]; then
+        rmdir -- "$APP_DIR" && good "$APP_DIR removed (it was empty)"
     fi
 
     if [ "$DO_PURGE" = 1 ]; then
@@ -463,6 +561,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
             else warn "role $r kept - it still holds privileges somewhere else on this server"; fi
         done
         if [ -e /etc/rscanvas ]; then rm -rf -- /etc/rscanvas && good "/etc/rscanvas removed"; fi
+        if [ -d "$STATE_DIR" ]; then rm -rf -- "$STATE_DIR" && good "$STATE_DIR removed"; fi
         for d in $ASIDE_ETC; do rm -rf -- "$d" && good "$d removed"; done
         rm -rf /var/tmp/rscanvas-restore.* 2>/dev/null || true
         # Only a SYSTEM account with no login shell, which is what this
@@ -528,15 +627,20 @@ esac
 good "$PRETTY_NAME, package manager $PKG"
 if [ -n "$KEPT" ]; then good "kept from the existing install:${KEPT%,}"; fi
 
-if [ "$SYSLOG_PORT" -lt 1024 ] || [ "$TRAP_PORT" -lt 1024 ]; then
-    warn "syslog udp/$SYSLOG_PORT and traps udp/$TRAP_PORT are privileged ports."
-    warn "This installer grants the capability to the node binary rather than running as root."
-    warn "A daemon parsing hostile input from the network is the wrong thing to hand root to."
-    warn "Use --high-ports for 5514/15162 with an iptables redirect instead."
-    if [ "$ASSUME_YES" != 1 ]; then
-        read -r -p "  continue with setcap on node? [y/N] " a
-        case "$a" in y|Y) ;; *) die "stopped - re-run with --high-ports" ;; esac
-    fi
+if [ "$SYSLOG_PORT" -lt 1024 ] || [ "$TRAP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -lt 1024 ]; then
+    # No question any more: the capability is the SERVICE's, granted by its
+    # systemd unit (AmbientCapabilities), not the node binary's - which gave
+    # every local user's node programs the privileged ports (review F17).
+    good "privileged ports (syslog $SYSLOG_PORT, traps $TRAP_PORT, web $HTTP_PORT): granted to the service by its unit, never root"
+fi
+
+step "storage"
+storage_report
+# Asked only while the answer can still change something: PostgreSQL not yet
+# installed, so a data disk mounted now is where it will put the database.
+if [ "$ON_SYSTEM_DISK" = 1 ] && [ ! -d "$(pg_base)" ] && [ "$ASSUME_YES" != 1 ]; then
+    read -r -p "  install the database on the system disk? [Y/n] " a
+    case "$a" in n|N) die "stopped - mount a data disk at $(pg_base), then run this again" ;; esac
 fi
 
 step "packages"
@@ -656,10 +760,32 @@ else
 fi
 
 step "service account and directories"
-id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$SVC_USER"
-install -d -o "$SVC_USER" -g "$SVC_USER" "$APP_DIR"
+# THE CODE IS ROOT'S, THE SERVICE WRITES ONLY ITS STATE DIRECTORY (2026-10-01,
+# review F6). The service account owned $APP_DIR, and root runs scripts from
+# it - this installer on every upgrade, rscanvas-backup.sh from root's crontab.
+# The service is the component that parses hostile input from the network, so
+# code execution inside it could rewrite a script root would run, and become
+# root within a day. Now root owns the code and the service can write only
+# $STATE_DIR (exports); the systemd unit below enforces the same with
+# ProtectSystem=strict. A wrong --dir must not be made root's recursively.
+case "$(app_dir_state)" in
+    refuse)  die "--dir $APP_DIR is not a directory this installer will take over - choose one of its own, such as /opt/rscanvas" ;;
+    foreign) die "$APP_DIR holds something that is not RSCanvas - extract the bundle into an empty or new directory" ;;
+    checkout) warn "$APP_DIR is a git checkout; it becomes root's like any install, so commit or pull there as root (or install from a bundle)" ;;
+esac
+if id -u "$SVC_USER" >/dev/null 2>&1; then
+    # Its home was the application directory, which it no longer owns. With
+    # the service running usermod refuses; the service step retries it with
+    # the service stopped, just before the restart it makes anyway.
+    if [ "$(getent passwd "$SVC_USER" | cut -d: -f6)" != "$STATE_DIR" ]; then
+        usermod -d "$STATE_DIR" "$SVC_USER" 2>/dev/null && good "$SVC_USER's home is now $STATE_DIR"
+    fi
+else
+    useradd --system --home-dir "$STATE_DIR" --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
+fi
+install -d -o root -g root -m 0755 "$APP_DIR"
 install -d -m 0700 /etc/rscanvas
-good "$SVC_USER, $APP_DIR"
+good "$SVC_USER, $APP_DIR (root's), $STATE_DIR (the service's)"
 
 step "secrets"
 # NEVER REGENERATE. An existing value is read back and reused, so re-running
@@ -668,13 +794,24 @@ step "secrets"
 # property in the file.
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:root "$ENV_FILE"
 read_secret() { sed -n "s/^$1=//p" "$ENV_FILE" | head -1; }
+# WRITTEN BY awk, WITH THE VALUE AS DATA (2026-10-01, review F5). This was
+# `sed -i "s|^$k=.*|$k=$v|"`, which made the value part of a sed PROGRAM: a
+# value of `x|e;#` ended the substitution and added sed's e flag, which runs
+# the line as a shell command - as root. The values come back from the env
+# file, and --restore puts a backup's env file in place before re-running
+# this script, so a tampered backup was root by this door too. awk reads the
+# key and value from its environment, where nothing is syntax.
 set_secret() {
-    local k="$1" v="$2"
-    if grep -q "^$k=" "$ENV_FILE"; then
-        sed -i "s|^$k=.*|$k=$v|" "$ENV_FILE"
-    else
-        printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
-    fi
+    local k="$1" v="$2" tmp
+    case "$v" in *$'\n'*|*$'\r'*) die "refusing to write $k: its value contains a line break" ;; esac
+    tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+    K="$k" V="$v" awk '
+        BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; n = length(k) + 1; seen = 0 }
+        substr($0, 1, n) == k "=" { print k "=" v; seen = 1; next }
+        { print }
+        END { if (!seen) print k "=" v }' "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; die "could not write $k to $ENV_FILE"; }
+    chmod 600 "$tmp"; chown root:root "$tmp"
+    mv "$tmp" "$ENV_FILE"
     # ASSERT READABLE. Writing a secret and not reading it back is how an
     # install reports success over a file the service cannot use.
     [ "$(read_secret "$k")" = "$v" ] || die "wrote $k but could not read it back from $ENV_FILE"
@@ -698,6 +835,14 @@ CRED_KEY_NEW=0
 if [ -z "$CRED_KEY" ]; then CRED_KEY="$(openssl rand -base64 32)"; CRED_KEY_NEW=1; fi
 ADMIN_PASS_DB="$(read_secret RSCANVAS_ADMIN_DB_PASSWORD)"
 [ -n "$ADMIN_PASS_DB" ] || ADMIN_PASS_DB="$(openssl rand -hex 24)"
+# The two database passwords go into superuser SQL ('...' below) and into a
+# URL, so they must be of a shape that is neither (review F5: a restored env
+# file is a backup's, and a backup is input). This installer only ever mints
+# hex; anything else was edited in by hand or arrived in a backup.
+for pw in "RSCANVAS_DB_PASSWORD:$DB_PASS" "RSCANVAS_ADMIN_DB_PASSWORD:$ADMIN_PASS_DB"; do
+    [[ "${pw#*:}" =~ ^[A-Za-z0-9._~+=-]{12,128}$ ]] \
+        || die "${pw%%:*} in $ENV_FILE is not a password this installer would write (12 to 128 of A-Z a-z 0-9 . _ ~ + = -) - fix or remove that line and re-run"
+done
 COMMUNITY="$(read_secret SNMP_COMMUNITY)"
 [ -n "$COMMUNITY" ] || COMMUNITY=public
 
@@ -713,6 +858,18 @@ set_secret SYSLOG_PORT "$SYSLOG_PORT"
 set_secret TRAP_PORT "$TRAP_PORT"
 set_secret COLLECTOR_ENABLED 1
 set_secret JOBS_ENABLED 1
+# WHERE EXPORTS ARE WRITTEN: the state directory (review F6). The code's
+# default is ./data/exports, inside the application directory, which the
+# service can no longer write - so it is always written here. A path an
+# operator chose (a bigger disk) is kept, and the unit is told to allow it.
+SPOOL_DIR="$(read_secret EXPORT_SPOOL_DIR)"
+if [[ ! "$SPOOL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "$SPOOL_DIR" = "$APP_DIR"* ]]; then
+    [ -n "$SPOOL_DIR" ] && warn "EXPORT_SPOOL_DIR=$SPOOL_DIR is inside $APP_DIR or not an absolute path - exports move to $STATE_DIR/exports"
+    SPOOL_DIR="$STATE_DIR/exports"
+    set_secret EXPORT_SPOOL_DIR "$SPOOL_DIR"
+fi
+if [ -n "$RAW_DAYS" ]; then set_secret RAW_RETENTION_DAYS "$RAW_DAYS"; good "raw samples kept $RAW_DAYS days (RAW_RETENTION_DAYS)"; fi
+if [ -n "$MSG_DAYS" ]; then set_secret MESSAGE_RETENTION_DAYS "$MSG_DAYS"; good "syslog and traps kept $MSG_DAYS days (MESSAGE_RETENTION_DAYS)"; fi
 # RETENTION ON, FOR NEW INSTALLS ONLY (the operator's ruling, 2026-09-28). The
 # application defaults to a dry run - it reports what it would drop and drops
 # nothing - and until now nothing ever changed that on an installed box, so
@@ -724,7 +881,7 @@ set_secret JOBS_ENABLED 1
 # date. Written only when absent, so a deliberate 1 is never overwritten.
 if [ "$DB_NEW" = 1 ] && ! grep -q '^RETENTION_DRY_RUN=' "$ENV_FILE"; then
     set_secret RETENTION_DRY_RUN 0
-    good "retention on: raw samples kept 14 days, messages 30, the hourly rollup always (RETENTION_DRY_RUN=0)"
+    good "retention on: raw samples kept $(keep_days "$RAW_DAYS" RAW_RETENTION_DAYS 14) days, messages $(keep_days "$MSG_DAYS" MESSAGE_RETENTION_DAYS 30), the hourly rollup always (RETENTION_DRY_RUN=0)"
 fi
 good "$ENV_FILE (0600 root:root), $( [ "$DB_NEW" = 1 ] && echo 'new' || echo 'existing') database credential"
 
@@ -739,6 +896,14 @@ good "$ENV_FILE (0600 root:root), $( [ "$DB_NEW" = 1 ] && echo 'new' || echo 'ex
 # one port, one cert, at most one warning. Turning TLS off is a deliberate
 # hand edit: remove TLS_CERT and TLS_KEY from the env file and restart.
 TLS_DIR=/etc/rscanvas/tls
+# The pair the installer manages, readable by the service and nobody else,
+# however it arrived - minted, supplied, kept, or put back by a restore, which
+# extracts without the archive's owners (rscanvas-backup.sh, review F5).
+tls_pair_perms() {
+    install -d -m 0750 -o root -g "$SVC_USER" "$TLS_DIR"
+    if [ -f "$TLS_DIR/key.pem" ]; then chown root:"$SVC_USER" "$TLS_DIR/key.pem"; chmod 0640 "$TLS_DIR/key.pem"; fi
+    if [ -f "$TLS_DIR/cert.pem" ]; then chown root:"$SVC_USER" "$TLS_DIR/cert.pem"; chmod 0644 "$TLS_DIR/cert.pem"; fi
+}
 if [ "$DO_TLS" = 1 ]; then
     step "tls"
     [ -n "$TLS_CERT_SRC" ] && [ -z "$TLS_KEY_SRC" ] && die "--tls-cert without --tls-key: half a pair must not fall back to plaintext OR to a minted key that does not match"
@@ -761,6 +926,7 @@ if [ "$DO_TLS" = 1 ]; then
         install -m 0640 -o root -g "$SVC_USER" "$TLS_KEY_SRC" "$TLS_DIR/key.pem"
         good "installed the supplied pair into $TLS_DIR"
     elif [ -s "$TLS_DIR/cert.pem" ] && [ -s "$TLS_DIR/key.pem" ]; then
+        tls_pair_perms
         good "existing pair kept - $(openssl x509 -in "$TLS_DIR/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2 | sed 's/^/expires /')"
     else
         # One self-signed cert named for EVERY address this box answers on,
@@ -792,6 +958,7 @@ fi
 # the scheme does.
 if [ "$DO_TLS" != 1 ] && [ -n "$(read_secret TLS_CERT)" ]; then
     chgrp "$SVC_USER" /etc/rscanvas; chmod 0710 /etc/rscanvas
+    [ "$(read_secret TLS_CERT)" = "$TLS_DIR/cert.pem" ] && tls_pair_perms
     good "tls kept from a previous run ($(read_secret TLS_CERT))"
 fi
 
@@ -826,7 +993,21 @@ if [ ! -f "$APP_DIR/package.json" ]; then
     then re-run. This script deliberately does not fetch code: an installer that
     chooses your version is an installer that can change it under you."
 fi
-chown -R "$SVC_USER:$SVC_USER" "$APP_DIR"
+# Root's, readable by everyone, writable by nobody else (the service account
+# step says why). Recursive on every run, because a bundle extracted as root
+# keeps its archive's owners, and an install from before this change left the
+# service account owning every file.
+chown -R root:root "$APP_DIR"
+chmod -R u+rwX,go+rX,go-w "$APP_DIR"
+# The spool that lived inside the code. Exports are held in memory, so its
+# files were orphans the moment the service last restarted - nothing can
+# serve them - and the directory is root's now.
+if [ -d "$APP_DIR/data/exports" ]; then
+    n="$(find "$APP_DIR/data/exports" -maxdepth 1 -type f -name '*.csv' | wc -l)"
+    find "$APP_DIR/data/exports" -maxdepth 1 -type f -name '*.csv' -delete
+    rmdir "$APP_DIR/data/exports" "$APP_DIR/data" 2>/dev/null || true
+    good "the old export spool in $APP_DIR/data removed ($n orphaned file(s)); exports now go to $SPOOL_DIR"
+fi
 good "$APP_DIR ($( [ -f "$APP_DIR/BUNDLE-MANIFEST.txt" ] && head -c 60 "$APP_DIR/BUNDLE-MANIFEST.txt" | tr '\n' ' ' || echo 'no manifest'))"
 
 step "schema - BUILD, then HARDEN, never the other way round"
@@ -839,22 +1020,63 @@ sudo -u "$SVC_USER" env \
     node "$APP_DIR/src/db/apply-schema.ts" --with-retention
 good "schema applied as rscanvas_admin, with retention"
 
-if [ -x "$APP_DIR/tools/harden-roles.sh" ]; then
-    # PGPASSWORD is the app role's GENERATED credential, not the dev default.
-    # Without it the script's own verification cannot log in, and since that
-    # verification is the part which proves the permission model rather than
-    # asserting it, a silent skip would be worse than the failure.
-    PGPASSWORD="$DB_PASS" bash "$APP_DIR/tools/harden-roles.sh" "$DB_NAME"
-    good "roles hardened and verified"
-else
-    warn "tools/harden-roles.sh not present - the app role still owns its tables and can DROP them"
-fi
+# PRESENT, NOT EXECUTABLE (2026-10-01, review F13a). The test was -x, and git
+# stored the script 100644: a bundle built from a Linux clone skipped the
+# hardening with a warning - a fresh install then failed later and less
+# clearly, an upgrade silently skipped the repair. It runs through bash, so
+# its mode never mattered; and a bundle without it is incomplete, not optional.
+[ -f "$APP_DIR/tools/harden-roles.sh" ] \
+    || die "tools/harden-roles.sh is missing from $APP_DIR - the bundle is incomplete; extract a whole one and re-run"
+# PGPASSWORD is the app role's GENERATED credential, not the dev default.
+# Without it the script's own verification cannot log in, and since that
+# verification is the part which proves the permission model rather than
+# asserting it, a silent skip would be worse than the failure.
+PGPASSWORD="$DB_PASS" bash "$APP_DIR/tools/harden-roles.sh" "$DB_NAME"
+good "roles hardened and verified"
 
 if [ "$DO_SERVICE" = 1 ]; then
     step "service"
-    if [ "$SYSLOG_PORT" -lt 1024 ] || [ "$TRAP_PORT" -lt 1024 ]; then
-        setcap 'cap_net_bind_service=+ep' "$(command -v node)"
-        good "cap_net_bind_service granted to $(command -v node) - NOT running as root"
+    # THE UNIT IS THE SANDBOX (2026-10-01, review F17; every line below was
+    # measured on Ubuntu 24.04, systemd 255, before it was written).
+    #
+    # Capabilities: CAP_NET_BIND_SERVICE only when a port is below 1024, and
+    # CAP_NET_RAW always - for fping, which the collector spawns. Both are
+    # the SERVICE's (ambient), never a file capability on the system-wide
+    # node, which gave every local user's node programs the privileged ports
+    # and was dropped by any upgrade of the nodejs package.
+    #
+    # Why node holds CAP_NET_RAW at all: under NoNewPrivileges - which every
+    # seccomp-based setting below implies anyway - a program can gain no
+    # capability its parent did not hold, so fping's own file capability is
+    # void when node spawns it ("can't create socket"). fping 5.1's
+    # unprivileged ICMP mode, the alternative, gets no replies at all (also
+    # measured). The trade is deliberate: NoNewPrivileges closes the setuid
+    # route to root (sudo, pkexec and their bugs) for anything running as
+    # the service, and raw IP sockets with no link layer (AF_PACKET is not
+    # among RestrictAddressFamilies) add little to what the service already
+    # does on the network.
+    #
+    # Filesystem: everything read-only (ProtectSystem=strict) except the
+    # state directory, which systemd creates and gives to the service, and an
+    # export spool an operator moved elsewhere. Not set, deliberately:
+    # MemoryDenyWriteExecute (V8 compiles code at run time) and a system call
+    # filter (libuv's io_uring use varies by kernel; not worth a mystery hang).
+    CAPS="CAP_NET_RAW"
+    if [ "$SYSLOG_PORT" -lt 1024 ] || [ "$TRAP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -lt 1024 ]; then
+        CAPS="CAP_NET_BIND_SERVICE CAP_NET_RAW"
+    fi
+    RW_SPOOL=""
+    case "$SPOOL_DIR" in
+        "$STATE_DIR"|"$STATE_DIR"/*) ;;
+        *) install -d -o "$SVC_USER" -g "$SVC_USER" -m 0750 "$SPOOL_DIR"; RW_SPOOL="ReadWritePaths=$SPOOL_DIR" ;;
+    esac
+    PROTECT_HOME=yes
+    case "$APP_DIR" in /home/*|/root/*) PROTECT_HOME=read-only ;; esac
+    # The old way, undone: a capability this installer put on node.
+    NODE_BIN="$(command -v node)"
+    if getcap "$NODE_BIN" 2>/dev/null | grep -q cap_net_bind_service; then
+        setcap -r "$NODE_BIN"
+        good "the port capability an earlier install put on $NODE_BIN removed - the unit grants it to the service alone"
     fi
     cat > /etc/systemd/system/rscanvas.service <<UNIT
 [Unit]
@@ -877,11 +1099,44 @@ Restart=always
 RestartSec=10
 SyslogIdentifier=rscanvas
 
+# The sandbox - rscanvas-setup.sh, the service step, says why each line is
+# here and why two common ones are not.
+AmbientCapabilities=$CAPS
+CapabilityBoundingSet=$CAPS
+NoNewPrivileges=yes
+StateDirectory=rscanvas
+StateDirectoryMode=0750
+UMask=0027
+ProtectSystem=strict
+$RW_SPOOL
+ProtectHome=$PROTECT_HOME
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
 [Install]
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
     systemctl enable rscanvas >/dev/null 2>&1
+    # The home move the account step could not make: usermod refuses while
+    # the account has a running process, and an upgrade runs this script with
+    # the service up (production, 2026-10-01). It is restarted next anyway,
+    # so stopping it first costs nothing.
+    if [ "$(getent passwd "$SVC_USER" | cut -d: -f6)" != "$STATE_DIR" ]; then
+        systemctl stop rscanvas 2>/dev/null || true
+        if usermod -d "$STATE_DIR" "$SVC_USER" 2>/dev/null; then good "$SVC_USER's home is now $STATE_DIR"
+        else warn "could not move $SVC_USER's home to $STATE_DIR (it has no login, so nothing depends on it)"; fi
+    fi
     systemctl restart rscanvas
     good "rscanvas.service enabled and started"
 fi
@@ -891,7 +1146,12 @@ ok=1
 sleep 8
 if [ "$DO_SERVICE" = 1 ]; then
     [ "$(systemctl is-active rscanvas)" = active ] || { bad "rscanvas.service is $(systemctl is-active rscanvas)"; ok=0; }
+    [ "$(systemctl show rscanvas -p NoNewPrivileges --value 2>/dev/null)" = yes ] \
+        && good "the unit's sandbox is in force (no new privileges, read-only system, capabilities: $CAPS)" \
+        || { bad "rscanvas.service is running without its sandbox"; ok=0; }
 fi
+if sudo -u "$SVC_USER" test -w "$APP_DIR" 2>/dev/null; then bad "$SVC_USER can write $APP_DIR - root runs scripts from there"; ok=0
+else good "$APP_DIR is root's; $SVC_USER can write only $STATE_DIR$( [ -n "${RW_SPOOL:-}" ] && echo " and $SPOOL_DIR" )"; fi
 # THE SCHEME IS READ FROM THE ENV FILE, NOT FROM THE FLAG. A box that got
 # --tls on a previous run serves https on THIS run too, flag or no flag, and
 # a verify that probed http would report a healthy box as broken. Verify the
@@ -926,6 +1186,7 @@ printf '\n%s================ RSCanvas is up ================%s\n' "$B" "$N"
 say "  web        $SCHEME://$(hostname -I | awk '{print $1}'):$HTTP_PORT$( [ "$SCHEME" = https ] && echo '   (self-signed: the browser warns once)' )"
 say "  syslog     udp/$SYSLOG_PORT      traps  udp/$TRAP_PORT"
 say "  database   $DB_NAME     config  $ENV_FILE"
+say "  keeps      raw samples $(keep_days "$RAW_DAYS" RAW_RETENTION_DAYS 14) days, syslog and traps $(keep_days "$MSG_DAYS" MESSAGE_RETENTION_DAYS 30) days"
 say "  service    systemctl status rscanvas    journalctl -u rscanvas -f"
 say ""
 if [ "$ADMIN_NEW" = 1 ]; then

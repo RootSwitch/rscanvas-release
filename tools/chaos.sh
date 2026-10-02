@@ -398,16 +398,20 @@ That is finding 5 (a blip must not kill the process), not a shutdown bug. Log ke
     if [ -z "$final" ]; then
         bad "no final ingest stats were logged - the shutdown path did not report"
     else
-        local rec wr shed
+        local rec wr shed refused
         rec=$(echo "$final" | grep -oP '"received":\s*\K[0-9]+' | head -1)
         wr=$(echo "$final" | grep -oP '"written":\s*\K[0-9]+' | head -1)
         shed=$(echo "$final" | grep -oP '"shedByUs":\s*\K[0-9]+' | head -1)
+        # Rows the database refused on their content (review F4); absent on
+        # builds before the field, which is 0.
+        refused=$(echo "$final" | grep -oP '"rowsRefused":\s*\K[0-9]+' | head -1)
+        refused=${refused:-0}
         local q
         q=$(echo "$final" | grep -oP '"queued":\s*\K[0-9]+' | head -1)
-        if [ -n "$rec" ] && [ -n "$wr" ] && [ -n "$shed" ] && [ "$((wr + shed))" -eq "$rec" ]; then
-            ok "every accepted datagram is accounted for: received $rec = written $wr + shed $shed"
+        if [ -n "$rec" ] && [ -n "$wr" ] && [ -n "$shed" ] && [ "$((wr + shed + refused))" -eq "$rec" ]; then
+            ok "every accepted datagram is accounted for: received $rec = written $wr + shed $shed + refused $refused"
         else
-            bad "accepted datagrams went missing across shutdown: received $rec, written $wr, shed $shed"
+            bad "accepted datagrams went missing across shutdown: received $rec, written $wr, shed $shed, refused $refused"
         fi
         # The same fact from the other side, and the one a regressed drain
         # trips first: an early return leaves rows sitting in the queue at exit.

@@ -218,6 +218,24 @@ S -c "ALTER DEFAULT PRIVILEGES FOR ROLE $ADMIN_ROLE IN SCHEMA public
       GRANT EXECUTE ON FUNCTIONS TO $APP_ROLE"
 echo "  $APP_ROLE granted DML on current and future objects (owner- AND admin-created)"
 
+# THE AUDIT TRAIL IS APPEND-ONLY FOR THE APPLICATION (2026-10-01, review
+# F13c). It only ever INSERTs and SELECTs there, and a role that could UPDATE
+# or DELETE audit rows could rewrite the record of what it did. After the
+# blanket grant above, which every run repeats. Deleting a user still sets
+# audit.actor_id to NULL: PostgreSQL runs a foreign key's action as the
+# referencing table's owner, not as the role that deleted the user.
+S -c "REVOKE UPDATE, DELETE, TRUNCATE ON audit FROM $APP_ROLE"
+echo "  audit is append-only for $APP_ROLE"
+
+# THE DATABASE IS FOR ITS OWN ROLES. CONNECT and TEMP are granted to PUBLIC by
+# default, so on a shared PostgreSQL every role on the server could connect
+# here and make temporary tables. The application role and the admin role
+# are the only ones that sign in; the owner never does, and the superuser is
+# not subject to this.
+S -c "REVOKE CONNECT, TEMPORARY ON DATABASE $DB FROM PUBLIC"
+S -c "GRANT CONNECT ON DATABASE $DB TO $APP_ROLE, $ADMIN_ROLE"
+echo "  CONNECT on $DB for $APP_ROLE and $ADMIN_ROLE only"
+
 # CREATE on the schema is what lets a role make a table of its own - and a
 # table it made is a table it owns and can drop. Taking it away is what stops
 # the disposable-partition pattern from quietly restoring the capability.
@@ -234,7 +252,11 @@ for f in "${DEFINER_FUNCS[@]}"; do
     # databases. The owner role is the one every other object has.
     S -c "ALTER FUNCTION $f OWNER TO $OWNER_ROLE"
     S -c "ALTER FUNCTION $f SET search_path = public, pg_temp"
-    echo "  ${f%%(*} is SECURITY DEFINER with a pinned search_path"
+    # Callable by the application role, not by every role on the server:
+    # EXECUTE goes to PUBLIC by default, and these run as the owner (F13c).
+    S -c "REVOKE EXECUTE ON FUNCTION $f FROM PUBLIC"
+    S -c "GRANT EXECUTE ON FUNCTION $f TO $APP_ROLE"
+    echo "  ${f%%(*} is SECURITY DEFINER with a pinned search_path, callable by $APP_ROLE alone"
 done
 
 echo

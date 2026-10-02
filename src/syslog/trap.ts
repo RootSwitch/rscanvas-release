@@ -50,8 +50,26 @@ export interface TrapPduLike {
     varbinds?: Array<{ oid: string; value: unknown }>;
 }
 
+/**
+ * A TRAP'S SIZE IS BOUNDED LIKE A SYSLOG LINE'S (2026-10-01, review F15).
+ * Syslog datagrams are cut at MAX_DATAGRAM_BYTES; a trap had no cap at all,
+ * and a 64 KB datagram rendered to about 256 KB of row - a binary value hexed
+ * once into msg and again into raw. INGEST_QUEUE_MAX counts rows and was sized
+ * for syslog's, so a database stall under a stream of large traps ran the
+ * worker out of memory. A value keeps its first TRAP_VALUE_CHARS characters
+ * and a trap its first TRAP_VARBINDS_MAX varbinds, each saying what it lost;
+ * the ingest worker cuts the rendered line at MAX_DATAGRAM_BYTES as for syslog.
+ * The largest real trap seen, an IPMI PET, is 47 bytes - 94 characters of hex.
+ */
+export const TRAP_VALUE_CHARS = 512;
+export const TRAP_VARBINDS_MAX = 32;
+
 /** A varbind value as text: printable buffers as text, the rest as hex. */
 export function renderValue(v: unknown): string {
+    return clipText(renderFull(v), TRAP_VALUE_CHARS);
+}
+
+function renderFull(v: unknown): string {
     if (v === null || v === undefined) return '';
     if (Buffer.isBuffer(v)) {
         let printable = true;
@@ -59,6 +77,18 @@ export function renderValue(v: unknown): string {
         return printable ? v.toString('utf8') : '0x' + v.toString('hex');
     }
     return String(v);
+}
+
+/** Text cut to `max` characters, saying how much was cut. */
+export function clipText(text: string, max: number): string {
+    return text.length <= max ? text : `${text.slice(0, max)}...(+${text.length - max} chars)`;
+}
+
+/** The varbinds a trap's row keeps, and how many it does not. */
+export function keptVarbinds<T>(varbinds: readonly T[]): { kept: readonly T[]; more: number } {
+    return varbinds.length <= TRAP_VARBINDS_MAX
+        ? { kept: varbinds, more: 0 }
+        : { kept: varbinds.slice(0, TRAP_VARBINDS_MAX), more: varbinds.length - TRAP_VARBINDS_MAX };
 }
 
 /**
@@ -79,7 +109,9 @@ export function renderTrap(pdu: TrapPduLike, nowMs: number = Date.now()): string
 
 function renderPlain(pdu: TrapPduLike): string {
     const varbinds = pdu.varbinds ?? [];
-    const listed = varbinds.map((vb) => `${vb.oid}=${renderValue(vb.value)}`).join(' ');
+    const { kept, more } = keptVarbinds(varbinds);
+    const listed = kept.map((vb) => `${vb.oid}=${renderValue(vb.value)}`).join(' ')
+        + (more > 0 ? ` (+${more} more varbinds)` : '');
     if (typeof pdu.enterprise === 'string' && typeof pdu.generic === 'number') {
         const generic = pdu.generic;
         const specific = typeof pdu.specific === 'number' ? pdu.specific : 0;

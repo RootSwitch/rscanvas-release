@@ -15,6 +15,7 @@
 import snmp from 'net-snmp';
 import { CONFIG } from '../config.ts';
 import { explainV3Error, explainV3Timeout, explainCommunityTimeout } from '../credentials/v3.ts';
+import { guardSession } from '../net/snmp-guard.ts';
 
 /**
  * net-snmp ships no type declarations, so TypeScript infers what it can from
@@ -76,6 +77,8 @@ export interface Session {
  * rather than literals. Default 5s with 1 retry is the parent's, and it is
  * where "a dead device costs about 10s" comes from: 5s x (1 + 1 retry).
  */
+let unguardedSaid = false;
+
 export function createSession(t: Target): Session {
     const options = {
         port: t.port || 161,
@@ -134,6 +137,16 @@ export function createSession(t: Target): Session {
     inner.on('error', (err: Error) => {
         session.lastError = err instanceof Error ? err : new Error(String(err));
     });
+
+    // AND A THROW, WHICH NO 'error' LISTENER SEES (2026-10-01, review F1b): a
+    // v1/v2c device answering with a Report PDU threw from inside net-snmp's
+    // message handler and ended the process. net/snmp-guard.ts says how the
+    // socket is guarded and why a swallowed throw alone would hang the poll.
+    if (!guardSession(inner, (err) => { session.lastError = err; }) && !unguardedSaid) {
+        unguardedSaid = true;
+        console.error('[collector] ALARM could not reach the SNMP session\'s socket to guard it '
+            + '(net-snmp internals moved?) - a hostile device can stop the process with one response');
+    }
 
     // AND ONE CLASS OF ERROR CANNOT REACH THAT LISTENER AT ALL, which is an
     // upstream bug rather than a gap here. net-snmp's socket-error path is

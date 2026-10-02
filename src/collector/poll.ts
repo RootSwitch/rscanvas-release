@@ -17,6 +17,7 @@ import { sensorSample, planSensorRepin, type SensorExtra } from './sensors.ts';
 import { speedTrust } from './speedtrust.ts';
 import { planRekey } from './rekey.ts';
 import { OPS, type SampleRow } from '../store/index.ts';
+import { inDomain } from '../store/bounds.ts';
 
 export interface PollResult {
     ok: boolean;
@@ -401,8 +402,10 @@ export async function pollDevice(
             // pins at about 4.29G, which silently understates every 10G port.
             const hs = asNumber(highSpeed.get(idx) ?? null);
             const speedBps = hs !== null && hs > 0 ? hs * 1_000_000 : asNumber(speed.get(idx) ?? null);
-            const adminStatus = asNumber(admin.get(idx) ?? null);
-            const operStatus = asNumber(oper.get(idx) ?? null);
+            // Inside their RFC 2863 domains or nothing (review F7): an
+            // agent's 70000 is not a status the alerting can reason about.
+            const adminStatus = inDomain(asNumber(admin.get(idx) ?? null), 1, 3);
+            const operStatus = inDomain(asNumber(oper.get(idx) ?? null), 1, 7);
 
             let row = byIndex.get(idx);
             if (!row) {

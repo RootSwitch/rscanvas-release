@@ -113,6 +113,78 @@ export function nestedQuantifier(pattern: string): { at: number; group: string }
 }
 
 /**
+ * THE POLYNOMIAL HALF (2026-10-01, review F3). The refusal above catches the
+ * exponential shape; the patterns operators actually write are polynomial, and
+ * the review measured them where the budget below could not help:
+ * `.*(error|fail).*(timeout|refused).*` took 22.7 s on an 8 KB line of
+ * "error error ...", and `.*error` took 54 ms on an 8 KB line with no match -
+ * over the budget, so ONE datagram from anyone disarmed the rule. That is an
+ * alert-evasion primitive: the line that disarms the rule can come just before
+ * the line the rule exists to catch.
+ *
+ * Three measures, none of which changes what an honest rule matches:
+ *
+ * 1. searchForm drops a LEADING `.*` and a TRAILING `.*`. A rule is tested,
+ *    never anchored, so they mean nothing - `.*error` finds exactly the lines
+ *    `error` finds - but the engine pays for a leading one by retrying it from
+ *    every position, quadratic in the line. Both measured patterns become
+ *    linear or nearly: `error`, and `(error|fail).*(timeout|refused)`.
+ * 2. MORE THAN ONE UNBOUNDED WILDCARD (`.*` or `.+`) in one alternative is
+ *    refused at compile, after that normalisation. Each one multiplies the
+ *    backtracking by the line's length, so two in a row is cubic - billions
+ *    of steps on 8 KB - and nothing at run time can interrupt it.
+ * 3. A REGEX TESTS AT MOST MATCH_TEXT_MAX characters of the message, which
+ *    bounds what one quadratic wildcard can cost (about 15 ms on a crafted
+ *    line, under the budget). Substring rules are linear and test the whole
+ *    message. The stored message is never cut by this.
+ */
+export const MATCH_TEXT_MAX = 4096;
+
+/** A pattern with the leading and trailing `.*` a test never needs dropped. */
+export function searchForm(pattern: string): string {
+    let p = pattern;
+    for (;;) {
+        const lead = /^\.\*\??/.exec(p);
+        if (lead === null || lead[0].length === p.length) break;
+        p = p.slice(lead[0].length);
+    }
+    for (;;) {
+        const tail = /\.\*\??$/.exec(p);
+        if (tail === null || tail.index === 0) break;
+        // Not when the dot is escaped: `\.*` is "any number of full stops".
+        let slashes = 0;
+        for (let i = tail.index - 1; i >= 0 && p[i] === '\\'; i--) slashes++;
+        if (slashes % 2 === 1) break;
+        p = p.slice(0, tail.index);
+    }
+    return p;
+}
+
+/** The most unbounded wildcards (`.*`, `.+`) in any one top-level alternative,
+ *  escapes and character classes skipped. */
+export function wildcardRuns(pattern: string): number {
+    let most = 0;
+    let here = 0;
+    let depth = 0;
+    for (let i = 0; i < pattern.length; i++) {
+        const ch = pattern[i];
+        if (ch === '\\') { i += 1; continue; }
+        if (ch === '[') {
+            while (i < pattern.length && pattern[i] !== ']') {
+                if (pattern[i] === '\\') i += 1;
+                i += 1;
+            }
+            continue;
+        }
+        if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+        else if (ch === '|' && depth === 0) { most = Math.max(most, here); here = 0; }
+        else if (ch === '.' && (pattern[i + 1] === '*' || pattern[i + 1] === '+')) here++;
+    }
+    return Math.max(most, here);
+}
+
+/**
  * A single rule test slower than this on ONE message is not slow, it is
  * pathological: a normal test is microseconds. Used by the ingest worker to
  * disarm the rule rather than keep paying it - see matchMessage's onSlow.
@@ -150,16 +222,35 @@ export function compileRule(rule: EventRule): { ok: true; compiled: CompiledRule
     }
     let re: RegExp;
     try {
-        re = new RegExp(rule.pattern);
+        // Compiled as written first, so a syntax error names the operator's
+        // pattern rather than its search form.
+        new RegExp(rule.pattern);
+        re = new RegExp(searchForm(rule.pattern));
     } catch (err) {
         return { ok: false, detail: `regex does not compile: ${(err as Error).message}` };
+    }
+    if (wildcardRuns(re.source) > 1) {
+        return {
+            ok: false,
+            detail: 'more than one ".*" or ".+" between the parts of the pattern. Each one '
+                + 'multiplies the work by the length of the line, so on a long line two of them '
+                + 'can hold the ingest thread for seconds; the pattern is refused rather than armed. '
+                + 'Keep one wildcard, or split it into two rules. A leading or trailing ".*" is '
+                + 'fine - a rule matches anywhere in the line already, so those are dropped.',
+        };
     }
     // re.test carries lastIndex state only with the g/y flags, which user
     // patterns here never get - the constructor above adds none.
     // `risky` is what the runtime budget times: a substring rule is linear
     // and cannot backtrack, so timing it would be pure overhead on the
     // latency thread for a case that cannot occur.
-    return { ok: true, compiled: { rule, risky: true, test: (msg) => re.test(msg) } };
+    return {
+        ok: true,
+        compiled: {
+            rule, risky: true,
+            test: (msg) => re.test(msg.length > MATCH_TEXT_MAX ? msg.slice(0, MATCH_TEXT_MAX) : msg),
+        },
+    };
 }
 
 /**
@@ -186,6 +277,28 @@ export interface MessageForMatch {
     app: string | null;
     ts: Date;
 }
+
+/**
+ * THE HOST, AS IT GOES INTO A KEY (2026-10-01, review F11). The key is
+ * event|<rule>|<host>, and the per-rule cap's overflow row is event|<rule>|*.
+ * The host is the sender's claim, so a sender could name itself `*|1`, `*|2`,
+ * ... - keys whose third field read as the overflow's `*`, each kept as its own
+ * row and owed its own raise: exactly the flood the 20-host cap exists to stop.
+ * `%`, `|` and `*` are written as %25, %7C and %2A, so no host can make a key
+ * that splits differently or names the overflow. Only the key changes; the
+ * alert's host column keeps the name as it was sent.
+ */
+export function keyHost(host: string): string {
+    return host.replace(/[%|*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/** The rule's overflow key, the one row every host past the cap folds into. */
+export function overflowKey(ruleId: string): string {
+    return `event|${ruleId}|*`;
+}
+
+/** At most this many keys wait in memory for the next flush (review F11). */
+export const PENDING_EVENTS_MAX = 10_000;
 
 /** One accumulated alert-to-be, the flush's unit of work. */
 export interface PendingEvent {
@@ -218,6 +331,7 @@ export interface PendingEvent {
 export function matchMessage(
     compiled: CompiledRule[], pending: Map<string, PendingEvent>, m: MessageForMatch,
     onSlow?: (rule: EventRule, ms: number) => void,
+    maxPending?: number,
 ): number {
     // The loop-breaker's recorded cost, stated where it is paid: a sender
     // spoofing APP-NAME as the notifier's own name exempts itself from ALL
@@ -251,15 +365,24 @@ export function matchMessage(
         // stored MESSAGE keeps the full host (never-drop applies to the
         // record, not to identity minted from it).
         const host = (m.host ?? m.sourceIp).slice(0, 255);
-        const key = `event|${c.rule.id}|${host}`;
-        const existing = pending.get(key);
+        let key = `event|${c.rule.id}|${keyHost(host)}`;
+        let existing = pending.get(key);
+        if (existing === undefined && maxPending !== undefined && pending.size >= maxPending) {
+            // FULL: a new host folds into the rule's overflow key here too
+            // (review F11). The database's cap decides between a per-host row
+            // and the overflow row; this bounds what is held in memory while
+            // it cannot be asked - a database outage under a flood of invented
+            // names grew this map without limit.
+            key = overflowKey(c.rule.id);
+            existing = pending.get(key);
+        }
         if (existing === undefined) {
             pending.set(key, {
                 alertKey: key,
                 ruleId: c.rule.id,
                 ruleName: c.rule.name,
                 severity: c.rule.severity,
-                host,
+                host: key === overflowKey(c.rule.id) ? '*' : host,
                 count: 1,
                 lastTs: m.ts,
                 sample: m.msg.slice(0, 200),

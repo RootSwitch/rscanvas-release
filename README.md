@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.4).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.5).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -72,8 +72,9 @@ so they show the page as the code now draws it.
   overrides, device-down and interface-down conditions, a pending/active/
   clearing state machine, maintenance windows that withhold notification,
   notify policies by device, location or application, escalation debt, and
-  delivery by email, ntfy or syslog with a ledger of what is owed. A whole
-  device's alerts can be muted, one device or a selection at a time. A location or application can raise one
+  delivery by email, ntfy or syslog with a ledger of what is owed. A
+  device's polled alerts (down, interfaces, sensors) can be muted, one device
+  or a selection at a time; its syslog and trap rules still alert. A location or application can raise one
   group alert when enough of its devices are down, holding their own emails
   while it is open.
 - **Dashboard and reports.** Open alerts first, then the top 10 interfaces
@@ -90,7 +91,8 @@ so they show the page as the code now draws it.
 - **Operations.** Per-user accounts with roles and an audit trail - each
   role sees only the controls it may use, and everyone can change their own
   password - TLS, an OpenMetrics endpoint, a one-command installer with hardened database
-  roles, a backup tool that proves its own backups restore, an uninstall that
+  roles, a backup tool that checks every dump against its row counts and with
+  `--test` proves it restores, an uninstall that
   keeps your data unless told otherwise, and health reporting that names the
   thread or lane that is behind.
 
@@ -102,7 +104,8 @@ SNMP fleets for demonstrations and load tests.
 
 - Linux. Ubuntu 24.04 is what the installer and the drills ran on.
 - Node 22.18 or later. The TypeScript is run directly; there is no build step.
-- PostgreSQL 16 or later; 18 is what was tested.
+- PostgreSQL 16 or later from source; the installer installs 18, which is
+  what was tested.
 - `fping` for ICMP reachability (optional; TCP checks work without it).
 - Four runtime dependencies and no native modules, so a bundle built on one
   platform runs on another.
@@ -133,30 +136,39 @@ From source, for development:
     npm install
     createdb rscanvas
     DATABASE_URL=postgres://user:pass@localhost:5432/rscanvas node src/db/apply-schema.ts --with-retention
-    DATABASE_URL=... ADMIN_PASSWORD=... node src/main.ts
+    DATABASE_URL=... ADMIN_PASSWORD=... COLLECTOR_ENABLED=1 JOBS_ENABLED=1 \n        RSCANVAS_SECRET=... node src/main.ts
 
 The first start with no users creates an admin from `ADMIN_PASSWORD` (name
-from `ADMIN_USERNAME`, default `admin`). `npm test` runs the offline suite:
-forty-seven test files and sixteen static checkers, no database needed.
+from `ADMIN_USERNAME`, default `admin`). Without `COLLECTOR_ENABLED=1`
+nothing is polled and without `JOBS_ENABLED=1` nothing is rolled up or
+expired; retention stays a dry run until `RETENTION_DRY_RUN=0`, and with no
+`RSCANVAS_SECRET` credential profiles are off. The installer sets all four.
+`npm test` runs the offline suite: fifty-six test files, sixteen static
+checkers and a type check, no database needed.
 
 ## Configuration
 
-Everything is an environment variable, read once in `src/config.ts`, where
-each one carries the reasoning behind its default. The ones that matter first:
+Everything is an environment variable, most of them read once in
+`src/config.ts`, where each one carries the reasoning behind its default.
+The ones that matter first:
 
 | variable | meaning |
 |---|---|
 | `DATABASE_URL` | the application role's connection string |
 | `RSCANVAS_ADMIN_DB_PASSWORD` | the maintenance role's password, needed on a hardened database for index DDL |
-| `HTTP_PORT`, `BIND_ADDRESS` | the web port (18080) and bind address |
+| `HTTP_PORT` | the web port: 18080 from the installer, 8080 when run from source |
+| `BIND_ADDRESS` | the address the web port, syslog and traps listen on; unset, they listen on every address (the web port on IPv6 as well) |
 | `TLS_CERT`, `TLS_KEY` | PEM pair; when set, the session cookie is Secure by default |
-| `RSCANVAS_SECRET` | the secret that signs sessions and capability tokens |
+| `RSCANVAS_SECRET` | the key that encrypts stored SNMP credential profiles. Sessions and display tokens do not use it: changing it revokes nothing, and makes every stored profile unreadable |
 | `ADMIN_USERNAME`, `ADMIN_PASSWORD` | first-boot admin, only when no users exist |
 | `SNMP_COMMUNITY` | the default v2c community; v3 and per-device credentials are managed in the UI |
-| `SYSLOG_PORT`, `TRAP_PORT` | UDP listeners (5514, 15162 by default; the privileged ports need a capability) |
+| `SYSLOG_PORT`, `TRAP_PORT` | UDP listeners: 514 and 162 from the installer (15162 for traps and 5514 for syslog with `--high-ports`), 5514 and 5162 when run from source |
+| `TRUST_PROXY` | `1` behind a reverse proxy: the client address is the last `X-Forwarded-For` entry, which the proxy wrote. Set it only when every connection comes through the proxy - `BIND_ADDRESS=127.0.0.1` with the proxy on the same box |
+| `COOKIE_SECURE` | the session cookie's Secure flag: on by default with `TLS_CERT`; set `1` behind a proxy that terminates TLS |
 | `POLL_CONCURRENCY`, `POLL_DOWN_CONCURRENCY` | in-flight polls, and how many of them may be retries of down devices (half the pool by default) |
 | `RAW_RETENTION_DAYS`, `MESSAGE_RETENTION_DAYS` | how many days of samples and messages to keep |
 | `ALERT_SMTP_*`, `ALERT_NTFY_*`, `ALERT_SYSLOG_*` | notification channels |
+| `ALERT_NOTIFY_BURST`, `ALERT_NOTIFY_PER_MINUTE` | how many alerts a channel sends one by one: 60 at once, then 60 a minute; past that they wait and go out together as one message a minute, never dropped |
 | `METRICS_TOKEN` | enables `/metrics` behind a bearer token |
 
 ## Reading the code

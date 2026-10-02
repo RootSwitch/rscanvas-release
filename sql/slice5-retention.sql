@@ -101,6 +101,29 @@ DECLARE
     RSCANVAS_LOCK_NS constant int := 1381253120;   -- 0x52530000
     LOCK_RETENTION   constant int := 2;
 BEGIN
+    -- THE FLOORS ARE THE FUNCTION'S, NOT THE CALLER'S (2026-10-01, review F13b).
+    --
+    -- Every guard's limit arrived as a parameter with a default, and EXECUTE
+    -- is the application role's - so that role, or anything able to make it
+    -- run SQL, could pass keep_days 0 with the floors zeroed and drop every
+    -- partition, today's included. The definer attribute that makes this the
+    -- only way to drop a partition also made it the way to drop them all.
+    -- So the limits that protect history are enforced HERE, as minimums: the
+    -- RETENTION_* settings can still make retention stricter, never looser.
+    -- A NULL is not a value either way - a NULL keep_days made no partition
+    -- "newer than the cutoff", and a NULL dry_run read as "not a dry run".
+    IF tbl IS NULL OR tbl NOT IN ('samples', 'messages') THEN
+        RAISE EXCEPTION 'refusing: retention drops partitions of samples and messages only, not %', tbl;
+    END IF;
+    IF keep_days IS NULL THEN
+        RAISE EXCEPTION 'refusing: keep_days is NULL for %', tbl;
+    END IF;
+    min_keep_days := GREATEST(coalesce(min_keep_days, 7), 7);
+    min_keep      := GREATEST(coalesce(min_keep, 2), 1);
+    max_span_days := LEAST(coalesce(max_span_days, 31), 32);
+    max_drop      := GREATEST(coalesce(max_drop, 3), 0);
+    dry_run       := coalesce(dry_run, true);
+
     -- Finding 10, inside the function because an operator running this from
     -- psql does not come through the pool that pins UTC. `current_date` below
     -- is LOCAL midnight, and against UTC-bounded partitions that shifts

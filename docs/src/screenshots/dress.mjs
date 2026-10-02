@@ -241,8 +241,16 @@ function dressDash(data, devices) {
             meanPct: d[field], peakPct: Math.min(100, d[field] + spread(d.name, `${salt}pk`, 0, peakSpread)),
             trend: spread(d.name, `${salt}tr`, -8, 8) / 100,
         }));
+    // The snapshot predates errors and discards as two lists (2026-10-01):
+    // its combined list, split and ranked as the server now does.
+    const ed = renamePorts(data).errs ?? [];
+    const rank = (field, trendField) => ed.filter((x) => (x[field] ?? 0) > 0)
+        .sort((a, b) => b[field] - a[field]).slice(0, 10)
+        .map((x) => ({ ...x, [trendField]: x.trendErrs }));
     return {
         ...renamePorts(data),
+        errs: rank('errors', 'trendErrs'),
+        discards: rank('discards', 'trendDiscards'),
         cpu: list('cpu_pct', data.cpu[0], (n) => `CPU (${cores(n)} cores)`, 11, 'C'),
         mem: list('mem_pct', data.mem[0], () => 'Memory: Physical memory', 4, 'M'),
     };

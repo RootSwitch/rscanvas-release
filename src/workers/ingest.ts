@@ -12,7 +12,8 @@
 //   FLUSH_ROWS  200    flush early when a burst starts filling the queue
 //   FLUSH_CHUNK 2000   cap one transaction, so a burst cannot hold the thread
 //                      long enough to overflow the OS receive buffer
-//   QUEUE_MAX   50000  backpressure ceiling
+//   QUEUE_MAX   50000  backpressure ceiling - INGEST_QUEUE_MAX since
+//                      2026-09-30 (config.ts says what it costs)
 //   DROP_BATCH  1%     shed in BATCHES, never one row per datagram: a
 //                      per-datagram splice reindexes the whole 50k array, so a
 //                      sustained flood costs O(n) per packet and O(n^2) over
@@ -27,6 +28,7 @@
 // 50,000 row burst from becoming one enormous transaction.
 
 import dgram from 'node:dgram';
+import { isIP } from 'node:net';
 import { parentPort, workerData } from 'node:worker_threads';
 import { CONFIG } from '../config.ts';
 import { startHeartbeat } from '../heartbeat.ts';
@@ -34,19 +36,21 @@ import { installSafetyNet } from '../safety.ts';
 import { copyMessages, closeAll, OPS, type MessageRow } from '../store/index.ts';
 import { parse } from '../syslog/parse.ts';
 import {
-    compileRule, matchMessage, eventLabel,
+    compileRule, matchMessage, eventLabel, PENDING_EVENTS_MAX,
     type CompiledRule, type PendingEvent, type EventRule,
 } from '../alerts/events.ts';
 import { socketStats, systemStats, describeRcvbuf, PROC_AVAILABLE } from '../net/udpstats.ts';
 import type { IngestStats } from './protocol.ts';
 import { makeFlushGate, failureBackoffMs, shouldLogFailure } from './flush-gate.ts';
-import { renderTrap, renderValue, deviceForAddress, hostForMessage } from '../syslog/trap.ts';
+import { renderTrap, renderValue, deviceForAddress, hostForMessage, keptVarbinds, clipText } from '../syslog/trap.ts';
+import { guardTrapReceiver, logSafe, type TrapDrop } from '../syslog/trap-guard.ts';
+import { copyIsolating, isDataError } from './copy-isolate.ts';
 import { decodePet, petSyslogSeverity } from '../syslog/pet.ts';
 
 const FLUSH_MS = 300;
 const FLUSH_ROWS = 200;
 const FLUSH_CHUNK = 2000;
-const QUEUE_MAX = 50_000;
+const QUEUE_MAX = CONFIG.ingestQueueMax;
 const DROP_BATCH = Math.max(1, Math.floor(QUEUE_MAX * 0.01));
 
 const hb = startHeartbeat('ingest', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdMs);
@@ -59,6 +63,9 @@ let flushes = 0;
 let flushFailures = 0;
 let nulsStripped = 0;
 let truncated = 0;
+/** Rows the database refused on their content and that were dropped alone
+ *  (review F4) - the one deliberate loss besides shedding. */
+let rowsRefused = 0;
 let laneBusyEvents = 0;
 let running = true;
 let flushing = false;
@@ -120,6 +127,30 @@ let peakRxQueueBytes = 0;
 
 function log(...args: unknown[]): void {
     console.log(new Date().toISOString(), '[ingest]', ...args);
+}
+
+// Traps refused or failed, counted always and logged at most once a minute
+// (2026-10-01, review F10): a line per packet was a journal flood any sender
+// could drive, and the error text carried sender-chosen bytes - a v3 user
+// name with a CR LF in it forged a log line.
+const trapsRefused: Record<TrapDrop | 'error', number> = { v3: 0, malformed: 0, ack: 0, error: 0 };
+const TRAP_DROP_TEXT: Record<TrapDrop | 'error', string> = {
+    v3: 'refused: SNMPv3 is not accepted',
+    malformed: 'dropped: the SNMP library could not handle it',
+    ack: 'Inform acknowledgement could not be encoded (the trap itself was kept)',
+    error: 'error',
+};
+let trapLogQuietUntil = 0;
+let trapLogSuppressed = 0;
+function trapProblem(why: TrapDrop | 'error', detail: string, from?: string): void {
+    trapsRefused[why]++;
+    const now = Date.now();
+    if (now < trapLogQuietUntil) { trapLogSuppressed++; return; }
+    trapLogQuietUntil = now + 60_000;
+    const more = trapLogSuppressed > 0 ? ` (and ${trapLogSuppressed} more since the last line)` : '';
+    trapLogSuppressed = 0;
+    log(`trap ${TRAP_DROP_TEXT[why]}${from ? ` from ${from}` : ''}`
+        + `${detail ? `: ${logSafe(detail.slice(0, 200))}` : ''}${more}`);
 }
 
 let asyncErrors = 0;
@@ -246,6 +277,7 @@ async function flushEvents(): Promise<void> {
         items.map((p) => eventLabel(p)),
         items.map((p) => p.count),
         items.map((p) => p.lastTs),
+        CONFIG.eventAlertHostsMax,
     );
     if (!res.ok) {
         for (const [k, p] of batch) {
@@ -280,7 +312,7 @@ function enqueue(row: MessageRow): void {
             // never be 'event|N|null', so the last resort is named.
             sourceIp: row.sourceIp ?? 'unknown-source',
             proto: row.proto ?? 'syslog', app: row.app, ts: row.ts,
-        }, disarmRule);
+        }, disarmRule, PENDING_EVENTS_MAX);
     }
 
     if (queue.length >= FLUSH_ROWS) {
@@ -288,6 +320,14 @@ function enqueue(row: MessageRow): void {
     } else {
         flushGate.armIfIdle();
     }
+}
+
+/** copyMessages in the shape copyIsolating takes, counting NULs on success. */
+async function copyForIsolation(part: MessageRow[]): Promise<{ ok: boolean; rowCount: number }> {
+    const { outcome, nulsStripped: nuls } = await copyMessages(part);
+    if (!outcome.ok) return { ok: false, rowCount: 0 };
+    nulsStripped += nuls;
+    return { ok: true, rowCount: outcome.rowCount };
 }
 
 async function flush(): Promise<void> {
@@ -312,7 +352,34 @@ async function flush(): Promise<void> {
             // two points is the one moment they can be lost.
             inFlightBatch = batch;
             const t0 = performance.now();
-            const { outcome, nulsStripped: nuls } = await copyMessages(batch);
+            let copied: Awaited<ReturnType<typeof copyMessages>>;
+            try {
+                copied = await copyMessages(batch);
+            } catch (err) {
+                if (!isDataError(err)) throw err;
+                // ONE ROW'S DATA, NOT THE DATABASE (review F4): written in
+                // halves until what cannot be stored is a single row, and only
+                // that row is dropped. copyIsolating never throws.
+                const iso = await copyIsolating(batch, copyForIsolation);
+                inFlightBatch = null;
+                written += iso.written;
+                rowsRefused += iso.dropped.length;
+                if (iso.dropped.length > 0) {
+                    const first = iso.dropped[0] as MessageRow;
+                    log(`ALARM the database refused ${iso.dropped.length} message row(s) on their content `
+                        + `(${logSafe((err as Error).message).slice(0, 160)}); dropped them alone and wrote the other `
+                        + `${iso.written}. First: from ${first.sourceIp ?? '?'}: ${logSafe(first.raw).slice(0, 160)}`);
+                }
+                if (iso.requeue.length > 0) {
+                    queue.unshift(...iso.requeue);
+                    flushFailed(`flush failed while isolating a refused row, ${iso.requeue.length} rows requeued`);
+                    break;
+                }
+                flushes++;
+                flushSucceeded();
+                continue;
+            }
+            const { outcome, nulsStripped: nuls } = copied;
             nulsStripped += nuls;
 
             if (outcome.ok) {
@@ -527,7 +594,8 @@ async function drain(deadlineMs = CONFIG.ingestDrainDeadlineMs): Promise<void> {
 // --- sockets -----------------------------------------------------------------
 
 function bindSyslog(): dgram.Socket {
-    const socket = dgram.createSocket({ type: 'udp4', recvBufferSize: CONFIG.rcvbufBytes });
+    // udp6 for an IPv6 BIND_ADDRESS: a udp4 socket cannot bind one (review F9).
+    const socket = dgram.createSocket({ type: isIP(CONFIG.bindAddress) === 6 ? 'udp6' : 'udp4', recvBufferSize: CONFIG.rcvbufBytes });
 
     socket.on('error', (err: NodeJS.ErrnoException) => {
         log(`syslog socket error: ${err.message}`);
@@ -619,19 +687,28 @@ async function bindTraps(): Promise<TrapReceiver | null> {
         return null;
     }
 
+    // On BIND_ADDRESS like the syslog socket (review F9: it had no address,
+    // so it listened everywhere whatever BIND_ADDRESS said).
     const receiver = snmp.createReceiver(
-        { port: CONFIG.trapPort, disableAuthorization: true, includeAuthentication: true },
+        {
+            port: CONFIG.trapPort, address: CONFIG.bindAddress,
+            transport: isIP(CONFIG.bindAddress) === 6 ? 'udp6' : 'udp4',
+            disableAuthorization: true, includeAuthentication: true,
+        },
         (error: Error | null, notification: unknown) => {
             if (error) {
-                log('trap error:', error.message);
                 // Same first-deployment trap as syslog above, and traps are
                 // WORSE to diagnose because this receiver does not exit -
                 // the app runs happily while nothing arrives.
                 if (/EACCES|permission denied/i.test(error.message) && CONFIG.trapPort < 1024) {
+                    log('trap error:', error.message);
                     log(`ALARM cannot bind udp/${CONFIG.trapPort} for traps - ports below 1024 `
                         + 'need privilege. Grant the capability to node once, or set '
                         + 'TRAP_PORT to a high port and redirect. Traps are NOT being received.');
+                    return;
                 }
+                // Per packet otherwise, so counted and rate-limited.
+                trapProblem('error', error.message);
                 return;
             }
             try {
@@ -644,6 +721,7 @@ async function bindTraps(): Promise<TrapReceiver | null> {
                 };
                 const pdu = n.pdu ?? {};
                 const varbinds = pdu.varbinds ?? [];
+                const kept = keptVarbinds(varbinds);
                 const sourceIp = n.rinfo?.address ?? null;
                 const now = new Date();
                 enqueue({
@@ -663,7 +741,8 @@ async function bindTraps(): Promise<TrapReceiver | null> {
                     app: 'snmp-trap',
                     procid: null,
                     proto: 'trap',
-                    msg: renderTrap(pdu, now.getTime()),
+                    // Cut like a syslog datagram (review F15; trap.ts says why).
+                    msg: clipText(renderTrap(pdu, now.getTime()), CONFIG.maxDatagramBytes),
                     raw: JSON.stringify({
                         source: sourceIp,
                         ...(typeof pdu.enterprise === 'string' ? {
@@ -671,7 +750,8 @@ async function bindTraps(): Promise<TrapReceiver | null> {
                         } : {}),
                         // renderValue, not String(): a binary varbind (a PET's
                         // 47 bytes) came out of String() as mangled UTF-8.
-                        varbinds: varbinds.map((v) => ({ oid: v.oid, value: renderValue(v.value) })),
+                        varbinds: kept.kept.map((v) => ({ oid: v.oid, value: renderValue(v.value) })),
+                        ...(kept.more > 0 ? { moreVarbinds: kept.more } : {}),
                     }),
                 });
             } catch (err) {
@@ -679,6 +759,17 @@ async function bindTraps(): Promise<TrapReceiver | null> {
             }
         },
     ) as unknown as TrapReceiver;
+
+    // THE GUARD, BEFORE ANYTHING ELSE TOUCHES THE SOCKET (review F1 and F10;
+    // syslog/trap-guard.ts). Without it one Inform datagram ends the process,
+    // so a receiver that cannot be guarded is closed rather than run.
+    const guarded = guardTrapReceiver(receiver, (why, detail, rinfo) => trapProblem(why, detail, rinfo?.address));
+    if (guarded === 0) {
+        receiver.close();
+        log('ALARM traps are OFF: the trap receiver\'s socket could not be reached to guard it '
+            + '(net-snmp internals moved?), and unguarded it can be stopped by one datagram');
+        return null;
+    }
 
     // SIZE THE TRAP SOCKET LIKE THE SYSLOG ONE (2026-09-24, the lab-5 ingest
     // test). net-snmp creates the receiver's socket itself with no buffer
@@ -738,6 +829,7 @@ function snapshot(): IngestStats {
         received,
         written,
         queued: queue.length,
+        queueMax: QUEUE_MAX,
         flushes,
         flushFailures,
         writeFailingMs: failingSince === null ? 0 : Date.now() - failingSince,
@@ -750,6 +842,7 @@ function snapshot(): IngestStats {
 
         // Ours: what we threw away under backpressure.
         shedByUs: shed,
+        rowsRefused,
         asyncErrors,
         eventRulesArmed: compiledEventRules.length,
         eventRuleErrors,
@@ -762,6 +855,7 @@ function snapshot(): IngestStats {
         disarmedRuleIds: [...disarmedRuleIds.keys()],
         eventMatches,
         eventUpserts,
+        trapsRefused: { ...trapsRefused },
 
         // The kernel's: what never reached us at all. This is the number the
         // done-when criterion is about, and it is null rather than 0 where it

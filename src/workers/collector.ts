@@ -37,6 +37,7 @@ import {
 import { tcpSweep } from '../collector/tcpcheck.ts';
 import { downBudget, liveBudget } from '../collector/lanes.ts';
 import { pollTiming } from '../collector/schedule.ts';
+import { copyIsolating, isDataError } from './copy-isolate.ts';
 import { fpingAvailable, runFpingSweep } from '../collector/fping.ts';
 import type { Target } from '../collector/snmp.ts';
 import type { CollectorStats } from './protocol.ts';
@@ -283,6 +284,8 @@ installSafetyNet({ thread: 'collector', onRejection: () => { asyncErrors++; } })
 
 let pending: SampleRow[] = [];
 let flushing = false;
+/** The batch a flush is writing, for isolating a refused row (review F7). */
+let lastFlushBatch: SampleRow[] | null = null;
 
 async function flush(): Promise<void> {
     if (flushing || pending.length === 0) return;
@@ -290,6 +293,7 @@ async function flush(): Promise<void> {
     try {
         const batch = pending;
         pending = [];
+        lastFlushBatch = batch;
         const t0 = performance.now();
         const res = await copySamples(batch);
         lastWriteMs = Number((performance.now() - t0).toFixed(1));
@@ -305,7 +309,22 @@ async function flush(): Promise<void> {
     } catch (err) {
         writeFailures++;
         log('sample write failed:', (err as Error).message);
+        // ONE DEVICE'S VALUE, NOT THE DATABASE (review F7). The COPY carries
+        // every device's rows, and bounds.ts keeps device values storable;
+        // if a row is refused on its content anyway, the rest of the fleet's
+        // rows are written around it rather than lost with it.
+        if (isDataError(err) && lastFlushBatch !== null) {
+            const iso = await copyIsolating(lastFlushBatch, async (part) => {
+                const r = await copySamples(part);
+                return { ok: r.ok, rowCount: r.ok ? r.rowCount : 0 };
+            });
+            samplesWritten += iso.written;
+            log(`  isolated: wrote ${iso.written}, dropped ${iso.dropped.length} refused row(s)`
+                + (iso.dropped[0] ? ` (first: entity ${iso.dropped[0].entityId})` : '')
+                + (iso.requeue.length > 0 ? `, ${iso.requeue.length} lost to a second failure` : ''));
+        }
     } finally {
+        lastFlushBatch = null;
         flushing = false;
     }
 }

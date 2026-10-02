@@ -39,7 +39,7 @@ const collector = {
 } as unknown as CollectorStats;
 
 const ingest = {
-    thread: 'ingest', received: 90000, written: 89100, queued: 12,
+    thread: 'ingest', received: 90000, written: 89100, queued: 12, queueMax: 50000,
     flushes: 800, flushFailures: 1, laneBusyEvents: 0, truncated: 0,
     nulsStripped: 4, flushMaxMs: 90, shedByUs: 900, asyncErrors: 0,
     eventRulesArmed: 3, eventRuleErrors: 0, eventRulesDisarmed: 1,

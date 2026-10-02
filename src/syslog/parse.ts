@@ -176,9 +176,36 @@ function parseCiscoHeader(
     return null;                                            // prose: not a Cisco header
 }
 
+/**
+ * A TIMESTAMP THE DATABASE CAN STORE, or none (2026-10-01, review F4).
+ * Date.parse accepts year 0 (`0000-01-01T00:00:00Z`), the signed six-digit
+ * years (`+010000-...`, `-000001-...`) and V8's legacy `Jan 1 99999`, and
+ * toISOString writes them back out in forms PostgreSQL refuses - "date/time
+ * field value out of range", "time zone displacement out of range", measured
+ * on the lab box. One such line made the COPY of its whole 2,000-row batch
+ * fail, the batch went back to the head of the queue, and nothing was stored
+ * until the queue's ceiling shed the poison row together with good ones.
+ * Years 1 to 9999 are what both ends agree on; outside them the message keeps
+ * its text (raw holds the header) and has no message time, as a line with an
+ * unreadable timestamp always did. A device whose clock is merely wrong is
+ * inside the range and unaffected.
+ */
+export function storableTs(d: Date): boolean {
+    const y = d.getUTCFullYear();
+    return Number.isFinite(d.getTime()) && y >= 1 && y <= 9999;
+}
+
 /** One datagram -> one row. Never throws, never returns null. */
 export function parse(
     line: string, sourceIp: string | null, nowMs?: number, proto = 'syslog',
+): ParsedMessage {
+    const row = parseLine(line, sourceIp, nowMs, proto);
+    if (row.msgTs !== null && !storableTs(row.msgTs)) row.msgTs = null;
+    return row;
+}
+
+function parseLine(
+    line: string, sourceIp: string | null, nowMs: number | undefined, proto: string,
 ): ParsedMessage {
     const now = nowMs !== undefined ? new Date(nowMs) : new Date();
     const row: ParsedMessage = {

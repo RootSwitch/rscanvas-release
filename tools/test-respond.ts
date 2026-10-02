@@ -9,7 +9,7 @@ import { Readable } from 'node:stream';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import {
-    readJsonBody, readBodyOr400, containsNul, acceptsGzip, sendJsonGzip, GZIP_MIN_BYTES,
+    readJsonBody, readBodyOr400, containsNul, acceptsGzip, sendJsonGzip, GZIP_MIN_BYTES, clientIp, crossSiteRefusal,
 } from '../src/http/respond.ts';
 
 // House rule since test-walk: fail unless the run reaches its verdict.
@@ -114,6 +114,47 @@ console.log('\nsendJsonGzip - through a real server:');
     ok('a short answer goes as it is', tiny.headers['content-encoding'] === undefined && tiny.raw.toString('utf8') === JSON.stringify(small));
     server.close();
     server.closeAllConnections();
+}
+
+console.log('\nclientIp behind a proxy (review F9):');
+{
+    const req = (xff: string | string[] | undefined, peer = '127.0.0.1'): http.IncomingMessage => ({
+        headers: xff === undefined ? {} : { 'x-forwarded-for': xff },
+        socket: { remoteAddress: peer },
+    }) as unknown as http.IncomingMessage;
+    const was = process.env.TRUST_PROXY;
+    process.env.TRUST_PROXY = '1';
+    ok('the address the nearest proxy appended, not the one the client sent',
+        clientIp(req('6.6.6.6, 203.0.113.9')) === '203.0.113.9');
+    ok('a single entry is that entry', clientIp(req('203.0.113.9')) === '203.0.113.9');
+    ok('repeated headers read as one list, last entry wins', clientIp(req(['6.6.6.6', '203.0.113.9'])) === '203.0.113.9');
+    ok('an IPv6 client', clientIp(req('2001:db8::7')) === '2001:db8::7');
+    ok('junk is not an address: the socket peer instead (it reached inet as a 500)',
+        clientIp(req("x'; drop table audit;--")) === '127.0.0.1');
+    ok('an empty header is the socket peer', clientIp(req('')) === '127.0.0.1');
+    process.env.TRUST_PROXY = '0';
+    ok('untrusted, the header is ignored entirely', clientIp(req('203.0.113.9', '198.51.100.4')) === '198.51.100.4');
+    if (was === undefined) delete process.env.TRUST_PROXY; else process.env.TRUST_PROXY = was;
+}
+
+console.log('\na request from another origin cannot change anything (review F12):');
+{
+    const r = (method: string, headers: Record<string, string>): http.IncomingMessage =>
+        ({ method, headers: { host: 'monitor:18080', ...headers } }) as unknown as http.IncomingMessage;
+    ok('this page\'s own POST (Sec-Fetch-Site: same-origin) passes',
+        crossSiteRefusal(r('POST', { 'sec-fetch-site': 'same-origin' })) === null);
+    ok('a page on another port of the box (same-site) is refused - Lax lets its cookie through',
+        crossSiteRefusal(r('POST', { 'sec-fetch-site': 'same-site' })) !== null);
+    ok('a cross-site DELETE is refused', crossSiteRefusal(r('DELETE', { 'sec-fetch-site': 'cross-site' })) !== null);
+    ok('a typed or bookmarked request (none) passes', crossSiteRefusal(r('POST', { 'sec-fetch-site': 'none' })) === null);
+    ok('a GET is never refused - nothing changes on one', crossSiteRefusal(r('GET', { 'sec-fetch-site': 'cross-site' })) === null);
+    ok('an old browser: Origin naming this host passes',
+        crossSiteRefusal(r('POST', { origin: 'https://monitor:18080' })) === null);
+    ok('an old browser: Origin naming another port is refused',
+        crossSiteRefusal(r('POST', { origin: 'https://monitor:8443' })) !== null);
+    ok('Origin: null (a sandboxed frame) is refused', crossSiteRefusal(r('POST', { origin: 'null' })) !== null);
+    ok('neither header - curl, a test tool - passes: CSRF is done to browsers',
+        crossSiteRefusal(r('POST', {})) === null);
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

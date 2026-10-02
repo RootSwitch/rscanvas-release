@@ -99,6 +99,63 @@ max_slice() {
     printf '%s' "$best"
 }
 
+# A BACKUP IS INPUT, NOT A SCRIPT (2026-10-01, review F5). SHA256SUMS lives
+# inside the archive, so it proves the file is whole, not that this script
+# wrote it - a manifest edited along with its checksum passed. Its values then
+# reached root's shell and superuser SQL: `heap_bytes: a[$(cmd)]` ran cmd as
+# root through $(( )) on --test, before any prompt. So every manifest line must
+# have the shape this script writes, and an archive with any other line is
+# refused before a single value is read.
+manifest_line_ok() {
+    local l="$1" re
+    for re in \
+        '^format: [0-9]{1,3}$' \
+        '^created: [0-9]{8}T[0-9]{6}Z$' \
+        '^host: [A-Za-z0-9._-]{0,253}$' \
+        '^addresses: [0-9A-Za-z:. ]*$' \
+        '^mode: (full \(everything\)|standard \(raw samples and messages left out\))$' \
+        '^database: [a-z_][a-z0-9_]{0,62}$' \
+        '^postgres: [A-Za-z0-9 ._()+~-]{0,128}$' \
+        '^app_version: [A-Za-z0-9.+-]{0,64}$' \
+        '^app_commit: [A-Za-z0-9-]{0,64}$' \
+        '^schema_slice: [0-9]{1,4}$' \
+        '^heap_bytes: [0-9]{1,15}$' \
+        '^dump_seconds: [0-9]{1,9}$' \
+        '^rows [a-z0-9_]{1,63} [0-9]{1,15}$' \
+        '^skipped [a-z0-9_]{1,63} ~[0-9]{1,15}$'; do
+        [[ "$l" =~ $re ]] && return 0
+    done
+    return 1
+}
+# The whole manifest: every line of a known shape, and the fields a restore
+# reads present exactly once (a second `database:` would make one value two).
+manifest_ok() {
+    local f="$1" l k
+    while IFS= read -r l || [ -n "$l" ]; do
+        manifest_line_ok "$l" || { printf 'unexpected manifest line: %q' "${l:0:80}"; return 1; }
+    done < "$f"
+    for k in format database schema_slice heap_bytes; do
+        [ "$(grep -c "^$k: " "$f")" = 1 ] || { printf 'the manifest must say %s exactly once' "$k"; return 1; }
+    done
+}
+
+# The configuration archive's listing (tar -tv), member by member: only plain
+# files and directories, under the one top directory it was taken from, with
+# no set-id or sticky bits, no links and no '..'. tar -xpf as root restored
+# whatever the archive said, wherever it said - `cron.d/x` or `sudoers.d/x`
+# landed in /etc (review F5).
+etc_listing_ok() {
+    local top="$1" perms owner size day time name extra
+    while read -r perms owner size day time name extra; do
+        [ -z "$perms" ] && continue
+        [ -z "$extra" ] || { printf 'a member with a space, or a link: %q' "$name $extra"; return 1; }
+        case "$perms" in -*|d*) ;; *) printf 'not a plain file or directory: %q (%s)' "$name" "$perms"; return 1 ;; esac
+        case "$perms" in *[sStT]*) printf 'a set-id or sticky member: %q (%s)' "$name" "$perms"; return 1 ;; esac
+        [[ "$name" =~ ^$top(/[A-Za-z0-9._-]+)*/?$ ]] || { printf 'a member outside %s/: %q' "$top" "$name"; return 1; }
+        case "/$name/" in */../*|*/./*) printf 'a member with a dot path: %q' "$name"; return 1 ;; esac
+    done
+}
+
 self_test() {
     local fail=0
     t() { if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: got '$2', wanted '$3'"; fail=1; fi; }
@@ -121,6 +178,37 @@ self_test() {
     t 'numeric, not lexical, and suffixes ignored' "$(max_slice "$d")" 54
     rm -rf "${d:?}"
     t 'an empty tree is slice 0'                "$(max_slice /nonexistent)" 0
+    echo "manifest_line_ok - what this script writes, and what it must refuse (review F5):"
+    m() { if manifest_line_ok "$1"; then echo ok; else echo refused; fi; }
+    t 'a heap size'                             "$(m 'heap_bytes: 123456789')" ok
+    t 'the arithmetic injection'                "$(m 'heap_bytes: a[$(echo pwned >&2)]')" refused
+    t 'a database name'                         "$(m 'database: rscanvas')" ok
+    t 'a quote in a database name'              "$(m "database: x'; DROP DATABASE postgres; --")" refused
+    t 'a rows line'                             "$(m 'rows samples_hourly_202609 12345')" ok
+    t 'a rows line with SQL in the name'        "$(m 'rows a"b 1')" refused
+    t 'a skipped line'                          "$(m 'skipped samples_20260924 ~38191623')" ok
+    t 'a skipped line with a comment trick'     "$(m 'skipped x/**/ ~1')" refused
+    t 'the standard mode'                       "$(m 'mode: standard (raw samples and messages left out)')" ok
+    t 'the full mode'                           "$(m 'mode: full (everything)')" ok
+    t 'the server version'                      "$(m 'postgres: 18.6 (Ubuntu 18.6-1.pgdg24.04+2)')" ok
+    t 'an empty commit (a bundle-less tree)'    "$(m 'app_commit: ')" ok
+    t 'a line of no known shape'                "$(m 'restore_hook: rm -rf /')" refused
+    local mf; mf="$(mktemp)"
+    printf 'format: 1\ndatabase: rscanvas\nschema_slice: 56\nheap_bytes: 100\nrows users 3\n' > "$mf"
+    t 'a whole manifest'                        "$(manifest_ok "$mf" >/dev/null && echo ok || echo refused)" ok
+    printf 'database: other\n' >> "$mf"
+    t 'database given twice'                    "$(manifest_ok "$mf" >/dev/null && echo ok || echo refused)" refused
+    rm -f "$mf"
+    echo "etc_listing_ok - the configuration archive's members:"
+    e() { if printf '%s\n' "$1" | etc_listing_ok rscanvas >/dev/null; then echo ok; else echo refused; fi; }
+    t 'the env file'                            "$(e '-rw------- root/root 1234 2026-09-27 10:00 rscanvas/rscanvas.env')" ok
+    t 'the tls directory'                       "$(e 'drwxr-x--- root/rscanvas 0 2026-09-27 10:00 rscanvas/tls/')" ok
+    t 'a file outside it'                       "$(e '-rw-r--r-- root/root 10 2026-09-27 10:00 cron.d/x')" refused
+    t 'a dot-dot path'                          "$(e '-rw-r--r-- root/root 10 2026-09-27 10:00 rscanvas/../sudoers.d/x')" refused
+    t 'a symbolic link'                         "$(e 'lrwxrwxrwx root/root 0 2026-09-27 10:00 rscanvas/x -> /etc/shadow')" refused
+    t 'a hard link'                             "$(e 'hrw-r--r-- root/root 0 2026-09-27 10:00 rscanvas/x link to rscanvas/y')" refused
+    t 'a setuid file'                           "$(e '-rwsr-xr-x root/root 10 2026-09-27 10:00 rscanvas/x')" refused
+    t 'a device'                                "$(e 'crw-r--r-- root/root 0,0 2026-09-27 10:00 rscanvas/x')" refused
     [ "$fail" = 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }
 }
 
@@ -154,6 +242,18 @@ pg()    { sudo -u postgres psql -qAtX -v ON_ERROR_STOP=1 "$@"; }
 pgdb()  { local d="$1"; shift; pg -d "$d" "$@"; }
 env_get() { sed -n "s/^$1=//p" "$2" | head -1; }
 db_exists() { [ "$(pg -c "SELECT 1 FROM pg_database WHERE datname = '$1'")" = 1 ]; }
+# THE RESTORED DATABASE IS READ AS rscanvas_admin, NEVER AS THE SUPERUSER
+# (review F5). A dump is SQL, and a tampered one restored or even counted as
+# postgres runs with everything postgres can do - COPY ... TO PROGRAM is a
+# shell, and a "table" the counts read can be a view over any function.
+# rscanvas_admin is the installer's schema role, a member of the owner, so
+# owners and grants restore as before; pg_trgm is a trusted extension it may
+# create. Over TCP with the box's own credential, which restore_preflight reads.
+RESTORE_PW=""
+pg_admin() {
+    local d="$1"; shift
+    PGPASSWORD="$RESTORE_PW" psql -qAtX -v ON_ERROR_STOP=1 -h localhost -p 5432 -U rscanvas_admin -w -d "$d" "$@"
+}
 
 # Leaf tables (the ones that hold rows; a partitioned parent holds none) with
 # their exact counts, as "name count" lines. Names are checked before they are
@@ -167,7 +267,7 @@ count_tables() {
         sql+="${sql:+ UNION ALL }SELECT '$t', count(*) FROM public.\"$t\""
     done
     [ -n "$sql" ] || return 0
-    pgdb "$db" -F' ' -c "$sql"
+    pg_admin "$db" -F' ' -c "$sql"
 }
 
 # Unpack an archive into a private directory and prove it is whole before
@@ -183,6 +283,8 @@ unpack() {
     tar -xf "$FILE" -C "$STAGE" || die "$FILE is not a readable archive"
     [ -f "$STAGE/MANIFEST.txt" ] && [ -f "$STAGE/SHA256SUMS" ] || die "$FILE is not an RSCanvas backup (no manifest)"
     (cd "$STAGE" && sha256sum --quiet -c SHA256SUMS) || die "$FILE is damaged - a checksum does not match; do not restore it"
+    local why
+    why="$(manifest_ok "$STAGE/MANIFEST.txt")" || die "$FILE was not written by this script ($why) - refusing to read it further"
     [ "$(sed -n 's/^format: *//p' "$STAGE/MANIFEST.txt")" = "$FORMAT" ] || die "$FILE was written by a different version of this script"
     good "$FILE is whole ($(du -h "$FILE" | cut -f1), every checksum matches)"
     say "  taken      $(sed -n 's/^created: *//p' "$STAGE/MANIFEST.txt") on $(sed -n 's/^host: *//p' "$STAGE/MANIFEST.txt")"
@@ -201,6 +303,10 @@ restore_preflight() {
         [ "$(pg -c "SELECT 1 FROM pg_roles WHERE rolname = '$r'")" = 1 ] \
             || die "role $r does not exist - install RSCanvas on this box first (rscanvas-setup.sh), then restore"
     done
+    RESTORE_PW="$(env_get RSCANVAS_ADMIN_DB_PASSWORD "$ENV_FILE")"
+    [ -n "$RESTORE_PW" ] || die "no RSCANVAS_ADMIN_DB_PASSWORD in $ENV_FILE - the restore runs as rscanvas_admin; re-run rscanvas-setup.sh on this box first"
+    [ "$(pg_admin postgres -c 'SELECT 1' 2>/dev/null)" = 1 ] \
+        || die "cannot sign in to PostgreSQL as rscanvas_admin with the password in $ENV_FILE - re-run rscanvas-setup.sh on this box first"
     good "room for it (${need} MB needed, ${have} MB free), and the installer's roles exist"
 }
 
@@ -217,8 +323,9 @@ restore_into() {
     local t0=$SECONDS log="$STAGE/pg_restore.log"
     # ONE TRANSACTION: a restore that fails halfway leaves an empty database,
     # never a plausible-looking partial one. stdin is the file itself, so
-    # pg_restore can still seek in it.
-    if ! sudo -u postgres pg_restore --dbname="$target" --single-transaction --exit-on-error \
+    # pg_restore can still seek in it. As rscanvas_admin (pg_admin says why).
+    if ! PGPASSWORD="$RESTORE_PW" pg_restore -h localhost -p 5432 -U rscanvas_admin -w \
+            --dbname="$target" --single-transaction --exit-on-error \
             < "$STAGE/rscanvas.dump" > "$log" 2>&1; then
         sed 's/^/    /' "$log" | tail -15
         pg -c "DROP DATABASE IF EXISTS \"$target\"" || true
@@ -236,7 +343,7 @@ restore_into() {
     done < <(grep '^rows ' "$STAGE/MANIFEST.txt")
     # And the bulk that was left out is left out, rather than half-present.
     while read -r _ name _; do
-        got=$(pgdb "$target" -c "SELECT count(*) FROM public.\"$name\"" 2>/dev/null || echo MISSING)
+        got=$(pg_admin "$target" -c "SELECT count(*) FROM public.\"$name\"" 2>/dev/null || echo MISSING)
         [ "$got" = 0 ] || { warn "$name should be empty in a restore of this backup and holds $got rows"; diff=1; }
     done < <(grep '^skipped ' "$STAGE/MANIFEST.txt")
     if [ "$diff" != 0 ]; then
@@ -407,6 +514,10 @@ fi
 step "check the archive"
 unpack
 M() { sed -n "s/^$1: *//p" "$STAGE/MANIFEST.txt"; }
+# The configuration archive is checked now, before anything changes, member
+# by member (etc_listing_ok): it is extracted as root into /etc.
+WHY="$(LC_ALL=C tar -tvf "$STAGE/etc-rscanvas.tar" | etc_listing_ok "$(basename "$ENV_DIR")")" \
+    || die "the configuration in $FILE is not what this script writes ($WHY) - nothing was changed"
 DB="$(M database)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -462,10 +573,14 @@ restore_into "$DB" || { undo_db; die "the restore failed and was undone - this b
 
 step "restore $ENV_DIR"
 [ -d "$ENV_DIR" ] && mv "$ENV_DIR" "$ASIDE_ETC"
-if ! tar -xpf "$STAGE/etc-rscanvas.tar" -C "$(dirname "$ENV_DIR")"; then
+# Without the archive's owners and modes: root's, private, and the installer
+# re-run below gives the service user back exactly what it needs (the env
+# file stays 0600 root:root; the TLS pair is root:<service> 0640/0644).
+if ! (umask 077 && tar -xf "$STAGE/etc-rscanvas.tar" --no-same-owner --no-same-permissions -C "$(dirname "$ENV_DIR")"); then
     rm -rf "${ENV_DIR:?}"; [ -d "$ASIDE_ETC" ] && mv "$ASIDE_ETC" "$ENV_DIR"
     undo_db; die "could not unpack $ENV_DIR from the backup - undone"
 fi
+chown -R root:root "$ENV_DIR"; chmod -R go-rwx "$ENV_DIR"
 [ "$(db_from_url "$(env_get DATABASE_URL "$ENV_FILE")")" = "$DB" ] \
     || warn "the restored $ENV_FILE names a different database than the backup's manifest ($DB)"
 good "$ENV_DIR from the backup$([ -d "$ASIDE_ETC" ] && echo "; this box's own is in $ASIDE_ETC" || true)"

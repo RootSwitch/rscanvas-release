@@ -45,6 +45,7 @@ import { OPS, type AlertRecord } from '../store/index.ts';
 import { NOTIFIER_APP } from './events.ts';
 import { varsFor, render, type AlertEvent, type Alert } from './templates.ts';
 import { GROUP_KIND, parseGroupKey, groupDetail } from './groups.ts';
+import { digestMessage, type NotifyBudget } from './notify-budget.ts';
 
 const NL = String.fromCharCode(10);
 
@@ -96,16 +97,21 @@ function syslogSeverity(event: AlertEvent, severity: string): number {
 }
 
 function sendSyslog(event: AlertEvent, alert: AlertRecord, message: string): Promise<SendResult> {
+    const sd = `[rscanvas@0 event="${sdEscape(event)}" severity="${sdEscape(alert.severity)}"`
+        + ` kind="${sdEscape(alert.kind)}" host="${sdEscape(alert.host ?? '')}"`
+        + (alert.code !== null ? ` code="${sdEscape(alert.code)}"` : '') + ']';
+    return sendSyslogDatagram(syslogSeverity(event, alert.severity), event, sd, message);
+}
+
+/** One RFC 5424 datagram to the configured host: an alert's, or a digest's. */
+function sendSyslogDatagram(severity: number, event: string, sd: string, message: string): Promise<SendResult> {
     const host = CONFIG.alertSyslogHost.trim();
     if (host === '') return Promise.resolve({ ok: false, detail: 'no syslog host configured' });
     const port = clamp(CONFIG.alertSyslogPort, 1, 65535, 514);
     const facility = clamp(CONFIG.alertSyslogFacility, 0, 23, 16);
 
-    const pri = facility * 8 + syslogSeverity(event, alert.severity);
+    const pri = facility * 8 + severity;
     const ts = new Date().toISOString();
-    const sd = `[rscanvas@0 event="${sdEscape(event)}" severity="${sdEscape(alert.severity)}"`
-        + ` kind="${sdEscape(alert.kind)}" host="${sdEscape(alert.host ?? '')}"`
-        + (alert.code !== null ? ` code="${sdEscape(alert.code)}"` : '') + ']';
     // One datagram is one message: embedded newlines would make a
     // nonconforming multi-line payload.
     const flat = message.replace(/[\r\n]+/g, ' ');
@@ -145,9 +151,14 @@ const ntfyTag = (event: AlertEvent, severity: string): string =>
 /** HTTP headers must stay latin1; a fancy title loses a character, not the send. */
 const headerSafe = (s: string): string => s.replace(/[^\x20-\x7E]/g, '?').slice(0, 250);
 
-async function sendNtfy(
+function sendNtfy(
     event: AlertEvent, alert: AlertRecord, title: string, message: string,
 ): Promise<SendResult> {
+    return sendNtfyMessage(title, message, ntfyPriority(event, alert.severity), ntfyTag(event, alert.severity));
+}
+
+/** One ntfy message: an alert's, or a digest's. */
+async function sendNtfyMessage(title: string, message: string, priority: string, tag: string): Promise<SendResult> {
     const server = CONFIG.alertNtfyServer.trim().replace(/\/+$/, '');
     const topic = CONFIG.alertNtfyTopic.trim();
     if (server === '' || topic === '') return { ok: false, detail: 'ntfy server/topic not configured' };
@@ -159,8 +170,8 @@ async function sendNtfy(
             body: message,
             headers: {
                 Title: headerSafe(title),
-                Priority: ntfyPriority(event, alert.severity),
-                Tags: ntfyTag(event, alert.severity),
+                Priority: priority,
+                Tags: tag,
                 ...(CONFIG.alertNtfyToken !== '' ? { Authorization: `Bearer ${CONFIG.alertNtfyToken}` } : {}),
             },
             signal: AbortSignal.timeout(15_000),
@@ -350,7 +361,8 @@ async function recordAttempt(
  * why delivering any of raise/escalate/renotify settles that channel's debt.
  */
 export async function dispatchEvent(
-    event: AlertEvent, alert: AlertRecord, opts: { retry?: boolean } = {},
+    event: AlertEvent, alert: AlertRecord,
+    opts: { retry?: boolean; budget?: NotifyBudget; now?: number } = {},
 ): Promise<boolean> {
     const vars = varsFor(toTemplateAlert(alert), event);
     const isClear = event === 'clear';
@@ -387,31 +399,30 @@ export async function dispatchEvent(
 
     let allOk = true;
     let attempted = false;
+    // Held for a digest because the channel's budget is spent (review F19;
+    // notify-budget.ts). Not a failure: no attempt is counted against the
+    // alert, and its debt stays open until the digest or a later send.
+    let held = false;
+    const now = opts.now ?? Date.now();
+    const deliver = async (channel: string, send: () => Promise<SendResult>): Promise<void> => {
+        attempted = true;
+        if (done.has(channel)) return;
+        const key = `${alert.id}|${event}|${channel}`;
+        if (opts.budget !== undefined && !opts.budget.take(channel, now)) {
+            opts.budget.hold(channel, key, { alertId: alert.id, event, severity: alert.severity, line, heldAt: now });
+            held = true;
+            return;
+        }
+        opts.budget?.release(channel, key);
+        const r = await send();
+        await recordAttempt(alert.id, channel, event, r);
+        allOk = allOk && r.ok;
+    };
 
-    if (syslogEnabled()) {
-        attempted = true;
-        if (!done.has('syslog')) {
-            const r = await sendSyslog(event, alert, line);
-            await recordAttempt(alert.id, 'syslog', event, r);
-            allOk = allOk && r.ok;
-        }
-    }
-    if (ntfyEnabled()) {
-        attempted = true;
-        if (!done.has('ntfy')) {
-            const r = await sendNtfy(event, alert, title, line);
-            await recordAttempt(alert.id, 'ntfy', event, r);
-            allOk = allOk && r.ok;
-        }
-    }
+    if (syslogEnabled()) await deliver('syslog', () => sendSyslog(event, alert, line));
+    if (ntfyEnabled()) await deliver('ntfy', () => sendNtfy(event, alert, title, line));
     if (emailEnabled()) {
-        attempted = true;
-        if (!done.has('email')) {
-            const body = render(isClear ? TMPL.bodyClear : TMPL.bodyRaise, vars);
-            const r = await sendMail(title, body);
-            await recordAttempt(alert.id, 'email', event, r);
-            allOk = allOk && r.ok;
-        }
+        await deliver('email', () => sendMail(title, render(isClear ? TMPL.bodyClear : TMPL.bodyRaise, vars)));
     }
 
     // No channel enabled: nothing owed, and saying otherwise would accumulate
@@ -422,6 +433,18 @@ export async function dispatchEvent(
     // retries per channel.
     const delivered = attempted ? allOk : true;
     const which = isClear ? 'clear' : event === 'escalate' ? 'escalate' : 'raise';
+    if (held && delivered) {
+        // Everything that was sent arrived, and the rest waits for a digest:
+        // leave the debt open WITHOUT counting a failure, so the next pass
+        // finds it due and the retry, seeing which channels the log says are
+        // done, settles it. A renotify still restarts its clock - the other
+        // channels were told - or it would repeat on them every pass.
+        if (event === 'renotify') {
+            const r = await OPS.markRenotified(alert.id, new Date());
+            if (!r.ok) throw new Error(`lane refused markRenotified (${r.reason})`);
+        }
+        return false;
+    }
     const m = await OPS.markNotified(alert.id, which, delivered, new Date());
     if (!m.ok) throw new Error(`lane refused markNotified (${m.reason})`);
     if (event === 'renotify') {
@@ -462,7 +485,7 @@ export interface RetryReport {
  * anything the scan raised while dispatch was failing or absent - the queue
  * is the database, so nothing depends on which process was alive when.
  */
-export async function retryPass(now = new Date()): Promise<RetryReport> {
+export async function retryPass(now = new Date(), budget?: NotifyBudget): Promise<RetryReport> {
     if (!syslogEnabled() && !ntfyEnabled() && !emailEnabled()) {
         return { sent: 0, owed: { raise: 0, escalate: 0, clear: 0, renotify: 0 }, oldestOwedTs: null };
     }
@@ -491,7 +514,7 @@ export async function retryPass(now = new Date()): Promise<RetryReport> {
     if (!raises.ok) throw new Error(`lane refused the raise queue (${raises.reason})`);
     for (const r of raises.rows) {
         if (!due(r, now)) continue;
-        if (await dispatchEvent('raise', r, { retry: true })) sent++;
+        if (await dispatchEvent('raise', r, { retry: true, budget })) sent++;
     }
     // The third queue (DECISIONS-2026-09-01 ruling 1): escalations whose
     // live dispatch was skipped by a window or policy, or failed. Disjoint
@@ -502,13 +525,13 @@ export async function retryPass(now = new Date()): Promise<RetryReport> {
     if (!escalates.ok) throw new Error(`lane refused the escalate queue (${escalates.reason})`);
     for (const r of escalates.rows) {
         if (!due(r, now)) continue;
-        if (await dispatchEvent('escalate', r, { retry: true })) sent++;
+        if (await dispatchEvent('escalate', r, { retry: true, budget })) sent++;
     }
     const clears = await OPS.alertsOwingClear();
     if (!clears.ok) throw new Error(`lane refused the clear queue (${clears.reason})`);
     for (const r of clears.rows) {
         if (!due(r, now)) continue;
-        if (await dispatchEvent('clear', r, { retry: true })) sent++;
+        if (await dispatchEvent('clear', r, { retry: true, budget })) sent++;
     }
     // The renotify generator (DECISIONS-2026-09-01 ruling 2): OFF unless
     // ALERT_RENOTIFY_H is set, crit-only, ack-aware, clock restarted by any
@@ -524,7 +547,7 @@ export async function retryPass(now = new Date()): Promise<RetryReport> {
         renotifyOwed = renotifies.rows.length;
         for (const r of renotifies.rows) {
             if (!due(r, now)) continue;
-            if (await dispatchEvent('renotify', r)) sent++;
+            if (await dispatchEvent('renotify', r, { budget })) sent++;
         }
     }
     const untold = [...raises.rows, ...escalates.rows];
@@ -540,4 +563,34 @@ export async function retryPass(now = new Date()): Promise<RetryReport> {
             : untold.reduce((m, r) => (r.first_breach_ts < m ? r.first_breach_ts : m),
                 untold[0]!.first_breach_ts),
     };
+}
+
+/**
+ * Send each channel's digest, if one is due: what the budget held, as ONE
+ * message (review F19; notify-budget.ts). Delivered, it is logged as
+ * delivered on that channel for every alert it lists - in one statement,
+ * however long the list - so each alert's next retry finds the channel done
+ * and settles its debt. Failed, it is logged as failed for each and the
+ * notices stay held for the next minute; the alerts' own retries carry on
+ * underneath as before. Returns the digests delivered.
+ */
+export async function flushDigests(budget: NotifyBudget, now = Date.now()): Promise<number> {
+    let delivered = 0;
+    for (const { channel, keys, notices } of budget.dueDigests(now)) {
+        const d = digestMessage(notices);
+        const sev = d.severity === 'crit' ? 2 : d.severity === 'warn' ? 4 : 5;
+        const r = channel === 'syslog'
+            ? await sendSyslogDatagram(sev, 'digest', `[rscanvas@0 event="digest" count="${notices.length}"]`, d.line)
+            : channel === 'ntfy'
+                ? await sendNtfyMessage(d.title, d.body, d.severity === 'crit' ? '5' : d.severity === 'warn' ? '4' : '3',
+                    d.severity === 'crit' ? 'rotating_light' : 'warning')
+                : await sendMail(d.title, d.body);
+        const detail = r.ok ? `in a digest of ${notices.length}` : `digest failed: ${r.detail}`.slice(0, 500);
+        const log = await OPS.logNotifications(
+            notices.map((x) => x.alertId), notices.map((x) => x.event), channel, r.ok, detail);
+        if (!log.ok) throw new Error(`lane refused the digest's notification log (${log.reason})`);
+        budget.digestSent(channel, now, r.ok ? keys : []);
+        if (r.ok) delivered++;
+    }
+    return delivered;
 }

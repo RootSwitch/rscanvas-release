@@ -12,6 +12,9 @@
 // few routes fails rather than passing on nothing (the blind-guard rule
 // every checker in this repository follows).
 //
+// 0. RAW REQUESTS the HTTP parser accepts and a URL parse does not - a Host
+//    of "a b" and a target of "//[" (review 2026-09-30 F2: each ended the
+//    process). Each must get a 4xx, and the server must answer afterwards.
 // 1. SIGNED OUT, every route with GET, POST and DELETE: only the documented
 //    public routes may answer anything but 401/403 (or 404/405 for a path or
 //    method that does not exist), and the two sessionless health routes may
@@ -28,6 +31,8 @@
 // Exit 0 with no findings, 1 with any. The password comes from the
 // environment, never the command line.
 import fs from 'node:fs';
+import net from 'node:net';
+import tls from 'node:tls';
 
 // --- reading the routes out of main.ts -----------------------------------------
 
@@ -76,6 +81,8 @@ function selfTest() {
     // The first sweep's worst finding, pinned where it would come back: a
     // route that turns an unreadable body into {} and acts on it.
     t('no route reads a failed body as {} (readJsonBody(...).catch)', !/readJsonBody\([^)]*\)\.catch\(/.test(src));
+    t('the request URL is parsed against a constant base, never the Host header (review F2)',
+        src.includes("new URL(req.url ?? '/', 'http://localhost')") && !/new URL\([^;]*headers\.host/.test(src));
     const empty = extractRoutes('nothing here');
     t('an empty source yields nothing (and the live run refuses it)', empty.paths.length === 0);
     console.log(fail === 0 ? 'PASS' : 'FAIL');
@@ -86,6 +93,25 @@ function selfTest() {
 
 const HOSTILE = ['', 'abc', '-1', '0', '1.5', 'NaN', '1e309', '99999999999999999999',
     "' OR 1=1 --", '%00', '\u0000', 'ΩΩΩ', '[]', 'x'.repeat(10000)];
+/** One request written by hand, for input fetch() will not send. Resolves
+ *  with the status line, or what happened instead. */
+function rawRequest(base, text) {
+    const u = new URL(base);
+    const https = u.protocol === 'https:';
+    const port = Number(u.port || (https ? 443 : 80));
+    return new Promise((resolve) => {
+        const s = https ? tls.connect({ host: u.hostname, port, rejectUnauthorized: false }) : net.connect(port, u.hostname);
+        let buf = '';
+        let settled = false;
+        const finish = (v) => { if (settled) return; settled = true; s.destroy(); resolve(v); };
+        s.setTimeout(5000, () => finish(buf.split('\r\n')[0] || 'no answer in 5 s'));
+        s.on(https ? 'secureConnect' : 'connect', () => s.write(text));
+        s.on('data', (d) => { buf += d; if (buf.includes('\r\n')) finish(buf.split('\r\n')[0]); });
+        s.on('error', (e) => finish(`error ${e.code ?? e.message}`));
+        s.on('close', () => finish(buf.split('\r\n')[0] || 'closed without an answer'));
+    });
+}
+
 const STACK = /\bat [A-Za-z_$][\w$.]* \(|\.ts:\d+:\d+|node:internal/;
 
 async function main() {
@@ -115,6 +141,19 @@ async function main() {
             return { status: 0, text: String(err), ms: performance.now() - t0 };
         }
     };
+
+    console.log('0. raw requests a URL parse refuses (review F2)');
+    for (const [label, text] of [
+        ['Host: a b', 'GET / HTTP/1.1\r\nHost: a b\r\nConnection: close\r\n\r\n'],
+        ['a target of //[', 'GET //[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'],
+    ]) {
+        const line = await rawRequest(base, text);
+        await new Promise((ok) => setTimeout(ok, 300));
+        const alive = await req('GET', '/api/health/live');
+        if (alive.status !== 200) find(`${label}: the server stopped answering afterwards (${alive.status}); it had said "${line}"`);
+        else if (!/^HTTP\/1\.[01] 4\d\d/.test(line)) find(`${label} -> "${line}", not a 4xx`);
+        else console.log(`   ${label} -> ${line}; still answering`);
+    }
 
     console.log(`1. signed out: ${paths.length} routes x GET, POST, DELETE`);
     let checked = 0;

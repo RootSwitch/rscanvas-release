@@ -11,8 +11,15 @@ exists and is less exercised.
   polled the full 30,000-entity test fleet every 30 seconds using under a
   tenth of its CPU. RSCanvas itself used about 400 MB, and 2.9 GB of memory
   stayed free. The lab's 4-core N150 mini PCs run the same fleet too.
+- **A disk for the database**, ideally its own: mount it at
+  `/var/lib/postgresql` (by UUID, in `/etc/fstab`) BEFORE running the
+  installer, which then puts PostgreSQL's data there. On the system disk, a
+  database that fills its disk fills the system's too. The installer says
+  which disk the data is going to, and asks once when it is the system disk.
+  If you ever turn on PostgreSQL's WAL archiving, give the archive another
+  disk again.
 - **Disk is what to size**, from the data you keep (the retention days in
-  section 2 set it):
+  section 2 set it, and the installer prints the estimate for them):
   - raw samples, kept 14 days by default: about 6 GB per 1,000 entities;
   - the hourly rollup behind charts and reports, kept for good: about 1.6 GB
     per 1,000 entities per year;
@@ -60,9 +67,21 @@ and `rscanvas.service`; mints a self-signed TLS pair into `/etc/rscanvas/tls`
 when `--tls` is given; starts the service; and verifies the result rather
 than assuming it.
 
-**It prints the generated credentials once, at the end.** The database
-password, the first admin's password, and `RSCANVAS_SECRET`, the key that
-encrypts stored credential profiles. Save all three from that screen. The
+**Where things live.** The code in `/opt/rscanvas` belongs to root, and the
+service cannot change it - root runs the installer and the backup tool from
+there, so a service that could rewrite them could become root. The
+configuration and secrets are in `/etc/rscanvas`. The only place the service
+writes is `/var/lib/rscanvas` (exports waiting to be downloaded);
+`EXPORT_SPOOL_DIR` in the env file can point exports at a bigger disk
+instead. The service runs in a systemd sandbox: no way to gain privileges,
+the rest of the filesystem read-only, and only two capabilities - binding
+ports below 1024, which the unit grants to the service rather than to the
+`node` program, and raw sockets, which `fping` needs for ping checks.
+
+**It prints the generated credentials once, at the end.** The first
+admin's password, and `RSCANVAS_SECRET`, the key that encrypts stored
+credential profiles. Save both from that screen; the database passwords
+are in `/etc/rscanvas/rscanvas.env`. The
 installer never regenerates a secret on a later run, so a lost
 `RSCANVAS_SECRET` means stored credential profiles cannot be read again.
 
@@ -73,6 +92,7 @@ Flags worth knowing:
 | `--check` | report what the box is running and change nothing; run it first on any box you did not just build |
 | `--tls` | https on the web port with a self-signed pair; sticky across re-runs; `--tls-cert` and `--tls-key` use your own pair instead |
 | `--high-ports` | syslog on 5514 and traps on 15162, so the service needs no privilege; otherwise the installer grants `cap_net_bind_service` to node for 514 and 162 |
+| `--raw-days N`, `--message-days N` | how many days raw per-poll samples and syslog/trap messages are kept; defaults 14 and 30, at least 7; written to the env file when given and kept on later runs when not |
 | `--http-port N`, `--db NAME`, `--dir DIR`, `--user NAME` | the obvious overrides; defaults 18080, `rscanvas`, `/opt/rscanvas`, `rscanvas` |
 | `--yes` | no prompts |
 
@@ -81,9 +101,10 @@ password, and change it.
 
 **Retention is on.** Raw per-poll samples are kept 14 days and syslog and
 trap messages 30; the hourly rollup behind the charts, the Dashboard and the
-reports is kept for good. Change the days with `RAW_RETENTION_DAYS` and
-`MESSAGE_RETENTION_DAYS` in `/etc/rscanvas/rscanvas.env` and restart the
-service. `RETENTION_DRY_RUN=1` there makes retention report what it would
+reports is kept for good. Change the days by re-running the installer
+with `--raw-days` and `--message-days`, or by editing `RAW_RETENTION_DAYS`
+and `MESSAGE_RETENTION_DAYS` in `/etc/rscanvas/rscanvas.env` and restarting
+the service. `RETENTION_DRY_RUN=1` there makes retention report what it would
 delete without deleting anything. Boxes installed before 0.1.0-alpha.3 were
 left in that dry run by the installer; set `RETENTION_DRY_RUN=0` on them. The
 health page says so once the dry run is keeping data past its date.
@@ -134,6 +155,26 @@ removing. A ping-only device costs almost nothing when it is down.
 `POLL_CONCURRENCY` and `POLL_DOWN_CONCURRENCY` change the split
 (`src/config.ts` says how).
 
+**Bursts of syslog and traps wait in memory.** Messages are written to the
+database every 0.3 seconds, and the few hundred in between wait in memory.
+When they arrive faster than the database can write them - a burst above
+about 15,000 a second on a mini PC, or the database down - they queue, up
+to `INGEST_QUEUE_MAX` (50,000 by default); past that the oldest are dropped
+and counted on the health report. The ceiling is not memory set aside: it
+is used only while the queue is full and returned as it drains. What a
+queued message costs, measured:
+
+| message | per message | 50,000 (default) | 150,000 |
+|---|---|---|---|
+| short (a link-state line) | about 530 B | 26 MB | 79 MB |
+| typical (a firewall log line) | about 770 B | 39 MB | 116 MB |
+| long (600 characters) | about 1,650 B | 82 MB | 247 MB |
+
+150,000 holds five seconds at 20,000 a second above what the database
+writes. Raising it helps bursts and outages; a flood that never slows still
+drops messages, only later. Set it in `/etc/rscanvas/rscanvas.env` and
+restart the service.
+
 **Syslog** is accepted in RFC 3164 and RFC 5424 format on UDP 514. A
 message's host is the hostname its header names; a message that names none
 takes the name of the device at its source address, when exactly one device
@@ -148,8 +189,18 @@ also keeps its enterprise, generic and specific numbers, and carries the
 same trap OID as its v2 equivalent. An event rule matching
 `1.3.6.1.6.3.1.1.5.3` therefore catches a linkDown in either version. A trap
 from an address that belongs to one device is attributed to that device, so
-the device's maintenance window, mute and notify policy apply to alerts it
-raises. SNMPv3 traps are not accepted yet: they are refused and logged.
+the device's maintenance window and notify policy apply to alerts it raises.
+A device mute does not: it silences what the device's polling raises, and a
+syslog or trap rule, written on purpose, still alerts - a BGP peer dropping
+on a muted router is heard. SNMPv3 traps are not accepted, and not planned:
+they are refused before they are read, and counted.
+
+**An event rule raises one alert per host it matches**, and holds at most
+20 of them open at once (`EVENT_ALERT_HOSTS_MAX`). A message's host is
+whatever its sender says, so past the limit new hosts share a single alert,
+"<rule>: more than 20 hosts", rather than each opening one and sending its
+own notification. Hosts already alerting keep their own alerts, and room
+reopens as they clear.
 
 **IPMI Platform Event Traps** (from a server's BMC) are decoded: a stored
 one reads like `IPMI Fan: Lower Critical going low, asserted - severity
@@ -169,8 +220,7 @@ Untar the new bundle over the same directory and run the installer again:
     sudo tar -xzf rscanvas-<newer>.tar.gz -C /opt/rscanvas
     cd /opt/rscanvas && sudo ./rscanvas-setup.sh
 
-On the default ports it asks once more about the port capability for
-`node` (answer y, or add `--yes`). It applies any new schema slices before
+It applies any new schema slices before
 restarting the service, which is the order that matters: the new code
 expects the new columns. Re-running it on
 an unchanged box changes nothing. It keeps what the install already uses -
@@ -230,16 +280,16 @@ any backup, it is only proven once it has been restored.
     sudo ./rscanvas-setup.sh --uninstall
 
 This stops and removes the service, the application directory, the
-capability the installer gave `node` for ports 514 and 162, and its kernel
-buffer setting. It **keeps the data**: the database and its roles,
-`/etc/rscanvas` (with `RSCANVAS_SECRET` and the TLS pair) and the service
-account. Installing again from any bundle finds them and resumes where it
+port capability an older install gave `node` (if it is still there), and its
+kernel buffer setting. It **keeps the data**: the database and its roles,
+`/etc/rscanvas` (with `RSCANVAS_SECRET` and the TLS pair), `/var/lib/rscanvas`
+and the service account. Installing again from any bundle finds them and resumes where it
 left off, with the same accounts, devices, history and certificate.
 
     sudo ./rscanvas-setup.sh --uninstall --purge
 
 This also drops the database (and any copies `rscanvas-backup.sh` set aside),
-the three roles, `/etc/rscanvas` and the service account. It asks you to type
+the three roles, `/etc/rscanvas`, `/var/lib/rscanvas` and the service account. It asks you to type
 the database name first, unless you pass `--yes`. To purge after a plain
 uninstall has removed `/opt/rscanvas`, run it from any extracted bundle.
 
@@ -253,17 +303,19 @@ every database on the machine.
     sudo ./rscanvas-setup.sh --check
     systemctl status rscanvas
     journalctl -u rscanvas -n 200
-    curl -sk https://localhost:18080/api/health
+    curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:18080/api/health/work
 
-The health report names the worker or database lane that is behind, and
-every startup failure names its own fix in the journal: a missing
+The last line answers without signing in: 200 when the workers are
+working, 503 when one is starved. The full health report, which names the
+worker or database lane that is behind, is the System page (or
+`/api/health`, signed in). Every startup failure names its own fix in the journal: a missing
 capability for port 514, a database still starting, a schema behind the
 code.
 
 **If the disk fills,** the health report says so first, in its problem
 list. When it runs out entirely, PostgreSQL stops. RSCanvas keeps receiving
-syslog and traps and holds up to 50,000 messages in memory until the
-database returns. Past that it drops the oldest and counts them. Free some
+syslog and traps and holds up to 50,000 messages in memory (`INGEST_QUEUE_MAX`,
+section 3) until the database returns. Past that it drops the oldest and counts them. Free some
 space and PostgreSQL restarts by itself within 10 seconds: the installer
 gives its unit a restart policy for exactly this. Nothing else needs doing.
 Retention days (section 2) are how to stop it happening again.

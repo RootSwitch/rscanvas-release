@@ -13,6 +13,7 @@
 
 import {
     loginAllowed, recordLoginFailure, recordLoginSuccess, rateLimitState,
+    beginLoginAttempt, endLoginAttempt, lockoutMs, addressKey, accountKey, type LoginAttempt,
 } from '../src/auth/index.ts';
 
 let pass = 0;
@@ -41,6 +42,60 @@ console.log('login rate limiter: the lockout, and the memory bound\n');
     recordLoginSuccess(ip);
     if (loginAllowed(ip)) ok('and a success clears it immediately');
     else bad('a success left the address locked');
+}
+
+// --- the three holes of review F8 (2026-10-01) --------------------------------
+console.log('\nthe race, the reset and the account (review F8):');
+{
+    // THE RACE: twenty concurrent attempts from one address, none finished
+    // yet. Before, all twenty passed the check and reached scrypt.
+    const held: Array<LoginAttempt | null> = [];
+    for (let i = 0; i < 20; i++) held.push(beginLoginAttempt('192.0.2.10', `spray-${i}`));
+    const admitted = held.filter((a) => a !== null).length;
+    if (admitted === 5) ok('twenty concurrent attempts from one address: five admitted, fifteen refused before scrypt');
+    else bad('concurrent attempts were not bounded', admitted);
+    for (const a of held) if (a) endLoginAttempt(a, false);
+    if (beginLoginAttempt('192.0.2.10', 'someone') === null) ok('and their five failures lock the address');
+    else bad('five failed attempts did not lock the address');
+}
+{
+    // THE RESET: four guesses at one account, a valid sign-in to another
+    // from the same address, then more guesses. The success used to clear
+    // the address's count.
+    const ip = '192.0.2.20';
+    for (let i = 0; i < 4; i++) endLoginAttempt(beginLoginAttempt(ip, 'victim') as LoginAttempt, false);
+    endLoginAttempt(beginLoginAttempt(ip, 'my-own-account') as LoginAttempt, true);
+    // It used to clear the count, leaving four more guesses; now one remains.
+    const fifth = beginLoginAttempt(ip, 'victim-2');
+    if (fifth) endLoginAttempt(fifth, false);
+    if (fifth !== null && beginLoginAttempt(ip, 'victim-3') === null) {
+        ok('a valid sign-in does not reset its address: one guess was left, and after it the address is locked');
+    } else bad('a successful sign-in reset the address count');
+}
+{
+    // THE ACCOUNT: five guesses at one name, each from a different address.
+    for (let i = 0; i < 5; i++) endLoginAttempt(beginLoginAttempt(`198.18.0.${i}`, 'Admin') as LoginAttempt, false);
+    if (beginLoginAttempt('198.18.0.99', 'admin') === null) ok('five failures from five addresses lock the account (case folded)');
+    else bad('the account was not locked');
+    const other = beginLoginAttempt('198.18.0.99', 'operator');
+    if (other !== null) ok('another account from a clean address is untouched');
+    else bad('locking one account locked another');
+    if (other) endLoginAttempt(other, true);
+    if (loginAllowed(accountKey('nobody-has-this-name'))) ok('an unknown name starts unlocked, like a real one');
+    else bad('an unknown name started locked');
+}
+{
+    if (lockoutMs(1) === 60_000 && lockoutMs(2) === 120_000 && lockoutMs(4) === 480_000 && lockoutMs(10) === 900_000) {
+        ok('repeated lockouts double, 1 minute to a 15 minute ceiling');
+    } else bad('lockout lengths', [1, 2, 4, 10].map(lockoutMs));
+    const a = addressKey('2001:db8:1:2:3:4:5:6');
+    const b = addressKey('2001:db8:1:2::9');
+    if (a === b && a === 'ip6:2001:db8:1:2::/64') ok('IPv6 addresses count by their /64');
+    else bad('IPv6 keys differ within one /64', `${a} vs ${b}`);
+    if (addressKey('2001:db8:1:3::1') !== a) ok('and another /64 is another key');
+    else bad('two /64s shared a key');
+    if (addressKey('::ffff:203.0.113.5') === addressKey('203.0.113.5')) ok('an IPv4-mapped address is its IPv4 address');
+    else bad('a mapped address was keyed apart from its IPv4 form');
 }
 
 // --- THE CAP, which is what this file exists for ------------------------------

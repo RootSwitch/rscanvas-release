@@ -28,7 +28,9 @@ import { startHeartbeat } from '../heartbeat.ts';
 import { installSafetyNet } from '../safety.ts';
 import { OPS, closeAll } from '../store/index.ts';
 import { scanTick } from '../alerts/scan.ts';
-import { dispatchEvent, retryPass } from '../alerts/notify.ts';
+import { dispatchEvent, retryPass, flushDigests } from '../alerts/notify.ts';
+import { NotifyBudget } from '../alerts/notify-budget.ts';
+import { serial } from './serial.ts';
 import type { FrontierState, JobsStats } from './protocol.ts';
 
 const hb = startHeartbeat('jobs', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdMs);
@@ -181,7 +183,23 @@ async function rollup(): Promise<string> {
 // This caller passes configuration and reports what came back; it deliberately
 // makes no decisions of its own, because the caller is exactly what was careful
 // last time and still lost 158GB.
-async function retention(table: 'samples' | 'messages', keepDays: number): Promise<string> {
+//
+// ONE TABLE AT A TIME (2026-10-01, the 30k drop check on lab-5). The two
+// retention jobs are independent timers with the same period, created one
+// after the other, so they fire in the same instant every hour - and the
+// function's advisory lock lets one retention run proceed and SKIPS the
+// other, reporting success. Samples was registered first and won: at the
+// first drop, samples_20260924 went in 0.74 s and messages recorded
+// "skipped-locked: messages" one millisecond after it started, and would have
+// every hour after - syslog that never expires, under a green job. So the
+// two now queue behind each other here, and the lock is left to do what it
+// is for: a second PROCESS (a rolling deploy).
+const oneRetentionAtATime = serial();
+function retention(table: 'samples' | 'messages', keepDays: number): Promise<string> {
+    return oneRetentionAtATime(() => retentionNow(table, keepDays));
+}
+
+async function retentionNow(table: 'samples' | 'messages', keepDays: number): Promise<string> {
     const res = await OPS.retentionRun(
         table, keepDays, CONFIG.retentionMinKeepDays, CONFIG.retentionMaxDropPerRun,
         CONFIG.retentionMinPartitions, CONFIG.retentionMaxSpanDays,
@@ -202,6 +220,12 @@ async function retention(table: 'samples' | 'messages', keepDays: number): Promi
     const parts: string[] = [];
     for (const [action, list] of by) parts.push(`${action}: ${list.join(', ')}`);
     const summary = parts.join(' | ');
+    if (by.has('skipped-locked')) {
+        // Not this process's other table any more (they queue), so another
+        // process holds retention. Fine once; worth a line, because a skip
+        // reports success and a skip every hour is retention that never runs.
+        log(`${table}: retention skipped this hour - another process holds the retention lock`);
+    }
     if (by.has('deferred-unrolled')) {
         log(`${table}: retention is WAITING for the rollup - ${by.get('deferred-unrolled')?.length} `
             + 'partition(s) hold raw samples the rollup has not consumed');
@@ -402,6 +426,9 @@ async function alertScan(): Promise<string> {
 // transitions per scan, which is small; the pass drains it whole.
 type ScanEvent = Awaited<ReturnType<typeof scanTick>>['events'][number];
 const eventsToNotify: ScanEvent[] = [];
+// The one sending budget (review F19; alerts/notify-budget.ts says what it
+// allows and what happens past it). Owned here, by the thread that sends.
+const notifyBudget = new NotifyBudget(CONFIG.alertNotifyBurst, CONFIG.alertNotifyPerMinute);
 
 async function alertNotify(): Promise<string> {
     // Dispatch queued events at their true type (an escalate arrives as an
@@ -456,10 +483,12 @@ async function alertNotify(): Promise<string> {
         const r0 = rec.rows[0];
         if (ev.type !== 'clear' && r0.in_group) continue;
         if (ev.type === 'clear' && !r0.notified_raise && r0.group_overlap) continue;
-        if (await dispatchEvent(ev.type, rec.rows[0])) sent++;
+        if (await dispatchEvent(ev.type, rec.rows[0], { budget: notifyBudget })) sent++;
     }
-    const r = await retryPass();
+    const r = await retryPass(new Date(), notifyBudget);
     sent += r.sent;
+    // What the budget held, once a minute per channel, as one message.
+    sent += await flushDigests(notifyBudget);
     // Channel health, refreshed once a minute off the pass that owns the
     // channels (easy-win E6): the trailing-failure streaks ride JobsStats so
     // the health page can say "email has failed 96 times since Tuesday"
@@ -484,7 +513,10 @@ async function alertNotify(): Promise<string> {
         + `${r.owed.clear}c/${r.owed.renotify}n`
         + (r.oldestOwedTs === null ? ''
             : `, oldest untold ${Math.round((Date.now() - r.oldestOwedTs.getTime()) / 60_000)}m`);
-    return `${events.length} event(s), notified ${sent}${owedNote}`;
+    // Over the sending budget, waiting for the minute's digest (review F19).
+    const held = Object.entries(notifyBudget.heldCounts());
+    const heldNote = held.length === 0 ? '' : `; held for a digest: ${held.map(([c, n]) => `${c} ${n}`).join(', ')}`;
+    return `${events.length} event(s), notified ${sent}${owedNote}${heldNote}`;
 }
 
 let lastChannelHealthMs = 0;

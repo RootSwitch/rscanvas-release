@@ -17,6 +17,7 @@ import copyFrom from 'pg-copy-streams';
 import { CONFIG } from '../config.ts';
 import { laneQuery, onLane, type Outcome } from './pool.ts';
 import { copyChunks, copyLine, stripNul } from './copy.ts';
+import { measurement, smallint, int4, int8, boundedJson } from './bounds.ts';
 import type { Clause } from '../search/grammar.ts';
 
 /**
@@ -139,12 +140,16 @@ export async function copySamples(rows: SampleRow[]): Promise<Outcome<never>> {
         );
         // In chunks, not a row at a time: see COPY_CHUNK_CHARS for the stall
         // the per-row form put on the collector thread at 30k entities.
+        // Every device-reported number bounded to what its column and the
+        // rollup can hold (store/bounds.ts, review F7): this COPY carries the
+        // whole fleet's rows, so one agent's absurd value must cost only
+        // itself.
         const source = Readable.from(copyChunks(rows, (r) => copyLine([
             r.entityId,
             r.ts.toISOString(),
-            r.status,
-            r.rttMs,
-            ...r.v,
+            smallint(r.status),
+            measurement(r.rttMs),
+            ...r.v.map(measurement),
         ])));
         await pipeline(source, sink);
         return { rows: [] as never[], rowCount: rows.length };
@@ -1300,9 +1305,13 @@ export const OPS = {
                -- the timeout constant, not a measurement.
                snmp_rtt_ms  = CASE WHEN $2 THEN $13 ELSE snmp_rtt_ms END
          WHERE id = $1::bigint`,
-        [id, ok, sysName, sysDescr, sysLocation, inventoryTried, cpuModel, pollLagMs,
-            summary === null ? null : JSON.stringify(summary), uptimeS, cpuCores, ramKb,
-            snmpRttMs, stencil, pollAnchor]),
+        // The summary and the inventory numbers come from the agent: bounded
+        // to their columns (store/bounds.ts), so an absurd reading blanks
+        // itself instead of failing this write - which recorded an answering
+        // device as DOWN (review F16).
+        [id, ok, sysName, sysDescr, sysLocation, inventoryTried, cpuModel, measurement(pollLagMs),
+            summary === null ? null : boundedJson(summary), measurement(uptimeS), int4(cpuCores), int8(ramKb),
+            measurement(snmpRttMs), stencil, pollAnchor]),
 
     /**
      * Create a PING-ONLY device (slice 35).
@@ -1662,7 +1671,7 @@ export const OPS = {
         VALUES ($1::bigint, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
         ON CONFLICT (device_id, kind, snmp_index) WHERE snmp_index IS NOT NULL DO NOTHING
         RETURNING id::text AS id, code`,
-        [deviceId, kind, snmpIndex, name, descr, alias, speedBps, code, extra, tracked]),
+        [deviceId, kind, snmpIndex, name, descr, alias, int8(speedBps), code, extra, tracked]),
 
     /** Does this device have ANY sensor entities yet? One count, asked at
      *  the inventory cadence, never per poll - it gates the backfill. */
@@ -1790,7 +1799,7 @@ export const OPS = {
                                       ELSE speed_untrusted END,
                admin_status = $6, oper_status = $7
          WHERE id = $1::bigint`,
-        [id, name, descr, alias, speedBps, adminStatus, operStatus]),
+        [id, name, descr, alias, int8(speedBps), smallint(adminStatus), smallint(operStatus)]),
 
     /**
      * Raw counters and their timestamp, so rates survive a restart. ONE
@@ -2512,7 +2521,7 @@ export const OPS = {
          WHERE inc.name = $1 AND NOT EXISTS (SELECT 1 FROM d)`,
         [name, host, port, version, credentialRef, pollIntervalS,
             sysName, sysDescr, sysLocation, uptimeCode,
-            kinds, indices, names, descrs, aliases, speeds, tracked, codes, extras]),
+            kinds, indices, names, descrs, aliases, speeds.map(int8), tracked, codes, extras]),
 
     /**
      * Which of these names or addresses are already known, for the report.
@@ -3909,6 +3918,16 @@ export const OPS = {
         INSERT INTO notifications (alert_id, event, channel, ok, detail)
         VALUES ($1::bigint, $2, $3, $4, $5)`, [alertId, event, channel, ok, detail]),
 
+    /** One channel's digest, logged for every alert it listed in ONE
+     *  statement (review F19). Joined to alerts so one pruned while it was
+     *  held is skipped rather than failing the rest. */
+    logNotifications: (alertIds: string[], events: string[], channel: string, ok: boolean, detail: string | null) =>
+        laneQuery('jobs', `
+        INSERT INTO notifications (alert_id, event, channel, ok, detail)
+        SELECT u.id, u.ev, $3, $4, $5
+          FROM unnest($1::bigint[], $2::text[]) AS u(id, ev)
+          JOIN alerts a ON a.id = u.id`, [alertIds, events, channel, ok, detail]),
+
     /**
      * The retry queues: raises still owed on active alerts, clears still owed
      * on recently cleared ones. Bounded to a day for clears, exactly as the
@@ -4083,24 +4102,84 @@ export const OPS = {
      *
      * The conflict target is the partial unique index alerts_open_key - one
      * open row per key is the table's own invariant doing the limiting.
+     *
+     * AND A CAP PER RULE (2026-10-01). The key is per HOST, and a syslog
+     * message's host is whatever its sender claims: a sender that varies the
+     * name opened an alert, and owed a raise, per name it invented - 500
+     * forged names were 500 open alerts in the scratch-database test. So a
+     * rule holds at most `hostsMax` open per-host alerts (EVENT_ALERT_HOSTS_MAX).
+     * A key already open always folds into its own row; a NEW host past the
+     * cap folds into one overflow row per rule, `event|<rule>|*`, labelled
+     * "<rule>: more than N hosts" - one alert and one raise however many names
+     * arrive. Room reopens as per-host alerts clear on their TTL; the
+     * overflow clears on the same TTL, its key parsing like any other. Keys
+     * repeated within one batch fold here too (GROUP BY), where they used to
+     * be refused and the worker's own folding was the only guard.
+     *
+     * THE OVERFLOW IS ONE EXACT KEY (2026-10-01, review F11). It was any key
+     * whose third field was '*', so a sender naming itself `*|1`, `*|2`, ...
+     * made keys that each read as overflow, were each kept as their own row,
+     * and stayed out of the per-host count - the flood the cap stops, by the
+     * side door. The worker now escapes `|` and `*` in a host (events.ts
+     * keyHost), and this statement accepts `event|<rule>|*` and nothing else
+     * as the overflow, so neither end alone is the guard.
      */
     upsertEventAlerts: (
         keys: string[], severities: string[], hosts: string[], labels: string[],
-        counts: number[], lastTss: Date[],
+        counts: number[], lastTss: Date[], hostsMax: number,
     ) => laneQuery<never>('ingest', `
+        WITH input AS (
+            SELECT u.k, u.s, u.h, u.l, u.c, u.t, u.o, split_part(u.k, '|', 2) AS rule,
+                   u.k = 'event|' || split_part(u.k, '|', 2) || '|*' AS overflow,
+                   EXISTS (SELECT 1 FROM alerts a
+                            WHERE a.alert_key = u.k AND a.state != 'cleared') AS is_open
+              FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
+                          $5::float8[], $6::timestamptz[]) WITH ORDINALITY AS u(k, s, h, l, c, t, o)
+        ), held AS (
+            -- Each rule's open per-host alerts now; its overflow row is not one.
+            SELECT split_part(a.alert_key, '|', 2) AS rule, count(*) AS n
+              FROM alerts a
+             WHERE a.kind = 'event' AND a.state != 'cleared'
+               AND a.alert_key <> 'event|' || split_part(a.alert_key, '|', 2) || '|*'
+               AND split_part(a.alert_key, '|', 2) IN (SELECT rule FROM input)
+             GROUP BY 1
+        ), ranked AS (
+            -- Counted per DISTINCT key, so one key twice in a batch cannot
+            -- straddle the cap.
+            SELECT i.*, (i.is_open OR i.overflow) AS keeps,
+                   dense_rank() OVER (PARTITION BY i.rule, (i.is_open OR i.overflow) ORDER BY i.first_o, i.k) AS nth
+              FROM (SELECT x.*, min(x.o) OVER (PARTITION BY x.k) AS first_o FROM input x) i
+        ), routed AS (
+            -- An overflow key the worker folded in memory (events.ts, when
+            -- its pending map is full) takes the overflow's host and label
+            -- here too, never the sample line it arrived with.
+            SELECT CASE WHEN r.overflow THEN r.k
+                        WHEN r.keeps OR coalesce(h.n, 0) + r.nth <= $7 THEN r.k
+                        ELSE 'event|' || r.rule || '|*' END AS k,
+                   CASE WHEN r.overflow THEN '*'
+                        WHEN r.keeps OR coalesce(h.n, 0) + r.nth <= $7 THEN r.h ELSE '*' END AS h,
+                   CASE WHEN NOT r.overflow AND (r.keeps OR coalesce(h.n, 0) + r.nth <= $7) THEN r.l
+                        ELSE coalesce(er.name, 'event rule ' || r.rule) || ': more than ' || $7 || ' hosts' END AS l,
+                   r.s, r.c, r.t
+              FROM ranked r
+              LEFT JOIN held h ON h.rule = r.rule
+              LEFT JOIN event_rules er ON er.id::text = r.rule
+        ), folded AS (
+            SELECT k, min(s) AS s, min(h) AS h, min(l) AS l, sum(c) AS c, max(t) AS t
+              FROM routed GROUP BY k
+        )
         INSERT INTO alerts (alert_key, state, severity, kind, host, label,
                             value, peak_value, unit, breach_count,
                             first_breach_ts, raised_ts, last_seen_ts)
-        SELECT u.k, 'active', u.s, 'event', u.h, u.l,
-               u.c, u.c, '', 1, u.t, u.t, u.t
-          FROM unnest($1::text[], $2::text[], $3::text[], $4::text[],
-                      $5::float8[], $6::timestamptz[]) AS u(k, s, h, l, c, t)
+        SELECT f.k, 'active', f.s, 'event', f.h, f.l,
+               f.c, f.c, '', 1, f.t, f.t, f.t
+          FROM folded f
         ON CONFLICT (alert_key) WHERE state != 'cleared'
         DO UPDATE SET
             last_seen_ts = GREATEST(alerts.last_seen_ts, EXCLUDED.last_seen_ts),
             value        = coalesce(alerts.value, 0) + EXCLUDED.value,
             peak_value   = coalesce(alerts.peak_value, 0) + EXCLUDED.value`,
-        [keys, severities, hosts, labels, counts, lastTss]),
+        [keys, severities, hosts, labels, counts, lastTss, hostsMax]),
 
     /**
      * The TTL clear, with BOTH slice-10 scoping rules inside the statement:
@@ -4839,11 +4918,12 @@ export const OPS = {
      * polled hour counts 1, a missing one 0.
      */
     dashboardInterfaces: (prevLo: Date, lo: Date, hi: Date, limit: number) => laneQuery<{
-        list: 'rx' | 'tx' | 'errs'; rk: number;
+        list: 'rx' | 'tx' | 'errs' | 'disc'; rk: number;
         device: string; code: string; name: string | null; alias: string | null; speed_bps: string | null;
         in_s: number | null; out_s: number | null; pk_in: number | null; pk_out: number | null;
         err_s: number | null; disc_s: number | null; cov_h: number | null;
-        p_in_s: number | null; p_out_s: number | null; p_ed_s: number | null; p_cov_h: number | null;
+        p_in_s: number | null; p_out_s: number | null; p_err_s: number | null; p_disc_s: number | null;
+        p_cov_h: number | null;
     }>('heavy', `
         WITH agg AS (
             SELECT h.entity_id,
@@ -4857,8 +4937,10 @@ export const OPS = {
                        FILTER (WHERE h.hour_ts >= $2) AS cov_h,
                    sum(h.a0) FILTER (WHERE h.hour_ts < $2) AS p_in_s,
                    sum(h.a1) FILTER (WHERE h.hour_ts < $2) AS p_out_s,
-                   sum(coalesce(h.a2, 0) + coalesce(h.a3, 0) + coalesce(h.a4, 0) + coalesce(h.a5, 0))
-                       FILTER (WHERE h.hour_ts < $2) AS p_ed_s,
+                   -- Errors and discards apart (2026-10-01, operator): each list
+                   -- is ranked and trended on its own.
+                   sum(coalesce(h.a2, 0) + coalesce(h.a3, 0)) FILTER (WHERE h.hour_ts < $2) AS p_err_s,
+                   sum(coalesce(h.a4, 0) + coalesce(h.a5, 0)) FILTER (WHERE h.hour_ts < $2) AS p_disc_s,
                    sum(least(1, coalesce(coalesce(h.n0, h.n) * d.poll_interval_s / 3600.0, 0)))
                        FILTER (WHERE h.hour_ts < $2) AS p_cov_h
               FROM samples_hourly h
@@ -4877,15 +4959,19 @@ export const OPS = {
             (SELECT 'tx', row_number() OVER (ORDER BY out_s DESC), agg.*
                FROM agg WHERE out_s > 0 ORDER BY out_s DESC LIMIT $4)
             UNION ALL
-            (SELECT 'errs', row_number() OVER (ORDER BY err_s + disc_s DESC), agg.*
-               FROM agg WHERE err_s + disc_s > 0 ORDER BY err_s + disc_s DESC LIMIT $4)
+            (SELECT 'errs', row_number() OVER (ORDER BY err_s DESC), agg.*
+               FROM agg WHERE err_s > 0 ORDER BY err_s DESC LIMIT $4)
+            UNION ALL
+            (SELECT 'disc', row_number() OVER (ORDER BY disc_s DESC), agg.*
+               FROM agg WHERE disc_s > 0 ORDER BY disc_s DESC LIMIT $4)
         )
         SELECT r.list, r.rk::int AS rk, d.name AS device, e.code, e.name, e.alias,
                coalesce(e.speed_override_bps, e.speed_bps)::text AS speed_bps,
                r.in_s::float8 AS in_s, r.out_s::float8 AS out_s,
                r.pk_in::float8 AS pk_in, r.pk_out::float8 AS pk_out,
                r.err_s::float8 AS err_s, r.disc_s::float8 AS disc_s, r.cov_h::float8 AS cov_h,
-               r.p_in_s::float8 AS p_in_s, r.p_out_s::float8 AS p_out_s, r.p_ed_s::float8 AS p_ed_s,
+               r.p_in_s::float8 AS p_in_s, r.p_out_s::float8 AS p_out_s,
+               r.p_err_s::float8 AS p_err_s, r.p_disc_s::float8 AS p_disc_s,
                r.p_cov_h::float8 AS p_cov_h
           FROM ranked r
           JOIN entities e ON e.id = r.entity_id

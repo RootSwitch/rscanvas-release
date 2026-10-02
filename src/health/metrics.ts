@@ -124,6 +124,8 @@ export function serializeMetrics(m: MetricsInput): string {
         line('datagrams_shed_total', i.shedByUs);
         family('ingest_queue_depth', 'gauge', 'Rows queued toward the next COPY.');
         line('ingest_queue_depth', i.queued);
+        family('ingest_queue_max', 'gauge', 'The queue ceiling (INGEST_QUEUE_MAX); past it the oldest rows are shed.');
+        line('ingest_queue_max', i.queueMax);
         family('ingest_flush_failures_total', 'counter', 'COPY batches that failed and were requeued.');
         line('ingest_flush_failures_total', i.flushFailures);
         family('event_matches_total', 'counter', 'Messages matched by event alert rules.');

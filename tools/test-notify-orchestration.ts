@@ -26,7 +26,8 @@ process.env.ALERT_SYSLOG_PORT = String(port);
 process.env.ALERT_RENOTIFY_H = '4';
 
 const { OPS } = await import('../src/store/index.ts');
-const { retryPass, dispatchEvent } = await import('../src/alerts/notify.ts');
+const { retryPass, dispatchEvent, flushDigests } = await import('../src/alerts/notify.ts');
+const { NotifyBudget, digestMessage } = await import('../src/alerts/notify-budget.ts');
 import type { AlertRecord } from '../src/store/ops.ts';
 
 let pass = 0;
@@ -183,6 +184,75 @@ console.log('the notify pass, orchestrated offline\n');
     const mn = calls.filter((c) => c.op === 'markNotified').map((c) => c.args[1]);
     eq('renotify settles the RAISE debt - the parent\'s folding, kept', mn, ['raise']);
     reset();
+}
+
+{
+    // REVIEW F19: a sending budget per channel, and a digest for the rest.
+    console.log('\nthe sending budget and the digest (review F19):');
+    reset();
+    const budget = new NotifyBudget(5, 60);
+    const digested = new Set<string>();
+    stub('channelsDelivered', (id: never) => okRows<Row>(digested.has(id as unknown as string) ? [{ channel: 'syslog' }] : []));
+    stub('logNotifications', (ids: never) => { for (const id of ids as unknown as string[]) digested.add(id); return okRows<Row>([]); });
+    queues = {
+        raise: Array.from({ length: 8 }, (_, i) => alert(`b${i}`, { notified_raise: false })),
+        escalate: [], clear: [], renotify: [],
+    };
+    const first = await retryPass(NOW, budget);
+    await settle();
+    eq('a burst of five goes out one by one', received.length, 5);
+    eq('the other three are held, not sent', budget.heldCounts(), { syslog: 3 });
+    const mn = calls.filter((c) => c.op === 'markNotified');
+    eq('only the five sent settle their debt - a held one is neither settled nor counted as failed',
+        [mn.length, mn.every((c) => c.args[2] === true)], [5, true]);
+    eq('and the pass reports five sent', first.sent, 5);
+
+    reset();
+    const now = Date.now();
+    eq('one digest for the channel', await flushDigests(budget, now), 1);
+    await settle();
+    eq('as ONE datagram', received.length, 1);
+    eq('which says how many and lists them', /3 alerts together: .*cpu b5.*cpu b6.*cpu b7/.test(received[0] ?? ''), true);
+    const logged = calls.filter((c) => c.op === 'logNotifications');
+    eq('logged as delivered for all three, in one call', [logged.length, (logged[0]?.args[0] as unknown as string[] | undefined)?.length, logged[0]?.args[3]], [1, 3, true]);
+    eq('and nothing is held any more', budget.heldCounts(), {});
+    eq('a second digest within the minute does not go', await flushDigests(budget, now + 1000), 0);
+
+    reset();
+    queues.raise = queues.raise.slice(5);
+    await retryPass(NOW, budget);
+    await settle();
+    eq('the next pass sends nothing again - the log says syslog is done for them', received.length, 0);
+    eq('and settles all three', calls.filter((c) => c.op === 'markNotified' && c.args[2] === true).length, 3);
+
+    reset();
+    const quiet = new NotifyBudget(1, 60);
+    quiet.take('syslog', Date.now());
+    const r = await dispatchEvent('renotify', alert('b9'), { budget: quiet });
+    eq('a held renotify still restarts its clock, so the other channels are not told again every pass',
+        [r, calls.some((c) => c.op === 'markRenotified'), calls.some((c) => c.op === 'markNotified')], [false, true, false]);
+    stub('channelsDelivered', () => okRows<Row>([]));
+    reset();
+}
+{
+    console.log('\nthe budget\'s arithmetic:');
+    const b = new NotifyBudget(60, 60);
+    let n = 0;
+    for (let i = 0; i < 100; i++) if (b.take('email', 0)) n++;
+    eq('sixty at once, then none', n, 60);
+    eq('one more a second later', [b.take('email', 1000), b.take('email', 1000)], [true, false]);
+    eq('and a full burst again after a quiet minute', Array.from({ length: 61 }, () => b.take('email', 70_000)).filter(Boolean).length, 60);
+    b.hold('email', 'k1', { alertId: '1', event: 'raise', severity: 'warn', line: 'warn x', heldAt: 0 });
+    b.hold('email', 'k1', { alertId: '1', event: 'raise', severity: 'warn', line: 'warn x', heldAt: 5 });
+    eq('the same debt held twice is listed once', b.heldCounts(), { email: 1 });
+    b.digestSent('email', 0, []);
+    eq('a failed digest keeps what it held, for the next minute', [b.heldCounts(), b.dueDigests(30_000).length, b.dueDigests(60_000).length], [{ email: 1 }, 0, 1]);
+    const many = Array.from({ length: 250 }, (_, i) => ({ alertId: String(i), event: 'raise' as const, severity: i === 7 ? 'crit' : 'warn', line: `warn port Gi1/0/${i} down`, heldAt: 0 }));
+    const d = digestMessage(many);
+    eq('a long digest lists the first hundred and says how many more', d.body.includes('... and 150 more'), true);
+    eq('its syslog line stays one datagram', d.line.length < 1600 && d.line.includes(' more'), true);
+    eq('and it carries the worst severity it holds', d.severity, 'crit');
+    eq('a digest of clears only is a notice', digestMessage([{ alertId: '1', event: 'clear', severity: 'crit', line: 'clear x', heldAt: 0 }]).severity, 'notice');
 }
 
 sock.close();

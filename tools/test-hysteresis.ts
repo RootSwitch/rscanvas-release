@@ -4,7 +4,7 @@
 //   node tools/test-hysteresis.ts
 
 import { step, type AlertRow, type MachineConfig } from '../src/alerts/machine.ts';
-import { insideClearBand, CLEAR_BAND } from '../src/alerts/hysteresis.ts';
+import { insideClearBand, clearBandThreshold, CLEAR_BAND } from '../src/alerts/hysteresis.ts';
 import type { Condition, Severity } from '../src/alerts/rules.ts';
 
 let pass = 0, fail = 0;
@@ -126,6 +126,45 @@ console.log('\nwhat the band must NOT do:');
     eq('held reading between two past-band readings preserves the clear count: clears on the second',
         r.events, ['raise', 'clear']);
 }
+
+console.log('\na rule loosened mid-incident (alerts-F3, the stale-band wedge):');
+{
+    // CPU, band 5. An override warned at 30; the reading sits at 32 and the
+    // alert raises. The override is deleted and the default 45 applies: 32
+    // is now normal. It used to sit inside the band of the deleted 30 line
+    // (32 >= 25) for ever.
+    const cpu = (value: number, warn: number): Condition => ({
+        key: 'cpu:pi:CPU', severity: value >= warn ? 'warn' : null, frozen: false,
+        kind: 'cpu', host: 'pi', code: 'CPU1', label: 'pi CPU', value, threshold: warn, unit: '%',
+    });
+    const r = run([cpu(32, 30), cpu(32, 30), cpu(32, 45), cpu(32, 45), cpu(32, 45)]);
+    eq('loosened from 30 to 45 at a steady 32: raises, then clears after clearScans', r.events, ['raise', 'clear']);
+    eq('and the states say so', r.states, ['pending', 'active', 'clearing', 'cleared', 'cleared']);
+    const held = run([cpu(32, 30), cpu(32, 30), cpu(42, 45), cpu(42, 45)]);
+    eq('a reading inside the NEW line\'s band (42 >= 45 - 5) is still held - the live band works',
+        held.states, ['pending', 'active', 'active', 'active']);
+    const out = run([cpu(32, 30), cpu(32, 30), cpu(42, 45), cpu(38, 45), cpu(38, 45)]);
+    eq('and it clears once it falls past that band', out.events, ['raise', 'clear']);
+}
+{
+    // Unchanged rule: nothing moves. A warn-raised temp alert at 44.5 against
+    // warn 45 (band 2) is held, exactly as before.
+    const r = run([45.85, 45.85, 44.5, 44.5, 44.5].map(temp));
+    eq('an unchanged rule holds inside its band as before', r.states, ['pending', 'active', 'active', 'active', 'active']);
+}
+{
+    // A crit incident whose reading falls under the WARN line: the stored
+    // crit line is the more lenient of the two and keeps its old behaviour.
+    const t = (value: number): Condition => ({
+        ...temp(value), severity: value >= 55 ? 'crit' : value >= 45 ? 'warn' : null,
+        threshold: value >= 55 ? 55 : 45,
+    });
+    const r = run([56, 56, 44, 44].map(t));
+    eq('a crit incident falling under warn clears as it always did', r.events, ['raise', 'clear']);
+}
+eq('lower-is-bad takes the lower line (a battery floor loosened from 30 to 20)',
+    [clearBandThreshold('battery', 30, 20), clearBandThreshold('cpu', 30, 45), clearBandThreshold('cpu', null, 45), clearBandThreshold('cpu', 30, null)],
+    [20, 45, 45, 30]);
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

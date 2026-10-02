@@ -64,6 +64,31 @@ export const CLEAR_BAND: Readonly<Record<string, number>> = {
 };
 
 /**
+ * The threshold a normal reading's clear band is judged against: the more
+ * LENIENT of the one the incident crossed (stored on the row) and the line
+ * that applies now (the normal condition's threshold).
+ *
+ * THE WEDGE THIS CLOSES (review 2026-09-01 finding 4, alerts-F3). The band
+ * was judged against the stored threshold alone, and nothing rewrites it on
+ * a normal reading. Loosen the rule mid-incident - an override at 30 deleted
+ * so the default 45 applies - and a reading of 32 is normal by today's rule
+ * while sitting inside the band of a rule that no longer exists (32 >= 30 -
+ * band), so the alert the operator loosened the rule to silence could never
+ * clear. Taking the more lenient line changes nothing else: with the rule
+ * unchanged the two agree, and a crit incident whose reading has fallen
+ * under the warn line keeps the stored crit line as it always did. And no
+ * hold can outlive the rule: every held reading sits inside the CURRENT
+ * line's band too, which it leaves as it falls.
+ */
+export function clearBandThreshold(
+    kind: string, stored: number | null, current: number | null,
+): number | null {
+    if (stored === null) return current;
+    if (current === null) return stored;
+    return LOWER_IS_BAD.has(kind) ? Math.min(stored, current) : Math.max(stored, current);
+}
+
+/**
  * Should a NORMAL reading (severity null) on an OPEN alert count toward
  * clearing, or be held inside the band?
  *

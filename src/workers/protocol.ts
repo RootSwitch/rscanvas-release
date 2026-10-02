@@ -195,6 +195,8 @@ export interface IngestStats {
     received: number;
     written: number;
     queued: number;
+    /** The queue's ceiling, INGEST_QUEUE_MAX: queued against it is how full. */
+    queueMax: number;
     flushes: number;
     flushFailures: number;
     /** VERDICT, via databaseVerdict in health/work.ts: how long writes have
@@ -208,6 +210,10 @@ export interface IngestStats {
     flushMaxMs: number;
     /** DISPLAY - see the sweep findings. Deliberate loss, and health does not say so. */
     shedByUs: number;
+    /** DISPLAY, cumulative. Rows the database refused on their content and
+     *  that were dropped alone (review F4): the conservation law is
+     *  received == written + shedByUs + rowsRefused. Optional for fixtures. */
+    rowsRefused?: number;
     asyncErrors: number;
     // DISPLAY, event alerting (slice 10). Rules armed is the compiled count;
     // ruleErrors is rows that refused to compile (hand-edited SQL - the API
@@ -227,6 +233,10 @@ export interface IngestStats {
     disarmedRuleIds?: string[];
     eventMatches: number;
     eventUpserts: number;
+    /** DISPLAY, cumulative. Traps not taken (review F1/F10): SNMPv3 refused,
+     *  datagrams the library threw on, Inform acks that could not be encoded,
+     *  and other receiver errors. Optional for fixture compatibility. */
+    trapsRefused?: { v3: number; malformed: number; ack: number; error: number };
     /** VERDICT. isKernelDropFree - the never-drop invariant itself. */
     kernel: KernelUdpState;
     /** VERDICT. isPartitionHealthy(_, 'ingest'). */

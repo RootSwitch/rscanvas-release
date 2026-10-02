@@ -361,21 +361,9 @@ function renderAlertDetail(a, history) {
                 + 'this alert clears as source-removed within a few scans, and the device page shows the mute and undoes it.';
         }
     }
-    // The wedge, said out loud (easy-win E8). Clearing is judged against the
-    // stored threshold - the one this incident crossed - so raising the
-    // effective threshold above it leaves a band where the value is normal by
-    // today's rule yet never clears the alert. The operator who raised the
-    // threshold to silence this exact alert is the person reading this line.
-    if (a.held_by_stale_band) {
-        const d = factLine('warning',
-            'the threshold was RAISED after this fired, and clearing is still judged'
-            + ' against the old stored value - a reading that is normal under the new'
-            + ' threshold can hold this alert open indefinitely. To release it, mute'
-            + ' the threshold briefly (the alert clears as source-removed) and unmute;'
-            + ' it will not re-raise unless the NEW threshold is crossed.');
-        d.className = 'error-text';
-        facts.appendChild(d);
-    }
+    // (The stale-band warning lived here until 2026-09-30: a loosened rule
+    // now clears the alert against its new line, and the provenance line
+    // above already says the threshold then and now.)
     // THE LAPTOP-OR-UPS HINT. A state sensor reading 1 is crit by default,
     // which is right for a UPS on battery and wrong for an undocked laptop -
     // and in the feed those are the same device. The machine says what it
@@ -1164,7 +1152,7 @@ const ROSTER_COLS = [
         // declarations: it is a decision about the device, not its state.
         if (d.alerts_muted === true) {
             const m = badge('muted', 'badge maint');
-            m.title = 'alerts muted: nothing on this device raises - down, interfaces, sensors';
+            m.title = 'alerts muted: down, interfaces and sensors raise nothing on this device - its syslog and trap rules still alert';
             td.append(document.createTextNode(' '), m);
         }
         return td;
@@ -2783,7 +2771,7 @@ function renderDeviceHeader() {
     if (d?.alerts_muted === true) {
         if (badges.childElementCount > 0) badges.appendChild(document.createTextNode(' '));
         const m = badge('muted', 'badge maint');
-        m.title = 'alerts muted: nothing on this device raises - down, interfaces, sensors';
+        m.title = 'alerts muted: down, interfaces and sensors raise nothing on this device - its syslog and trap rules still alert';
         badges.appendChild(m);
     }
     const grp = $('device-grouping');
@@ -4231,10 +4219,8 @@ function showSection(name) {
     // The rules live on System now; re-read them on each visit so an edit
     // made in another tab, or a rule the ingest worker disarmed, shows up.
     if (name === 'system' && can('alertrule.read')) { loadEventRules(); loadGroupAlerts(); }
-    if (name === 'system' && isAdmin) {
-        refreshAdmin();
-        fillGroupSuggestions($('inv-axis').value, 'group-values');
-    }
+    if (name === 'system' && (isAdmin || can('alertrule.read') || can('board.write'))) refreshSystem();
+    if (name === 'system' && can('board.write')) fillGroupSuggestions($('inv-axis').value, 'group-values');
     freshenShown();
 }
 
@@ -4427,9 +4413,11 @@ async function loadDashboard() {
     renderDashList('dash-rx', r.rx || [], traffic('inBytes', 'peakInBps', 'trendIn'), 'no traffic recorded in this window');
     renderDashList('dash-tx', r.tx || [], traffic('outBytes', 'peakOutBps', 'trendOut'), 'no traffic recorded in this window');
     renderDashList('dash-errs', r.errs || [], (x) => [
-        cell(x.device), dashIfCell(x), cell(fmtCount(x.errors), 'num'),
-        cell(fmtCount(x.discards), 'num'), trendCell(x.trendErrs),
-    ], 'no errors or discards on any interface - a clean window');
+        cell(x.device), dashIfCell(x), cell(fmtCount(x.errors), 'num'), trendCell(x.trendErrs),
+    ], 'no errors on any interface - a clean window');
+    renderDashList('dash-disc', r.discards || [], (x) => [
+        cell(x.device), dashIfCell(x), cell(fmtCount(x.discards), 'num'), trendCell(x.trendDiscards),
+    ], 'no discards on any interface - a clean window');
     const pctRow = (x) => [
         cell(x.device), cell(x.name || x.code, 'muted'),
         cell(x.meanPct === null ? '' : `${Math.round(x.meanPct)}%`, 'num'),
@@ -5055,13 +5043,13 @@ async function setRole(username, role) {
     // second implementation of a rule that must hold under concurrency, and
     // the two would disagree exactly when it mattered.
     adminSay('users-msg', r, `${username} is now ${role}`);
-    refreshAdmin();
+    refreshSystem();
 }
 
 async function deleteUser(username) {
     const r = await api(`/api/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
     adminSay('users-msg', r, `deleted ${username}`);
-    refreshAdmin();
+    refreshSystem();
 }
 
 $('new-user-form').addEventListener('submit', async (e) => {
@@ -5077,7 +5065,7 @@ $('new-user-form').addEventListener('submit', async (e) => {
     });
     adminSay('new-user-msg', r, `created ${$('nu-name').value.trim()}`);
     if (r.ok) { $('nu-name').value = ''; $('nu-pass').value = ''; }
-    refreshAdmin();
+    refreshSystem();
 });
 
 function renderAudit(rows) {
@@ -5203,7 +5191,7 @@ function renderBoards(boards, gridFields, gridDefaults, manual) {
             if (!window.confirm(`Delete the board "${b.name}"?${warn}`)) return;
             const r = await api(`/api/boards/${encodeURIComponent(b.id)}`, { method: 'DELETE' });
             adminSay('boards-msg', r, `deleted "${b.name}"`);
-            refreshAdmin();
+            refreshSystem();
         });
         actCell.appendChild(delBtn);
 
@@ -5259,7 +5247,7 @@ function renderBoards(boards, gridFields, gridDefaults, manual) {
                     body: JSON.stringify({ action, ...(extra2 || {}) }),
                 });
                 adminSay('boards-msg', r, `${b.name}: ${action} - now ${r.shapes} shape(s)`);
-                refreshAdmin();
+                refreshSystem();
             };
             if (missing > 0) {
                 const addBtn = document.createElement('button');
@@ -5413,7 +5401,7 @@ $('grid-save').addEventListener('click', async () => {
                 ? `displays now fit their own screens automatically, ${fields.length} field(s) - live within one refresh`
                 : `displays now render ${cols} columns with ${fields.length} field(s) - live within one refresh`)
         : (r.detail || `refused (${r.status})`);
-    if (r.ok) refreshAdmin();
+    if (r.ok) refreshSystem();
 });
 
 async function setBoardAddresses(id, show) {
@@ -5425,7 +5413,7 @@ async function setBoardAddresses(id, show) {
     adminSay('boards-msg', r, show
         ? 'displays of this board will now show IP addresses'
         : 'addresses withheld from displays of this board');
-    refreshAdmin();
+    refreshSystem();
 }
 
 /**
@@ -5512,7 +5500,7 @@ $('inv-export').addEventListener('click', async () => {
                     : ' - if a board for this group already exists, "rebuild" in the table above regenerates it.');
             return;
         }
-        await refreshAdmin();
+        await refreshSystem();
         // Selecting the new board hands the picker to it - the CrossCanvas
         // path's next step. Without manual layout the picker is hidden and the
         // next Generate must make the next board, not export this one.
@@ -5592,7 +5580,7 @@ $('imp-go').addEventListener('click', async () => {
         names.textContent = un.join(', ');
         box.appendChild(names);
     }
-    if (r.ok) refreshAdmin();
+    if (r.ok) refreshSystem();
 });
 
 $('new-board-form').addEventListener('submit', async (e) => {
@@ -5607,7 +5595,7 @@ $('new-board-form').addEventListener('submit', async (e) => {
     });
     adminSay('boards-msg', r, `created ${$('nb-name').value.trim()}`);
     if (r.ok) $('nb-name').value = '';
-    refreshAdmin();
+    refreshSystem();
 });
 
 async function showTokens(board) {
@@ -5661,7 +5649,7 @@ async function revokeToken(id, label) {
         ? `${label} was already revoked`
         : `${label} revoked - that display stops rendering on its next poll`);
     if (currentBoard !== null) showTokens(currentBoard);
-    refreshAdmin();
+    refreshSystem();
 }
 
 $('new-token-form').addEventListener('submit', async (e) => {
@@ -5681,7 +5669,7 @@ $('new-token-form').addEventListener('submit', async (e) => {
     // operator minted three tokens hunting for it (2026-08-27) before the
     // audit trail proved the mints were working and the screen was not.
     await showTokens(currentBoard);
-    refreshAdmin();
+    refreshSystem();
     // THE SECRET EXISTS HERE AND NOWHERE ELSE, EVER AGAIN. Only its hash was
     // stored, so "copy this now" is literally true rather than the usual
     // security theatre - and the panel says which it is, because an operator
@@ -5694,7 +5682,8 @@ $('new-token-form').addEventListener('submit', async (e) => {
     const out = $('token-once');
     out.replaceChildren();
     out.classList.remove('hidden');
-    const url = `${location.origin}/wall.html?token=${r.secret}`;
+    // In the fragment, which never reaches a server or a proxy log (wall.js).
+    const url = `${location.origin}/wall.html#token=${r.secret}`;
     const open = document.createElement('a');
     // DOM-SINK-OK: `url` is the template two lines above - location.origin
     // plus a server-minted token. Same-origin by construction; the token is
@@ -5751,6 +5740,8 @@ function renderThresholds(data) {
         del.type = 'button'; del.textContent = 'remove';
         del.title = 'Remove this override. The next tier, or the default, applies on the next scan.';
         del.addEventListener('click', () => deleteThreshold(o.id, o));
+        // Operators read this table; removing an override is alertrule.write.
+        if (!can('alertrule.write')) del.classList.add('hidden');
         const tr = rowEl([
             cell(thScopeLabel(o)), cell(o.kind),
             // A code is a key, not an answer. Eleven mem mutes listed as
@@ -6037,22 +6028,31 @@ async function deleteCredential(name, devices) {
     const d = await api('/api/credentials'); if (d.ok) renderCredentials(d);
 }
 
-async function refreshAdmin() {
+// THE SYSTEM TAB'S PANELS, each loaded for whoever may see it (2026-09-30):
+// thresholds and boards are operators' work too, so this is no longer admin
+// alone. A role asks only for what its panels show - an operator's refresh
+// requests nothing it would be refused.
+async function refreshSystem() {
+    const admin = isAdmin;
     const [ret, users, audit, creds, ths] = await Promise.all([
-        api('/api/admin/retention'), api('/api/users'), api(`/api/audit?limit=${auditLimit}`),
-        api('/api/credentials'), api('/api/thresholds'),
+        admin ? api('/api/admin/retention') : null, admin ? api('/api/users') : null,
+        admin ? api(`/api/audit?limit=${auditLimit}`) : null, admin ? api('/api/credentials') : null,
+        can('alertrule.read') ? api('/api/thresholds') : null,
     ]);
-    if (ret.status === 401) { showLogin(); return; }
-    if (ret.ok) renderRetention(ret);
-    else {
-        const el = $('retention-msg');
-        el.textContent = ret.detail || `could not load retention (${ret.status})`;
-        el.classList.remove('hidden');
+    if ([ret, users, audit, creds, ths].some((r) => r !== null && r.status === 401)) { showLogin(); return; }
+    if (ret !== null) {
+        if (ret.ok) renderRetention(ret);
+        else {
+            const el = $('retention-msg');
+            el.textContent = ret.detail || `could not load retention (${ret.status})`;
+            el.classList.remove('hidden');
+        }
     }
-    if (users.ok) renderUsers(users.users || []);
-    if (audit.ok) renderAudit(audit.entries || []);
-    if (creds.ok) renderCredentials(creds);
-    if (ths.ok) renderThresholds(ths);
+    if (users?.ok) renderUsers(users.users || []);
+    if (audit?.ok) renderAudit(audit.entries || []);
+    if (creds?.ok) renderCredentials(creds);
+    if (ths?.ok) renderThresholds(ths);
+    if (!can('board.write')) return;
     const boards = await api('/api/boards');
     if (boards.ok) renderBoards(boards.boards || [], boards.gridFields, boards.gridDefaults, boards.manualLayout);
 }

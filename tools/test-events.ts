@@ -19,7 +19,7 @@
 
 import {
     compileRule, matchMessage, eventLabel, MAX_PATTERN_LENGTH, NOTIFIER_APP,
-    nestedQuantifier, RULE_BUDGET_MS,
+    nestedQuantifier, RULE_BUDGET_MS, searchForm, wildcardRuns, MATCH_TEXT_MAX, keyHost, overflowKey,
     type EventRule, type CompiledRule, type PendingEvent, type MessageForMatch,
 } from '../src/alerts/events.ts';
 
@@ -181,6 +181,36 @@ function main(): void {
             key.split('|')[1], '42');
     }
 
+    console.log('\na host cannot make a key that reads as the overflow (review F11)');
+    {
+        // `*|1`, `*|2`, ... read as `event|<rule>|*` in field 3, so each was
+        // kept as its own row past the 20-host cap and owed its own raise.
+        const pending = new Map<string, PendingEvent>();
+        for (let i = 0; i < 5; i++) matchMessage([compiled({ id: '42' })], pending, msg({ host: `*|${i}` }));
+        const keys = [...pending.keys()];
+        eq('five invented hosts are five keys', keys.length, 5);
+        eq('none splits to a third field of *', keys.some((k) => k.split('|')[2] === '*'), false);
+        eq('and each splits into exactly three fields', keys.every((k) => k.split('|').length === 3), true);
+        eq('the escaped form', keys[0], 'event|42|%2A%7C0');
+        const p = pending.get('event|42|%2A%7C0') as PendingEvent;
+        eq('the alert row keeps the host as it was sent', p.host, '*|0');
+        eq('a host of exactly * is not the overflow key', keyHost('*'), '%2A');
+        eq('a percent sign is escaped too, so escapes cannot collide', keyHost('%2A'), '%252A');
+        eq('an ordinary host is untouched', keyHost('core-sw-01.example.net'), 'core-sw-01.example.net');
+    }
+
+    console.log('\nthe pending map is bounded while the database cannot be asked (review F11)');
+    {
+        const pending = new Map<string, PendingEvent>();
+        for (let i = 0; i < 50; i++) matchMessage([compiled({ id: '9' })], pending, msg({ host: `h-${i}` }), undefined, 10);
+        eq('ten per-host keys and one overflow, not fifty', pending.size, 11);
+        const o = pending.get(overflowKey('9')) as PendingEvent;
+        eq('the overflow carries the other forty matches', o.count, 40);
+        eq('and the overflow host, not one of the names', o.host, '*');
+        matchMessage([compiled({ id: '9' })], pending, msg({ host: 'h-3' }), undefined, 10);
+        eq('a host already pending still folds into its own key', (pending.get('event|9|h-3') as PendingEvent).count, 2);
+    }
+
     console.log('\nthe host is bounded (2026-09-01 review)');
     {
         // HOSTNAME arrives from unauthenticated UDP with no upstream cap, and
@@ -216,7 +246,7 @@ function main(): void {
     // The false-positive side decides whether this guard survives contact: one
     // that refuses real rules gets an exception added and then gets ignored.
     for (const p of [
-        'link (up|down)', 'BGP.*neighbor.*Down', 'CPU utilization is [0-9]+%',
+        'link (up|down)', 'neighbor.*Down', 'CPU utilization is [0-9]+%',
         'Interface Gi[0-9]+/[0-9]+', 'temp=[0-9]{1,3}C', '(warning|critical) threshold',
         '.*(error|fail).*', 'a{3}', 'path\(s\)', '([a-z]+){2}',
         // A QUANTIFIED GROUP WHOSE BODY DOES NOT REPEAT is safe and common,
@@ -259,6 +289,71 @@ function main(): void {
             msg: 'link down', host: 'h', sourceIp: '1.1.1.1', proto: 'syslog', app: null, ts: new Date(),
         }, (rule) => { fired.push(rule.name); });
         eq('ordinary work does NOT trip the budget', fired.length, 0);
+    }
+
+    // ---- the polynomial half (2026-10-01, review F3) --------------------------
+    // The review's measurements, before: `.*(error|fail).*(timeout|refused).*`
+    // 22.7 s on an 8 KB line of "error ", and `.*error` 54 ms on an 8 KB line
+    // with no match - over the budget, so one datagram disarmed the rule.
+    console.log('\nReDoS, the polynomial half (review F3):');
+    {
+        eq('a leading .* is dropped', searchForm('.*error'), 'error');
+        eq('and a trailing one', searchForm('.*(error|fail).*(timeout|refused).*'), '(error|fail).*(timeout|refused)');
+        eq('lazy ones too', searchForm('.*?x.*?'), 'x');
+        eq('an escaped dot is a full stop, kept', searchForm('a\\.*'), 'a\\.*');
+        eq('an anchored pattern is left alone', searchForm('^.*x'), '^.*x');
+        eq('a pattern that is only .* keeps it', searchForm('.*'), '.*');
+        // Equivalence on real lines: the search form finds what the pattern
+        // as written finds. A rule is tested, never anchored, so it must.
+        const lines = ['', 'error', 'an error occurred', 'fail then timeout', 'x\nerror', 'timeout before fail',
+            'link down', 'a.b', 'aaa', '...'];
+        for (const p of ['.*error', '.*error.*', '.*(error|fail).*(timeout|refused).*', '.*?down', 'a\\.*', '.*a|b.*']) {
+            const asWritten = new RegExp(p);
+            const c = compileRule(redosRule(p));
+            const same = c.ok && lines.every((l) => c.compiled.test(l) === asWritten.test(l));
+            eq(`the search form of ${p} matches exactly the lines the pattern does`, same, true);
+        }
+    }
+    {
+        eq('one wildcard is armed', compileRule(redosRule('(error|fail).*(timeout|refused)')).ok, true);
+        eq('one per alternative is armed', compileRule(redosRule('a.*b|c.*d')).ok, true);
+        const two = compileRule(redosRule('BGP.*neighbor.*Down'));
+        eq('two in one alternative are REFUSED (cubic: 258 ms on a crafted 4 KB line)', two.ok, false);
+        eq('and the refusal says what to write instead', !two.ok && two.detail.includes('Keep one wildcard'), true);
+        eq('x.*y.*z is refused (5.9 s on 4 KB, measured)', compileRule(redosRule('x.*y.*z')).ok, false);
+        eq('.+ counts as a wildcard', compileRule(redosRule('a.+b.+c')).ok, false);
+        eq('a wildcard inside a character class is not one', wildcardRuns('[.*]x[.+]'), 0);
+        eq('nor an escaped dot', wildcardRuns('a\\.*b\\.+c'), 0);
+    }
+    {
+        // The review's own suggested regression: an 8 KB line against `.*error`
+        // must not disarm the rule. Plus the 22.7 s case and a 130 KB trap.
+        const slow: string[] = [];
+        const onSlow = (r: EventRule, ms: number): void => { slow.push(`${r.pattern} ${ms.toFixed(0)}ms`); };
+        const cases: Array<[string, string]> = [
+            ['.*error', 'a'.repeat(8186)],
+            ['.*(error|fail).*(timeout|refused).*', 'error '.repeat(1364)],
+            ['.*(error|fail).*(timeout|refused).*', 'error ' + 'ab'.repeat(65000)],
+            ['x.*y', 'x'.repeat(8192)],
+        ];
+        for (const [p, line] of cases) {
+            const c = compileRule(redosRule(p));
+            if (!c.ok) { bad(`${p} should compile`, c.detail); continue; }
+            matchMessage([c.compiled], new Map(), {
+                msg: line, host: 'h', sourceIp: '1.1.1.1', proto: 'syslog', app: null, ts: new Date(),
+            }, onSlow);
+        }
+        eq('none of the measured lines trips the budget any more', slow, []);
+    }
+    {
+        // The trade, stated as a test: a regex looks at the first
+        // MATCH_TEXT_MAX characters; a substring rule at all of them.
+        const far = 'x'.repeat(MATCH_TEXT_MAX + 10) + ' link down';
+        const rex = compileRule(redosRule('link (up|down)'));
+        const sub = compileRule(redosRule('link down', false));
+        eq('a regex does not see past MATCH_TEXT_MAX', rex.ok && rex.compiled.test(far), false);
+        eq('a substring rule does', sub.ok && sub.compiled.test(far), true);
+        eq('and within it a regex sees everything', rex.ok && rex.compiled.test('x'.repeat(4000) + ' link down'), true);
     }
     console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
     process.exit(fail === 0 ? 0 : 1);

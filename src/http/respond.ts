@@ -5,6 +5,7 @@
 // belong somewhere a later slice can reuse rather than copy.
 
 import type http from 'node:http';
+import { isIP } from 'node:net';
 import zlib from 'node:zlib';
 import { authorize, type Action, type Principal, type Resource } from '../auth/authorize.ts';
 
@@ -96,11 +97,11 @@ export const BODY_CAP_DOC = 4_000_000;
  * permanently rather than per-feature.
  *
  * `frame-ancestors 'none'` (with the older `x-frame-options` beside it) is
- * about clickjacking, because CSRF protection here rests entirely on
- * `SameSite=Lax` with no token and no Origin check. Lax does hold against
- * cross-site POST - no state-changing route is reachable by GET - but it is
- * one control, and a UI carrying `DELETE /api/users/:name` and bulk device
- * delete should not be frameable.
+ * about clickjacking. CSRF protection was `SameSite=Lax` alone until
+ * 2026-10-01; crossSiteRefusal below is the second control. Lax holds
+ * against cross-SITE POST - no state-changing route is reachable by GET - but
+ * a UI carrying `DELETE /api/users/:name` and bulk device delete should not
+ * be frameable either.
  *
  * HSTS IS CONDITIONAL ON TLS and must stay that way: sent over plain http it
  * pins a browser to https for a year against a deployment that may not serve
@@ -277,14 +278,57 @@ export function str(body: Record<string, unknown>, key: string): string {
  */
 export function clientIp(req: http.IncomingMessage): string {
     if (process.env.TRUST_PROXY === '1') {
+        // THE RIGHTMOST ENTRY, AND ONLY AN ADDRESS (2026-10-01, review F9).
+        // It took the LEFTMOST, which is whatever the client sent: a proxy
+        // that appends ($proxy_add_x_forwarded_for, the usual nginx setting)
+        // keeps the client's own header in front of the address it saw, so
+        // the "client address" was chosen by the client even through a
+        // correctly configured proxy - a fresh lockout bucket per request,
+        // and an audit trail of addresses the attacker picked. The rightmost
+        // entry is the one the nearest proxy wrote. It must also BE an
+        // address: anything else reached the audit's inet cast as a 500.
         const xff = req.headers['x-forwarded-for'];
-        const first = Array.isArray(xff) ? xff[0] : xff;
-        if (first) {
-            const ip = first.split(',')[0]?.trim();
-            if (ip) return ip;
-        }
+        const joined = Array.isArray(xff) ? xff.join(',') : xff;
+        const last = joined?.split(',').map((s) => s.trim()).filter((s) => s !== '').at(-1);
+        if (last !== undefined && isIP(last) !== 0) return last;
     }
     return req.socket.remoteAddress ?? 'unknown';
+}
+
+/**
+ * WHY A REQUEST THAT CHANGES THINGS IS REFUSED AS CROSS-ORIGIN, or null when
+ * it may proceed (2026-10-01, review F12; the operator chose this over a
+ * custom header).
+ *
+ * `SameSite=Lax` keeps the session cookie off requests from another SITE,
+ * and a site is a registrable domain: a page on another PORT of this box, or
+ * on a sibling host under the same domain - a monitored device's own web UI,
+ * often - is the same site, the cookie goes with its requests, and a no-cors
+ * text/plain POST (which readJsonBody parses whatever the Content-Type) could
+ * create an admin in a signed-in admin's name.
+ *
+ * Browsers say where a request came from. `Sec-Fetch-Site` is sent by every
+ * current one: only `same-origin` (this page) and `none` (typed, or a
+ * bookmark) may change anything - `same-site` and `cross-site` are refused.
+ * A browser too old to send it sends `Origin` on a cross-origin POST, which
+ * must then name this host. A request carrying neither is not from a page at
+ * all - curl, the test tools, a script with a session - and passes, because
+ * CSRF is something done to a browser.
+ */
+export function crossSiteRefusal(req: http.IncomingMessage): string | null {
+    const method = req.method ?? 'GET';
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return null;
+    const site = req.headers['sec-fetch-site'];
+    if (site !== undefined) {
+        return site === 'same-origin' || site === 'none' ? null : `a ${site} request may not change anything here`;
+    }
+    const origin = req.headers.origin;
+    if (origin === undefined) return null;
+    let originHost: string | null = null;
+    try { originHost = new URL(origin).host; } catch { /* "null", or junk: refused below */ }
+    return originHost !== null && originHost === req.headers.host
+        ? null
+        : 'a request from another origin may not change anything here';
 }
 
 /** Postgres inet rejects a bare IPv6 scope or "unknown"; store null instead. */

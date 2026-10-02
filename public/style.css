@@ -537,7 +537,7 @@ table.list.no-select tr > :first-child { display: none; }
 .whoami:hover { color: var(--se-txt); text-decoration: underline; }
 
 /* ===== Dashboard (2026-09-25) =====
- * Five top-10 widgets that flow two-up on a wide screen and stack on a
+ * Six top-10 widgets that flow two-up on a wide screen and stack on a
  * narrow one; compact rows, because ten of them have to fit a glance. */
 .dash-grid {
     display: grid;

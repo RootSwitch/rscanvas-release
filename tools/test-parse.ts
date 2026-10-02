@@ -12,7 +12,7 @@
 //
 //   node tools/test-parse.ts
 
-import { parse } from '../src/syslog/parse.ts';
+import { parse, storableTs } from '../src/syslog/parse.ts';
 import { copyEscape, copyLine, stripNul } from '../src/store/copy.ts';
 
 type Case = [
@@ -289,6 +289,36 @@ if (copyEscape(null) === '\\N') {
         fail++;
         console.log('FAIL | stripNul altered a clean string');
     }
+}
+
+// A TIMESTAMP POSTGRESQL CANNOT STORE IS NO TIMESTAMP (2026-10-01, review F4).
+// Date.parse accepts each of these and toISOString writes them back in forms
+// PostgreSQL refuses - one such line made its whole 2,000-row COPY fail, the
+// batch requeued at the head, and nothing was stored until the queue shed.
+for (const ts of ['0000-01-01T00:00:00Z', '+010000-01-01T00:00:00Z', '-000001-01-01T00:00:00Z']) {
+    const row = parse(`<14>1 ${ts} host app 1 - - text`, '192.0.2.1');
+    if (!Number.isNaN(Date.parse(ts)) && row.msgTs === null && row.raw.includes(ts)) {
+        pass++;
+    } else {
+        fail++;
+        console.log(`FAIL | an unstorable timestamp survived parsing: ${ts} ->`, row.msgTs?.toISOString());
+    }
+}
+{
+    // V8's legacy `Jan 1 99999` cannot arrive as one 5424 field (they split on
+    // spaces), so the gate itself is checked against it.
+    const legacy = new Date(Date.parse('Jan 1 99999'));
+    if (!Number.isNaN(legacy.getTime()) && !storableTs(legacy) && storableTs(new Date('2026-10-01T00:00:00Z'))) pass++;
+    else { fail++; console.log('FAIL | storableTs accepted year 99999 or refused today'); }
+}
+for (const [ts, iso] of [
+    ['1970-01-01T00:00:00Z', '1970-01-01T00:00:00.000Z'],       // an unset clock: wrong, storable, kept
+    ['2003-08-24T05:14:15.000003-07:00', '2003-08-24T12:14:15.000Z'],
+    ['9999-12-31T23:59:59Z', '9999-12-31T23:59:59.000Z'],
+] as const) {
+    const row = parse(`<14>1 ${ts} host app 1 - - text`, '192.0.2.1');
+    if (row.msgTs?.toISOString() === iso) pass++;
+    else { fail++; console.log(`FAIL | a storable timestamp was lost: ${ts} ->`, row.msgTs?.toISOString()); }
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

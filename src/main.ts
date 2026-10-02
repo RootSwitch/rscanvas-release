@@ -59,6 +59,7 @@ import { serializeMetrics } from './health/metrics.ts';
 import { SUPPORTED_CHECKS } from './collector/reach.ts';
 import {
     sendJson, sendJsonGzip, enforce, readJsonBody, readBodyOr400, containsNul, clientIp, inetOrNull, BODY_CAP_BULK, BODY_CAP_DOC, securityHeaders,
+    crossSiteRefusal,
 } from './http/respond.ts';
 import * as authRoutes from './http/routes-auth.ts';
 import * as exportRoutes from './http/routes-export.ts';
@@ -823,12 +824,44 @@ const SCHEME = tlsPair === null ? 'http' : 'https';
 // before this process, 1 to force it behind one that terminates.
 if (tlsPair !== null && process.env.COOKIE_SECURE === undefined) process.env.COOKIE_SECURE = '1';
 
+/** host[:port] - a bracketed IPv6 literal or an RFC 3986 reg-name/IPv4. */
+const HOST_SHAPE = /^(\[[0-9A-Fa-f:.]+\]|(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2})+)(:[0-9]{1,5})?$/;
+
 const server = createWebServer(tlsPair, (req, res) => {
-    const url = new URL(req.url ?? '/', `${SCHEME}://${req.headers.host ?? 'localhost'}`);
+    // A CONSTANT BASE, AND A PARSE THAT CANNOT THROW OUT OF HERE (2026-10-01,
+    // review F2). The base was built from the Host header, and this line runs
+    // in the request listener itself, outside route() and its catch - so
+    // `Host: a b`, or a request target of `//[`, both of which the HTTP parser
+    // accepts, threw from new URL and ended the process. Only the path and the
+    // query are ever read from this URL, never its host.
+    let url: URL;
+    try {
+        url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+        sendJson(res, 400, { ok: false, detail: 'malformed request target' });
+        return;
+    }
+    // And a Host that is not a host is refused, as HTTP/1.1 requires (RFC
+    // 9112 section 3.2) - no longer because anything here would break on it.
+    // An absent one is allowed (HTTP/1.0 probes send none), and so is an
+    // empty one, which HTTP/1.1 permits.
+    const host = req.headers.host;
+    if (host !== undefined && host !== '' && !HOST_SHAPE.test(host)) {
+        sendJson(res, 400, { ok: false, detail: 'malformed Host header' });
+        return;
+    }
     const method = req.method ?? 'GET';
     const path = url.pathname;
 
     const route = async (): Promise<void> => {
+        // A PAGE ON ANOTHER ORIGIN CANNOT CHANGE ANYTHING, whatever cookie
+        // its request carries (review F12; respond.ts crossSiteRefusal).
+        // Before every route, so no route can forget it.
+        const crossSite = crossSiteRefusal(req);
+        if (crossSite !== null) {
+            sendJson(res, 403, { ok: false, detail: crossSite });
+            return;
+        }
         // INPUT NO ROUTE CAN USE, refused before any route sees it (2026-09-28,
         // the surface sweep - tools/live-surface.mjs). A NUL in a query
         // parameter reached PostgreSQL, which cannot store one, as a 500 on
@@ -1152,24 +1185,11 @@ const server = createWebServer(tlsPair, (req, res) => {
                             threshold_source: info.source,
                             threshold_muted: info.muted,
                             threshold_now: now,
-                            // THE WEDGE DETECTOR (easy-win E8). The clear
-                            // band is judged against the threshold ON THE
-                            // ROW - the one this incident crossed - and
-                            // normal scans never rewrite it. Loosen the
-                            // effective threshold above the stored one while
-                            // the alert is open and the value can sit
-                            // forever in [stored - band, new-warn): normal
-                            // by today's rule, held by the band of a rule
-                            // that no longer exists. The alert the operator
-                            // raised the threshold specifically to silence
-                            // never clears. This page already computes both
-                            // numbers; saying the trap out loud is one
-                            // comparison (review alerts-F3 records the fix
-                            // shape; until it lands, this is the light on
-                            // it).
-                            held_by_stale_band: a.state === 'active'
-                                && now !== null && a.threshold !== null
-                                && now > a.threshold,
+                            // (The E8 wedge detector lived here until alerts-F3
+                            // was fixed on 2026-09-30: a loosened rule no longer
+                            // holds an alert open - hysteresis.ts
+                            // clearBandThreshold. The provenance line above
+                            // already shows the threshold then and now.)
                         };
                     }
                 } catch { /* garnish - the page renders without it */ }
@@ -2248,6 +2268,10 @@ const server = createWebServer(tlsPair, (req, res) => {
         }
 
         if (path === '/api/devices/remove' && method === 'POST') {
+            // AUTHORISED BEFORE THE BODY IS READ (review L3, the 09-28 rule):
+            // the lesser action first, since every role that may delete may
+            // also disable; the mode the body asks for is checked after it.
+            if (!enforce(res, principal, 'device.disable')) return;
             let body: Record<string, unknown>;
             try {
                 body = await readJsonBody(req, BODY_CAP_BULK);
@@ -2256,7 +2280,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                 return;
             }
             const mode = normalizeMode(body.mode);
-            if (!enforce(res, principal, mode === 'delete' ? 'device.delete' : 'device.disable')) return;
+            if (mode === 'delete' && !enforce(res, principal, 'device.delete')) return;
 
             // The rules themselves live in src/devices/removal.ts and are
             // asserted offline by tools/test-onboarding.ts. What stays here is
@@ -4338,7 +4362,16 @@ const server = createWebServer(tlsPair, (req, res) => {
 
         const userMatch = /^\/api\/users\/([^/]+)(\/role|\/password)?$/.exec(path);
         if (userMatch) {
-            const target = decodeURIComponent(userMatch[1] as string);
+            // A malformed escape (`%`, `%zz`) threw a URIError here, before
+            // any route authorised - a 500 and a stack trace in the log for
+            // anyone (review L2). It is the client's mistake: a 400.
+            let target: string;
+            try {
+                target = decodeURIComponent(userMatch[1] as string);
+            } catch {
+                sendJson(res, 400, { ok: false, detail: 'malformed user name in the path' });
+                return;
+            }
             const sub = userMatch[2];
             if (sub === '/role' && method === 'POST') {
                 await authRoutes.setRole(req, res, principal, target);
@@ -4399,8 +4432,10 @@ log(credentialStoreReady()
     ? '  credential store: key derived at boot'
     : '  credential store: RSCANVAS_SECRET unset - profiles disabled, SNMP_COMMUNITY* still resolve');
 
-server.listen(CONFIG.httpPort, () => {
-    log(`${SCHEME} listening on ${CONFIG.httpPort}${tlsPair === null ? '' : ` (TLS_CERT=${CONFIG.tlsCert}; plain http on this port is redirected)`}`);
+// On BIND_ADDRESS when it is set, else every address, IPv6 included (config.ts
+// bindAddressSet says why the default is not passed through).
+const onListening = (): void => {
+    log(`${SCHEME} listening on ${CONFIG.bindAddressSet ? `${CONFIG.bindAddress}:` : ''}${CONFIG.httpPort}${tlsPair === null ? '' : ` (TLS_CERT=${CONFIG.tlsCert}; plain http on this port is redirected)`}`);
     log('  POST /api/login                 {username, password}');
     log('  POST /api/logout');
     log('  GET  /api/me');
@@ -4453,7 +4488,13 @@ server.listen(CONFIG.httpPort, () => {
     } else {
         log(`notification channels: ${channels.enabled.join(', ')}`);
     }
-});
+    if (CONFIG.alertSmtpModeUnknown !== null) {
+        log(`WARNING ALERT_SMTP_MODE=${JSON.stringify(CONFIG.alertSmtpModeUnknown)} is not tls, starttls or none -`);
+        log('        email uses starttls (upgrade or fail, never plaintext). Set it to one of the three.');
+    }
+};
+if (CONFIG.bindAddressSet) server.listen(CONFIG.httpPort, CONFIG.bindAddress, onListening);
+else server.listen(CONFIG.httpPort, onListening);
 
 /** One window's lists for the rollup hour ending at hiMs, computed once. */
 async function computeDashboard(hours: number, hiMs: number): Promise<DashboardAnswer> {
@@ -4480,8 +4521,8 @@ async function computeDashboard(hours: number, hiMs: number): Promise<DashboardA
         // previous window (trend() says why).
         trendIn: trend(r.in_s, r.p_in_s, r.cov_h, r.p_cov_h, hours),
         trendOut: trend(r.out_s, r.p_out_s, r.cov_h, r.p_cov_h, hours),
-        trendErrs: trend(r.err_s === null && r.disc_s === null ? null : (r.err_s ?? 0) + (r.disc_s ?? 0),
-            r.p_ed_s, r.cov_h, r.p_cov_h, hours),
+        trendErrs: trend(r.err_s, r.p_err_s, r.cov_h, r.p_cov_h, hours),
+        trendDiscards: trend(r.disc_s, r.p_disc_s, r.cov_h, r.p_cov_h, hours),
     });
     const sensRow = (r: (typeof sens.rows)[number]) => ({
         device: r.device, code: r.code, name: r.name,
@@ -4495,6 +4536,7 @@ async function computeDashboard(hours: number, hiMs: number): Promise<DashboardA
         rx: ifs.rows.filter((r) => r.list === 'rx').map(ifRow),
         tx: ifs.rows.filter((r) => r.list === 'tx').map(ifRow),
         errs: ifs.rows.filter((r) => r.list === 'errs').map(ifRow),
+        discards: ifs.rows.filter((r) => r.list === 'disc').map(ifRow),
         cpu: sens.rows.filter((r) => r.list === 'cpu').map(sensRow),
         mem: sens.rows.filter((r) => r.list === 'mem').map(sensRow),
         ms: Math.round(performance.now() - t0),

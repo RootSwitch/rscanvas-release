@@ -170,11 +170,22 @@
                         <tbody></tbody>
                     </table>
                 </div>
+                <!-- Errors and discards apart (2026-10-01, operator): a link
+                     dropping packets for want of buffer is a different story
+                     from one taking bad frames, and six tables sit evenly. -->
                 <div class="widget">
-                    <h3>Errors and discards</h3>
+                    <h3>Errors</h3>
                     <table class="list compact" id="dash-errs">
                         <thead><tr><th>device</th><th>interface</th><th class="num">errors</th>
-                            <th class="num">discards</th><th class="num">vs before</th></tr></thead>
+                            <th class="num">vs before</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="widget">
+                    <h3>Discards</h3>
+                    <table class="list compact" id="dash-disc">
+                        <thead><tr><th>device</th><th>interface</th><th class="num">discards</th>
+                            <th class="num">vs before</th></tr></thead>
                         <tbody></tbody>
                     </table>
                 </div>
@@ -976,7 +987,11 @@
             </table>
         </div>
 
-        <div class="panel hidden admin-only" data-section="system" id="thresholds-panel">
+        <!-- Thresholds and Boards are operators' panels too (2026-09-30, operator):
+             each is gated by the permission its routes check, not by admin.
+             An operator reads thresholds (changing one stays alertrule.write)
+             and does everything with boards but mint a display token. -->
+        <div class="panel hidden" data-section="system" id="thresholds-panel" data-can="alertrule.read">
             <h2>Thresholds <span id="th-sub" class="muted"></span></h2>
             <div class="hints">
                 The shipped defaults are a starting point. An override replaces them
@@ -1153,7 +1168,7 @@
             <div id="new-user-msg" class="muted small"></div>
         </div>
 
-        <div class="panel hidden admin-only" data-section="system" id="boards-panel">
+        <div class="panel hidden" data-section="system" id="boards-panel" data-can="board.write">
             <h2>Boards and displays <span id="boards-sub" class="muted"></span></h2>
             <div id="boards-msg" class="allquiet hidden"></div>
             <table class="list" id="boards">
@@ -1244,7 +1259,7 @@
                 </table>
                 <div id="no-tokens" class="muted small hidden">no displays yet - mint a token below and
                     open its URL on the screen that should show this board</div>
-                <form id="new-token-form" class="row token-mint">
+                <form id="new-token-form" class="row token-mint" data-can="token.mint">
                     <input type="text" id="nt-label" class="grow"
                            placeholder="which screen is this? e.g. NOC left panel" autocomplete="off" required>
                     <button type="submit" class="btn-primary">Mint a display token</button>

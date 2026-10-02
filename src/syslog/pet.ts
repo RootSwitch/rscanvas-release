@@ -129,14 +129,25 @@ const SENSOR_SPECIFIC: Readonly<Record<number, readonly string[]>> = {
 };
 
 /** Entity IDs (IPMI v2.0 table 43-13), the ones a BMC's sensors sit on. */
+// Every entity IPMI 2.0 names (its entity ID table), not a selection: the
+// first real power cycle (2026-09-30) reported its OEM events on 0x18, a
+// sub-chassis, which the selection lacked and printed as a bare number.
 const ENTITIES: Readonly<Record<number, string>> = {
-    0x03: 'processor', 0x04: 'disk or disk bay', 0x06: 'system management module', 0x07: 'system board',
-    0x08: 'memory module', 0x0a: 'power supply', 0x0b: 'add-in card', 0x0c: 'front panel board',
-    0x0f: 'drive backplane', 0x13: 'power unit', 0x14: 'power module', 0x17: 'system chassis',
-    0x1a: 'disk drive bay', 0x1d: 'fan', 0x1e: 'cooling unit', 0x20: 'memory device',
-    0x21: 'system management software', 0x22: 'system firmware', 0x23: 'operating system', 0x28: 'battery',
-    0x2e: 'management controller firmware', 0x35: 'real-time clock', 0x40: 'air inlet', 0x41: 'processor',
-    0x42: 'baseboard',
+    0x01: 'other', 0x02: 'unknown', 0x03: 'processor', 0x04: 'disk or disk bay', 0x05: 'peripheral bay',
+    0x06: 'system management module', 0x07: 'system board', 0x08: 'memory module', 0x09: 'processor module',
+    0x0a: 'power supply', 0x0b: 'add-in card', 0x0c: 'front panel board', 0x0d: 'back panel board',
+    0x0e: 'power system board', 0x0f: 'drive backplane', 0x10: 'system internal expansion board',
+    0x11: 'other system board', 0x12: 'processor board', 0x13: 'power unit', 0x14: 'power module',
+    0x15: 'power management', 0x16: 'chassis back panel board', 0x17: 'system chassis', 0x18: 'sub-chassis',
+    0x19: 'other chassis board', 0x1a: 'disk drive bay', 0x1b: 'peripheral bay', 0x1c: 'device bay',
+    0x1d: 'fan', 0x1e: 'cooling unit', 0x1f: 'cable or interconnect', 0x20: 'memory device',
+    0x21: 'system management software', 0x22: 'system firmware', 0x23: 'operating system', 0x24: 'system bus',
+    0x25: 'group', 0x26: 'remote management device', 0x27: 'external environment', 0x28: 'battery',
+    0x29: 'processing blade', 0x2a: 'connectivity switch', 0x2b: 'processor and memory module',
+    0x2c: 'I/O module', 0x2d: 'processor and I/O module', 0x2e: 'management controller firmware',
+    0x2f: 'IPMI channel', 0x30: 'PCI bus', 0x31: 'PCI Express bus', 0x32: 'SCSI bus', 0x33: 'SATA/SAS bus',
+    0x34: 'processor front-side bus', 0x35: 'real-time clock', 0x37: 'air inlet', 0x40: 'air inlet',
+    0x41: 'processor', 0x42: 'baseboard',
 };
 
 /** IANA enterprise numbers of the makers whose BMCs are common. */
@@ -171,6 +182,13 @@ export interface PetEvent {
     /** The BMC's clock, as it states it; null when unspecified. */
     time: { at: string; basis: 'pet' | 'unix'; utcOffsetMin: number | null } | null;
     maker: { id: number; name: string | null };
+    /**
+     * The BMC's own words, when it sends them beside the PET bytes - a text
+     * varbind under the PET enterprise, as a Supermicro BMC does
+     * ("[PWR-0020] First AC Power on"). For an OEM sensor type it is the only
+     * description there is; null when the trap carries none.
+     */
+    text: string | null;
 }
 
 function specificOf(pdu: TrapPduLike): number | null {
@@ -209,6 +227,15 @@ export function decodePet(pdu: TrapPduLike, nowMs: number = Date.now()): PetEven
             basis: future ? 'unix' : 'pet', utcOffsetMin,
         };
     }
+    // The BMC's text, if any: a printable string (or bytes) on another varbind
+    // under the PET enterprise.
+    let text: string | null = null;
+    for (const v of pdu.varbinds ?? []) {
+        if (v.oid === PET_DATA_OID || !String(v.oid).startsWith(`${PET_ENTERPRISE}.`)) continue;
+        const s = Buffer.isBuffer(v.value) ? v.value.toString('utf8') : typeof v.value === 'string' ? v.value : '';
+        const t = s.replace(/\s+/g, ' ').trim();
+        if (t !== '' && /^[\x20-\x7e]+$/.test(t)) { text = t.slice(0, 200); break; }
+    }
     const be = b.readUInt32BE(40);
     const le = b.readUInt32LE(40);
     const makerId = MAKERS[be] === undefined && MAKERS[le] !== undefined ? le : be;
@@ -227,6 +254,7 @@ export function decodePet(pdu: TrapPduLike, nowMs: number = Date.now()): PetEven
         sequence: b.readUInt16BE(16),
         time,
         maker: { id: makerId, name: MAKERS[makerId] ?? null },
+        text,
     };
 }
 
@@ -270,11 +298,18 @@ export function petText(e: PetEvent): string {
     const type = e.sensorType === null ? 'platform event'
         : SENSOR_TYPES[e.sensorType] ?? `${e.sensorType >= 0xc0 ? 'OEM ' : ''}sensor type ${hex2(e.sensorType)}`;
     const parts: string[] = [];
-    let head = `IPMI ${type}: ${eventWords(e)}`;
+    // An OEM sensor type means nothing to anyone but its maker, so the
+    // BMC's own words lead when it sent them, and the codes follow.
+    const oem = e.sensorType !== null && e.sensorType >= 0xc0 && SENSOR_TYPES[e.sensorType] === undefined;
+    let head = oem && e.text !== null ? `IPMI: ${e.text}` : `IPMI ${type}: ${eventWords(e)}`;
     if (e.asserted !== null) head += e.asserted ? ', asserted' : ', deasserted';
     const sev = severityOf(e.severity);
     if (sev !== null) head += ` - severity ${sev[0]}`;
     parts.push(head);
+    if (oem && e.text !== null) parts.push(`${type} ${eventWords(e)}`);
+    // A standard event keeps its decoded meaning first, and the BMC's words
+    // after it: they name the sensor ("CPU_FAN1"), which the bytes cannot.
+    else if (e.text !== null) parts.push(`"${e.text}"`);
 
     const where: string[] = [];
     if (e.sensorNumber !== 0x00 && e.sensorNumber !== 0xff) where.push(`sensor ${hex2(e.sensorNumber)}`);

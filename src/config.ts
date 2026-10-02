@@ -24,6 +24,25 @@ const str = (name: string, dflt: string): string => {
 // the pool (C6): an explicit POLL_DOWN_CONCURRENCY wins, an absent one means
 // half the pool, and either is checked against the pool once, here.
 const pollConcurrency = num('POLL_CONCURRENCY', 24);
+
+// Checked once, here, so a typo stops the service at start with its name
+// rather than as a queue that sheds at 5 or never at all.
+const ingestQueueMax = num('INGEST_QUEUE_MAX', 50_000);
+const eventAlertHostsMax = num('EVENT_ALERT_HOSTS_MAX', 20);
+if (!Number.isInteger(eventAlertHostsMax) || eventAlertHostsMax < 1 || eventAlertHostsMax > 10_000) {
+    throw new Error(`EVENT_ALERT_HOSTS_MAX must be a whole number from 1 to 10000, got ${eventAlertHostsMax}`);
+}
+if (!Number.isInteger(ingestQueueMax) || ingestQueueMax < 1_000 || ingestQueueMax > 10_000_000) {
+    throw new Error(`INGEST_QUEUE_MAX must be a whole number from 1000 to 10000000, got ${ingestQueueMax}`);
+}
+// ALERT_SMTP_MODE, FAILING CLOSED (2026-10-01, review F20). notify.ts derived
+// secure, requireTLS and ignoreTLS by exact match, so `STARTTLS`, `ssl` or a
+// typo made all three false - nodemailer's OPPORTUNISTIC STARTTLS, which
+// anyone on the path can strip to read the SMTP password. Case and spaces are
+// forgiven; anything else is starttls (upgrade or fail) and says so at boot.
+const SMTP_MODES = ['tls', 'starttls', 'none'] as const;
+const smtpModeRaw = str('ALERT_SMTP_MODE', 'starttls').trim().toLowerCase();
+const smtpModeKnown = (SMTP_MODES as readonly string[]).includes(smtpModeRaw);
 const pollDownExplicit = process.env.POLL_DOWN_CONCURRENCY === undefined
     || process.env.POLL_DOWN_CONCURRENCY === ''
     ? null : num('POLL_DOWN_CONCURRENCY', 0);
@@ -98,6 +117,14 @@ export const CONFIG = {
     syslogPort: num('SYSLOG_PORT', 5514),
     trapPort: num('TRAP_PORT', 5162),
     bindAddress: str('BIND_ADDRESS', '0.0.0.0'),
+    // WHETHER IT WAS SET, which the web port needs (2026-10-01, review F9).
+    // BIND_ADDRESS bound the syslog socket only, while the README called it
+    // the web port's bind address too - so BIND_ADDRESS=127.0.0.1 behind a
+    // proxy still exposed the UI on every interface. It now binds all three.
+    // But the web port's default must stay listen() with no host, which is
+    // :: dual stack; passing the 0.0.0.0 default would quietly make every
+    // install IPv4-only.
+    bindAddressSet: (process.env.BIND_ADDRESS ?? '') !== '',
 
     // Requested socket receive buffer. The kernel returns DOUBLE this from
     // getsockopt, reserving half for bookkeeping, so the ingest worker reports
@@ -472,6 +499,11 @@ export const CONFIG = {
      * previous renotify).
      */
     alertRenotifyH: num('ALERT_RENOTIFY_H', 0),
+    // THE SENDING BUDGET PER CHANNEL (review F19, the operator's numbers):
+    // up to ALERT_NOTIFY_BURST messages at once, then ALERT_NOTIFY_PER_MINUTE;
+    // past it, alerts wait and go out as one message a minute. Never dropped.
+    alertNotifyBurst: Math.max(1, Math.floor(num('ALERT_NOTIFY_BURST', 60))),
+    alertNotifyPerMinute: Math.max(1, num('ALERT_NOTIFY_PER_MINUTE', 60)),
     /**
      * Bearer token for GET /metrics (easy-win E2). Empty - the default -
      * means the endpoint does not exist: metrics are DETAIL, the
@@ -521,7 +553,9 @@ export const CONFIG = {
      * whole reason this is a mode rather than a boolean. 'tls' is implicit
      * TLS from byte one (port 465). 'none' is a dumb LAN relay and says so.
      */
-    alertSmtpMode: str('ALERT_SMTP_MODE', 'starttls'),
+    alertSmtpMode: (smtpModeKnown ? smtpModeRaw : 'starttls') as (typeof SMTP_MODES)[number],
+    /** The value ALERT_SMTP_MODE was set to when it was none of the three, for the boot warning. */
+    alertSmtpModeUnknown: smtpModeKnown ? null : (process.env.ALERT_SMTP_MODE ?? null),
     alertSmtpUser: str('ALERT_SMTP_USER', ''),
     /**
      * ARCHITECTURE section 4: secrets come from the environment or a column
@@ -564,6 +598,32 @@ export const CONFIG = {
      * PAIRED WITH shutdownWaitMarginMs: main waits this PLUS that margin.
      */
     ingestDrainDeadlineMs: num('INGEST_DRAIN_DEADLINE_MS', 15_000),
+
+    /**
+     * How many syslog and trap messages may wait in memory for the database
+     * (INGEST_QUEUE_MAX, 2026-09-30). A CEILING, NOT AN ALLOCATION: the queue
+     * is flushed every 300 ms and normally holds a few hundred; it fills only
+     * while messages arrive faster than the database writes them, or while
+     * the database is down, and the memory returns as it drains. Past it the
+     * oldest are dropped, in batches, and counted.
+     *
+     * Measured per queued message (INSTALL.md section 3 has the table): about
+     * 530 B for a short line, 770 B for a typical firewall line, 1,650 B for a
+     * 600-character one - so the default 50,000 is 26-82 MB at the worst
+     * moment, and 150,000, enough to hold five seconds at 20,000 a second
+     * above the write ceiling, 79-247 MB. Raising it helps bursts and
+     * outages; a flood that never slows still sheds, only later.
+     */
+    ingestQueueMax,
+
+    /**
+     * How many open per-host alerts one syslog or trap rule may hold
+     * (EVENT_ALERT_HOSTS_MAX, 2026-10-01). Past it, new hosts fold into one
+     * "<rule>: more than N hosts" alert, because a message's host is whatever
+     * its sender claims and a forged name per message would otherwise open
+     * an alert, and owe a notification, per name (OPS.upsertEventAlerts).
+     */
+    eventAlertHostsMax,
 
     /**
      * How long the collector keeps waiting on shutdown for in-flight polls to

@@ -23,12 +23,13 @@ and the instruments that produced every number are in `tools/`.
 - **A daily fault window** (`tools/soak-fault.sh`): a slice of the fleet
   taken away for ten minutes each night, so alerting and recovery are
   exercised every day of a run rather than assumed.
-- **The offline suite** (`npm test`): forty-five test files and sixteen
+- **The offline suite** (`npm test`): fifty-six test files and sixteen
   static checkers that hold invariants the reviews kept finding one instance
   at a time - every query on a declared lane, no DOM injection sinks, no
   duplicate SQL definitions, every worker message type with a sender, and
-  so on. Where a test needs a database it says so and refuses any database
-  whose name does not say scratch.
+  so on. Where a test needs a database it says so, and the destructive ones
+  refuse any database but `rscanvas_test` (or one named in
+  `DESTRUCTIVE_TEST_DB`) unless `ALLOW_FIXTURE_DROPS=1`.
 
 ## The campaigns
 
@@ -100,6 +101,12 @@ fix, on the Ryzen box above unless it says otherwise.
 | the pages at 30k | everything answered promptly but two. The Alerts refresh took 850 ms, 730 of them PostgreSQL compiling a 24 ms query to machine code (JIT); with JIT off for short queries, 60 ms. Switching the Dashboard's window took 1.6 s for a day and 2.9 s for a week; kept until the hourly rollup moves and warmed in the background, a few milliseconds |
 | the page thread's pauses | a CPU profile of the main thread, taken through the inspector without a restart, put every pause of 40-90 ms on an open tab's 10-second refresh: 52 and 58 ms of that thread's CPU to build the alert list and the roster, 1.4 MB each, fetched whatever the tab showed. Fetched now only where shown, and gzipped to 60 and 77 KB: ten minutes with a tab open on System, no pause over 50 ms, against about twenty in fifteen minutes before |
 | the poll cadence | 31.01 s between polls of a 30-second device, over 1,973 polls on the operator's network; each poll counted from when the last one finished. On a fixed schedule: 30.009 s on a 41-device box, and 30.005 s across 1,472 devices at 30k (30.574 before) |
+| retention's first drops at 30k, 2026-10-01 | samples_20260924 (about 38 million rows) dropped in 0.74 s on the hourly run; the collector's 30-second write bursts before, during and after it the same size (about 22,500 rows), no write failures, the threads inside their limits. The messages partition the same hour was SKIPPED - the two retention jobs fired in the same instant and the second lost the advisory lock, reporting success (fixed: they queue, 9980065). Redeployed with the fix under 1,000 syslog datagrams a second off-box: messages_20260924 (about 55 million rows) dropped in 2.7 s, ingest held 983-1,016 a second through it, every datagram from the socket's bind on written (159,180 of 159,180), flush max 98 ms, kernel drops 0 |
+| the collector at 30k, a week | single pauses of 150 to 320 ms every day or two (426 ms once), a handful of ticks among millions, the other threads undisturbed and nothing logged. Under the health report's 500 ms acute limit; accepted as measured (2026-10-01), to be reopened if longer runs say otherwise |
+| the alert scan at 30k, six days | about 109,000 scans of 102,903 conditions every five seconds across 25 process runs, no failures but nine during a lab deployment that missed a schema slice; typical scan 0.42 s, slowest sample 1.2 s |
+| an interface that disappears | a tracked interface deleted from a Linux host is marked stale on the first poll that no longer sees it, and when it returns at a new index it is followed by name to the same record, history kept, the stale mark cleared. On Linux net-snmp a removed interface reads down, not gone, until snmpd restarts |
+| a board after retagging | a board generated from a location reports one missing and one moved away when devices change location, and its add and drop actions bring it back to none of either |
+| the database itself | on a disposable database with the full schema: retention picks the same UTC days from sessions in UTC+14 and UTC-11, the rollup writes whole hours and the Dashboard weights them by readings (150, not the 250 of a mean of means), event alerts fold, keep their severity and are born again after clearing, and every installed function is its newest definition (`tools/test-scratch-db.ts`, `tools/test-apply-convergence.ts`) |
 | interface tracking | on the operator's network 232 untracked interfaces were sampled every poll beside 104 tracked ones, and five tracked Wi-Fi and tunnel interfaces had never been read. After the fix, no untracked rows, and the five started recording |
 
 ## What was not tested

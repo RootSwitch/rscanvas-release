@@ -146,5 +146,37 @@ console.log('\nwithout the v1 header (v2c, or a relay that dropped it):');
     eq('and direction is not claimed', (bare === null ? '' : petText(bare)).includes('asserted'), false);
 }
 
+console.log('\nthe BMC\'s own words (a Supermicro power cycle, 2026-09-30; system GUID zeroed):');
+{
+    const TEXT_OID = `${PET_ENTERPRISE}.4`;
+    // OEM sensor type 0xc8, sensor-specific, offset 0, on entity 0x18.
+    const oem = {
+        enterprise: PET_ENTERPRISE, generic: 6, specific: 0xc86f00, agentAddr: '192.0.2.31',
+        varbinds: [
+            { oid: DATA_OID, value: petBuf({ severity: 0x08, sensor: 0xff, entity: 0x18 }) },
+            { oid: TEXT_OID, value: '[PWR-0020] First AC Power on' },
+        ],
+    };
+    const e = decodePet(oem, NOW);
+    eq('the text varbind is read', e?.text, '[PWR-0020] First AC Power on');
+    has('an OEM event leads with it', e === null ? '' : petText(e), 'IPMI: [PWR-0020] First AC Power on, asserted - severity non-critical');
+    has('then the codes it stands for', e === null ? '' : petText(e), 'OEM sensor type 0xc8 offset 0');
+    has('on a sub-chassis, which the table now names', e === null ? '' : petText(e), 'on sub-chassis');
+    // A standard fan event keeps its decoded meaning first; the text adds the sensor's name.
+    const fan = { ...v1(specific(0x04, 0x01, 0x02), petBuf()), varbinds: [
+        { oid: DATA_OID, value: petBuf() },
+        { oid: TEXT_OID, value: Buffer.from('[IPMI-2002] CPU_FAN1, Lower Critical - going low') },
+    ] };
+    const f = decodePet(fan, NOW);
+    has('a standard event keeps its meaning first', f === null ? '' : petText(f), 'IPMI Fan: Lower Critical going low, asserted');
+    has('and quotes the BMC, sent as bytes, for the name', f === null ? '' : petText(f), '"[IPMI-2002] CPU_FAN1, Lower Critical - going low"');
+    const none = decodePet(v1(specific(0x04, 0x01, 0x02), petBuf()), NOW);
+    eq('no text varbind, no text', none?.text, null);
+    const junk = decodePet({ ...v1(specific(0x04, 0x01, 0x02), petBuf()), varbinds: [
+        { oid: DATA_OID, value: petBuf() }, { oid: TEXT_OID, value: Buffer.from([0x00, 0x01, 0xff]) },
+    ] }, NOW);
+    eq('binary in the text slot is not text', junk?.text, null);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
 if (fail === 0) process.exitCode = 0;

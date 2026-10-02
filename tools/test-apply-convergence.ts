@@ -13,9 +13,9 @@
 // files; only an APPLY followed by a read-back can see what a full series
 // actually converges to.
 //
-// PROVISIONAL - NEVER RUN. Written on a box with no Postgres (2026-09-01);
-// the first run belongs on lab-test against a scratch database, the same
-// posture test-page-budgets shipped with and recorded in its own header.
+// Written on a box with no Postgres (2026-09-01) and first run on
+// 2026-10-01, on rs-test-2 against a fresh rscanvas_test: 6 of 6
+// (RESULTS-2026-10-01-DRILLS).
 // The apply order is DUPLICATED from apply-schema.ts's globs because that
 // file executes its main() at import - the duplication is a recorded
 // hazard, and the assertions below are the hedge: if the orders ever

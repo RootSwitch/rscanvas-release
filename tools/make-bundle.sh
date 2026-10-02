@@ -194,7 +194,11 @@ FILES=("${PAYLOAD[@]}" BUNDLE-MANIFEST.txt)
 # drill found the cold-backup procedure reporting success while tar printed
 # warnings, because tar's exit rode into a pipe and the compressor's 0 was
 # the one the shell saw. Same shape here, same fix.
+# Owned by root in the archive (review L13): extracted as root it was the
+# builder's uid - 197121, User - until the installer's chown, and the
+# installer now makes the tree root's anyway (F6).
 tar -czf "$TAR" \
+    --owner=0 --group=0 --numeric-owner \
     --exclude='node_modules/.cache' \
     --exclude='*.log' \
     --exclude='__pycache__' \
@@ -234,12 +238,13 @@ SQLN=$(grep -c '^sql/.*\.sql$' <<< "$LIST")
 # a different hat.
 LOCALN=$(ls sql/*.sql | wc -l | tr -d ' ')
 [ "$SQLN" = "$LOCALN" ] || { echo "  SQL MISMATCH: ${SQLN} in bundle, ${LOCALN} in tree"; MISSING=1; }
-# The two scripts INSTALL.md runs as ./name must arrive executable. Until
+# The two scripts INSTALL.md runs as ./name must arrive executable, and the
+# hardening script with them (review F13a: stored 100644, it was skipped). Until
 # 2026-09-27 git stored the installer 100644: bundles built on Windows came
 # out right only because Git Bash marks any file opening with #! executable,
 # and one built from a Linux clone of the public repository would have
 # answered the first install command with "command not found".
-for want in rscanvas-setup.sh rscanvas-backup.sh; do
+for want in rscanvas-setup.sh rscanvas-backup.sh tools/harden-roles.sh; do
     perm="$(tar -tvzf "$TAR" "$want" 2>/dev/null || true)"
     [[ "$perm" == -rwx* ]] || { echo "  NOT EXECUTABLE: $want"; MISSING=1; }
 done

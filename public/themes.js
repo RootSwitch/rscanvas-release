@@ -249,7 +249,10 @@
     // in turn, so the next person to open the app in that browser inherited
     // whatever the wall happened to be showing.
     function applyTheme(name, { persist = true } = {}) {
-        const theme = THEMES[name] || THEMES.classic;
+        // Own keys only: `constructor` or `__proto__` - from ?theme= or a
+        // stored value - found Object's members, and Object.entries of their
+        // undefined `vars` threw before the wall began polling (review L5).
+        const theme = Object.hasOwn(THEMES, name) ? THEMES[name] : THEMES.classic;
         const root = document.documentElement.style;
         for (const v of THEME_VARS) root.removeProperty(v);
         for (const [k, val] of Object.entries(theme.vars)) root.setProperty(k, val);

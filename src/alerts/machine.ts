@@ -20,7 +20,7 @@
 // independent of wall-clock jitter - and makes it testable without sleeping.
 
 import { LOWER_IS_BAD, type Condition, type Severity } from './rules.ts';
-import { insideClearBand } from './hysteresis.ts';
+import { insideClearBand, clearBandThreshold } from './hysteresis.ts';
 
 export type AlertState = 'pending' | 'active' | 'clearing' | 'cleared';
 export type AlertEventType = 'raise' | 'escalate' | 'clear';
@@ -238,10 +238,12 @@ export function step(
     //
     // The band is judged against the threshold ON THE ROW, which is the one
     // the incident actually crossed (sticky through a crit, per the rule
-    // above), not the level the current reading happens to sit under.
+    // above) - unless the rule has since been LOOSENED past it, when the
+    // line that applies now is the one (clearBandThreshold says why: a
+    // stored line alone wedged such an alert open for good).
     // A reading inside the band still updates the displayed value, so an
     // operator watching it fall sees it fall.
-    if (insideClearBand(c.kind, c.value, row.threshold)) {
+    if (insideClearBand(c.kind, c.value, clearBandThreshold(c.kind, row.threshold, c.threshold))) {
         return {
             action: 'update',
             row: { ...row, value: c.value ?? row.value, missingCount: 0, lastSeenTs: now },

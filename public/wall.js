@@ -27,7 +27,14 @@ const $ = (id) => document.getElementById(id);
 // it comes back to a permission error nobody is there to fix. A wall that
 // cannot survive a power cut is not a wall. The mitigation for the leak stays
 // where it was designed to be: narrow scope, and revocation that works.
-const TOKEN = new URLSearchParams(location.search).get('token') ?? '';
+//
+// THE FRAGMENT FIRST (2026-10-01, review L6). `#token=` is never sent to the
+// server at all - not in the request for this page, so not in a proxy's
+// access log - and it survives a reboot exactly as the query form does: a
+// display reloads its whole URL, fragment included. Minted links use it now;
+// the query form is still read, so a display pointed at one keeps working.
+const TOKEN = new URLSearchParams(location.hash.slice(1)).get('token')
+    ?? new URLSearchParams(location.search).get('token') ?? '';
 /**
  * The signed-in way in (slice 45): ?board=<id> and no token, authorised by
  * the session cookie the operator already has.
@@ -103,7 +110,7 @@ function startTheming() {
     // Nothing to rotate: the one ?theme=, else this browser's own choice -
     // which also puts the palette back when the panel turns rotation off.
     if (ring.length === 0) {
-        showTheme(single !== null && themes[single] ? single : window.Themes.currentTheme());
+        showTheme(single !== null && Object.hasOwn(themes, single) ? single : window.Themes.currentTheme());
         return;
     }
     let i = 0;
@@ -1226,7 +1233,7 @@ function updateAge() {
 
 async function poll() {
     if (TOKEN === '' && BOARD === '') {
-        message('this URL names no board - a display needs ?token=... from the board it shows, '
+        message('this URL names no board - a display needs #token=... from the board it shows, '
             + 'or ?board=<id> if you are signed in');
         return;
     }

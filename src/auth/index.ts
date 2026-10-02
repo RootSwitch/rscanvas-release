@@ -355,12 +355,74 @@ export function tokenFromRequest(req: http.IncomingMessage): string | null {
     return parseCookies(req)[COOKIE_NAME] ?? null;
 }
 
-// --- login rate limiting (in-memory, per source IP) ---------------------------
+// --- login rate limiting (in-memory, per source address AND per account) ------
+//
+// THREE HOLES, CLOSED 2026-10-01 (review F8, and the operator's ruling that
+// accounts lock too):
+//
+//  * THE RACE. The address was checked once, then the handler awaited the
+//    body, the user lookup and scrypt before counting a failure - so a burst
+//    of concurrent attempts all passed the check, and hundreds reached scrypt
+//    where five were meant to. An attempt now RESERVES its slot before the
+//    first await (beginLoginAttempt), and the check counts attempts in
+//    flight as well as failures.
+//  * THE RESET. A successful sign-in cleared its address's count, so anyone
+//    with one valid account could guess four times at another, sign in, and
+//    guess four more. A success now clears only its own account; an
+//    address's count lapses after FAILURE_WINDOW_MS without failures.
+//  * THE ACCOUNT. Counting only by address left an account open to guesses
+//    from many addresses. Each username is counted too, whether or not it
+//    exists (so a lockout says nothing about which names are real), and its
+//    lockouts double, 1 minute to LOCKOUT_MAX_MS. An attacker can therefore
+//    keep an account locked; the operator's position is that this is handled
+//    outside the application (a firewall, a proxy), and a locked account
+//    loses nothing it had.
+//
+// Changing one's own password checks the current one through the same
+// limiter - it was unlimited, so a stolen session could brute-force it.
 
-interface Failure { count: number; lockedUntil: number }
+interface Failure {
+    count: number;
+    lockedUntil: number;
+    /** When the current count began; it lapses after FAILURE_WINDOW_MS. */
+    since: number;
+    /** Lockouts so far, for the doubling; forgotten after a quiet day. */
+    lockouts: number;
+    /** Attempts admitted and not yet finished - the race's half of the check. */
+    inFlight: number;
+}
 const failures = new Map<string, Failure>();
 const MAX_FAILURES = 5;
 const LOCKOUT_MS = 60 * 1000;
+const LOCKOUT_MAX_MS = 15 * 60 * 1000;
+const FAILURE_WINDOW_MS = 15 * 60 * 1000;
+const LOCKOUTS_FORGOTTEN_MS = 24 * 3600 * 1000;
+
+/** How long the nth lockout lasts: 1, 2, 4, 8 minutes, then 15. */
+export function lockoutMs(nth: number): number {
+    return Math.min(LOCKOUT_MS * 2 ** Math.max(0, nth - 1), LOCKOUT_MAX_MS);
+}
+
+/**
+ * The limiter's key for a client address. IPv6 by its /64: one host is
+ * routinely given a whole /64, so per-address keying handed an IPv6 attacker
+ * eighteen quintillion fresh buckets.
+ */
+export function addressKey(ip: string): string {
+    const v4mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+    if (v4mapped) return `ip:${v4mapped[1]}`;
+    if (!ip.includes(':')) return `ip:${ip}`;
+    const [head = '', tail] = ip.split('::');
+    const h = head === '' ? [] : head.split(':');
+    const t = tail === undefined || tail === '' ? [] : tail.split(':');
+    const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+    return `ip6:${groups.slice(0, 4).map((g) => g.toLowerCase().replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
+/** The limiter's key for an account: the name as typed, case folded, bounded. */
+export function accountKey(username: string): string {
+    return `user:${username.trim().toLowerCase().slice(0, 128)}`;
+}
 /**
  * A HARD cap, and the word is load bearing.
  *
@@ -385,11 +447,59 @@ const LOCKOUT_MS = 60 * 1000;
  */
 const MAX_TRACKED_IPS = 10_000;
 
-export function loginAllowed(ip: string): boolean {
-    const f = failures.get(ip);
+/** The entry for a key, with whatever has lapsed brought up to now. */
+function current(key: string, now: number): Failure | undefined {
+    const f = failures.get(key);
+    if (!f) return undefined;
+    if (f.lockedUntil && f.lockedUntil <= now) f.lockedUntil = 0;
+    if (!f.lockedUntil && f.count > 0 && now - f.since > FAILURE_WINDOW_MS) f.count = 0;
+    if (!f.lockedUntil && f.lockouts > 0 && now - f.since > LOCKOUTS_FORGOTTEN_MS) f.lockouts = 0;
+    if (!f.lockedUntil && f.count === 0 && f.lockouts === 0 && f.inFlight === 0) { failures.delete(key); return undefined; }
+    return f;
+}
+
+/** May an attempt under this key go ahead now? Failures and attempts in
+ *  flight both count, so concurrent attempts cannot all pass together. */
+export function loginAllowed(key: string): boolean {
+    const f = current(key, Date.now());
     if (!f) return true;
-    if (f.lockedUntil && f.lockedUntil <= Date.now()) { failures.delete(ip); return true; }
-    return !f.lockedUntil;
+    return !f.lockedUntil && f.count + f.inFlight < MAX_FAILURES;
+}
+
+/** One sign-in attempt's reservation, held from before the first await. */
+export interface LoginAttempt { keys: string[] }
+
+/**
+ * Reserve an attempt against every key it counts under - the address and the
+ * account - or refuse it. Synchronous on purpose: nothing can interleave
+ * between the check and the reservation. Every admitted attempt must be
+ * finished with endLoginAttempt, success or not.
+ */
+export function beginLoginAttempt(ip: string, username: string): LoginAttempt | null {
+    const keys = [addressKey(ip), accountKey(username)];
+    if (!keys.every(loginAllowed)) return null;
+    const now = Date.now();
+    for (const k of keys) {
+        const f = current(k, now) ?? { count: 0, lockedUntil: 0, since: now, lockouts: 0, inFlight: 0 };
+        f.inFlight++;
+        failures.set(k, f);
+    }
+    return { keys };
+}
+
+/** Finish an attempt: a failure counts under every key; a success clears the
+ *  account only - never the address (see the header: THE RESET). */
+export function endLoginAttempt(attempt: LoginAttempt, succeeded: boolean): void {
+    for (const k of attempt.keys) {
+        const f = failures.get(k);
+        if (f) f.inFlight = Math.max(0, f.inFlight - 1);
+    }
+    if (succeeded) {
+        const account = attempt.keys.find((k) => k.startsWith('user:'));
+        if (account) failures.delete(account);
+        return;
+    }
+    for (const k of attempt.keys) recordLoginFailure(k);
 }
 
 export function recordLoginFailure(ip: string): void {
@@ -400,9 +510,16 @@ export function recordLoginFailure(ip: string): void {
     // zero, meaning THE ATTACKER FILLING THE MAP NEVER LOCKED OUT AT ALL. A
     // memory bound that switches off the protection is worse than no bound.
     // Caught by the control asserting the newest offender stays locked.
-    const f = failures.get(ip) ?? { count: 0, lockedUntil: 0 };
+    const now = Date.now();
+    const f = current(ip, now) ?? { count: 0, lockedUntil: 0, since: now, lockouts: 0, inFlight: 0 };
+    if (f.count === 0) f.since = now;
     f.count++;
-    if (f.count >= MAX_FAILURES) { f.count = 0; f.lockedUntil = Date.now() + LOCKOUT_MS; }
+    if (f.count >= MAX_FAILURES) {
+        f.count = 0;
+        f.lockouts++;
+        f.lockedUntil = now + lockoutMs(f.lockouts);
+        f.since = now;
+    }
 
     // Keyed by client IP, so the map is attacker-growable. Two passes, and
     // the second is what makes MAX_TRACKED_IPS true rather than aspirational.
@@ -410,7 +527,7 @@ export function recordLoginFailure(ip: string): void {
         const now = Date.now();
         // 1. The free ones: expired lockouts and counts that never locked.
         for (const [k, v] of failures) {
-            if (k !== ip && (!v.lockedUntil || v.lockedUntil <= now)) failures.delete(k);
+            if (k !== ip && v.inFlight === 0 && (!v.lockedUntil || v.lockedUntil <= now)) failures.delete(k);
         }
         // 2. Still full, so evict LIVE lockouts, oldest first. Insertion
         //    order means the oldest is nearest to expiring, so the attacker

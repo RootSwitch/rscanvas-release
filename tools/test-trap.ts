@@ -4,7 +4,12 @@
 //
 //   node tools/test-trap.ts
 
-import { renderTrap, deviceForAddress, hostForMessage, v1TrapOid, renderValue } from '../src/syslog/trap.ts';
+import dgram from 'node:dgram';
+import {
+    renderTrap, deviceForAddress, hostForMessage, v1TrapOid, renderValue,
+    keptVarbinds, TRAP_VALUE_CHARS, TRAP_VARBINDS_MAX,
+} from '../src/syslog/trap.ts';
+import { snmpVersion, guardTrapReceiver, logSafe } from '../src/syslog/trap-guard.ts';
 import { parse } from '../src/syslog/parse.ts';
 import { explainCommunityTimeout } from '../src/credentials/v3.ts';
 
@@ -106,6 +111,80 @@ console.log('\nrenderValue and the v2c timeout hint:');
     const h = explainCommunityTimeout();
     eq('the v2c timeout hint names the community and the ping test',
         h.includes('community') && h.includes('ping'), true);
+}
+
+console.log('\nthe size of a trap is bounded like a syslog line (review F15):');
+{
+    const long = renderValue(Buffer.from('x'.repeat(5000)));
+    eq('a long value keeps its first characters and says how many it lost',
+        long, `${'x'.repeat(TRAP_VALUE_CHARS)}...(+${5000 - TRAP_VALUE_CHARS} chars)`);
+    const many = { varbinds: Array.from({ length: TRAP_VARBINDS_MAX + 8 }, (_, i) => ({ oid: `1.3.6.1.4.1.1.${i}`, value: i })) };
+    const t = renderTrap(many);
+    eq('only the first varbinds are listed', t.includes(`1.3.6.1.4.1.1.${TRAP_VARBINDS_MAX - 1}=`) && !t.includes(`1.3.6.1.4.1.1.${TRAP_VARBINDS_MAX}=`), true);
+    has('and the line says how many it left out', t, '(+8 more varbinds)');
+    eq('keptVarbinds agrees', keptVarbinds(many.varbinds).more, 8);
+}
+
+console.log('\nthe SNMP version is read from the first bytes:');
+// The review's two Inform packets (REVIEW-2026-09-30 F1): v2c, community
+// "anything", an InformRequest whose third varbind is a BIT STRING / an
+// INTEGER of 2^32. Both decode, and both threw when net-snmp re-encoded them
+// as the acknowledgement.
+const INFORM_BITSTRING = Buffer.from('30500201010408616e797468696e67a6410201010201000201003036300d06082b0601020101030043'
+    + '01003016060a2b06010603010104010006082b06010401010001300d06072b060104010101030200ff', 'hex');
+const INFORM_INT2_32 = Buffer.from('30530201010408616e797468696e67a6440201010201000201003039300d06082b0601020101030043'
+    + '01003016060a2b06010603010104010006082b06010401010001301006072b06010401010102050100000000', 'hex');
+{
+    eq('a v2c message is version 1', snmpVersion(INFORM_BITSTRING), 1);
+    eq('a long-form length is stepped over', snmpVersion(Buffer.from('30820005020103', 'hex')), 3);
+    eq('a version-3 header reads 3', snmpVersion(Buffer.from('3005020103', 'hex')), 3);
+    eq('text is not SNMP', snmpVersion(Buffer.from('<14>hello there')), null);
+    eq('a truncated header is not SNMP', snmpVersion(Buffer.from('300502', 'hex')), null);
+    eq('an empty datagram is not SNMP', snmpVersion(Buffer.alloc(0)), null);
+    const s = logSafe('u2\r\n2026-10-01T00:00:00Z [ingest] forged');
+    eq('a CR LF in logged text cannot start a new line', s.includes('\n') || s.includes('\r'), false);
+}
+
+console.log('\none datagram cannot stop the receiver (review F1, F10) - loopback, the app\'s receiver options:');
+{
+    // Without the guard, either Inform below is an uncaught exception and this
+    // process exits before the verdict - the test fails by not finishing.
+    const snmp = await import('net-snmp');
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const delivered: string[] = [];
+    const drops: string[] = [];
+    const receiver = snmp.createReceiver(
+        { port, address: '127.0.0.1', disableAuthorization: true, includeAuthentication: true },
+        (error, n) => {
+            if (error) { drops.push(`error: ${error.message}`); return; }
+            const pdu = (n as { pdu: { type: number; varbinds?: Array<{ oid: string }> } }).pdu;
+            delivered.push(`${pdu.type}:${pdu.varbinds?.at(-1)?.oid ?? ''}`);
+        },
+    );
+    eq('the receiver is guarded', guardTrapReceiver(receiver, (why) => drops.push(why)), 1);
+    const sock = dgram.createSocket('udp4');
+    const send = (b: Buffer): Promise<void> => new Promise((ok) => sock.send(b, port, '127.0.0.1', () => ok()));
+    await new Promise((ok) => setTimeout(ok, 200));
+    await send(INFORM_BITSTRING);
+    await send(INFORM_INT2_32);
+    // A v3 noAuthNoPriv trap under an invented user name, which net-snmp
+    // delivered with authorization disabled, and a CR LF in the name.
+    const v3 = (snmp as unknown as {
+        createV3Session: (t: string, u: object, o: object) => { trap: (t: number, vb: unknown[], cb: (e: Error | null) => void) => void; close: () => void };
+    }).createV3Session('127.0.0.1', { name: 'anyone\r\nforged', level: 1 }, { trapPort: port, version: snmp.Version3 });
+    await new Promise<void>((ok) => v3.trap(2, [], () => ok()));
+    // And an ordinary v2c trap, which must still arrive.
+    const v2 = snmp.createSession('127.0.0.1', 'public', { trapPort: port, version: snmp.Version2c });
+    await new Promise<void>((ok) => v2.trap('1.3.6.1.6.3.1.1.5.3', [], () => ok()));
+    await new Promise((ok) => setTimeout(ok, 500));
+    v3.close(); v2.close(); sock.close(); receiver.close();
+
+    eq('both Informs are still recorded - only their acknowledgement failed',
+        delivered.filter((d) => d.startsWith('166:')).length, 2);
+    eq('and each failed acknowledgement is counted', drops.filter((d) => d === 'ack').length, 2);
+    eq('the v3 trap is refused before the library parses it', drops.filter((d) => d === 'v3').length, 1);
+    eq('so no error text carrying its user name is produced', drops.some((d) => d.includes('forged')), false);
+    eq('an ordinary v2c trap still arrives', delivered.filter((d) => d.startsWith('167:')).length, 1);
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

@@ -1,5 +1,262 @@
 # Changelog
 
+## 0.1.0-alpha.5 - 2026-10-01
+
+The fifth alpha, and a security release. An outside review of the fourth
+found three ways for one packet or one request to stop the service - an
+SNMP Inform to the trap port, a crafted answer from any polled device, a
+malformed web request - and a backup that could become root on the box
+that restored it, along with a list of smaller holes; all of them are
+fixed here, each with a test that fails without its fix. The service now
+runs in a systemd sandbox with code it cannot change. And the first
+retention drop on the 30,000-entity lab found that syslog would never have
+been expired at all.
+
+### Upgrading
+
+Unpack the bundle over the install and re-run the installer, as `INSTALL.md`
+section 4 describes. Take a backup first with `rscanvas-backup.sh`, and
+reload open browser tabs afterwards. There is no schema change; the
+installer replaces the retention function.
+
+- **The layout changes, and the installer makes the change.**
+  `/opt/rscanvas` becomes root's and the service can no longer write it;
+  exports move to `/var/lib/rscanvas/exports` (an `EXPORT_SPOOL_DIR` you set
+  yourself is kept), and any export files left in `/opt/rscanvas/data` are
+  removed - they were unreachable after a restart anyway. The service
+  account's home moves to `/var/lib/rscanvas`.
+- **The service runs in a sandbox.** If you added anything to the systemd
+  unit by hand, it is rewritten as before; check that a program you run
+  from the service, if any, still works with a read-only filesystem.
+- **`node` loses the port capability an earlier installer gave it.** The
+  unit grants it to the service alone. Anything else on the box that ran
+  node on a port below 1024 needs its own arrangement.
+- **`BIND_ADDRESS`, if you set it, now binds the web port and traps too**,
+  not only syslog.
+- **Event rules with two `.*` (or `.+`) in a row are refused** - at
+  creation, and an existing one when the rules load, which the log names.
+  Keep one wildcard, or split the rule in two.
+- **Accounts lock as well as addresses**: five failed sign-ins lock the
+  account for a minute, doubling to fifteen.
+- **More than 60 alerts at once on a channel** are sent together as one
+  message a minute rather than one each.
+- **Wall links minted from now on carry the token after `#`.** Displays
+  already pointed at a `?token=` link keep working.
+
+### Security
+
+From the 2026-09-30 review. Each fix lands with a regression test that fails
+without it.
+
+- **One UDP datagram to the trap port stopped the process.** An SNMP Inform
+  carrying a BIT STRING, or an INTEGER outside 32 bits, decoded fine and then
+  threw when the SNMP library re-encoded it as the acknowledgement - outside
+  its own error handling, so the ingest worker died and the service with it,
+  under any community string and from a spoofable source. The trap socket's
+  handler is now wrapped; such an Inform is still recorded and only its
+  acknowledgement is lost.
+- **One SNMP response from any polled v1 or v2c device stopped the
+  process.** A device answering a poll - or an onboarding probe - with a
+  Report PDU made the SNMP library read v3 security fields a v1/v2c message
+  does not have, outside its own error handling, and the collector died and
+  the service with it: the weakest device on the watch list could take the
+  monitor down. The polling session's socket is now guarded too; such an
+  answer is dropped and the poll fails with a reason. A failure not yet
+  known still settles its request, which the library would otherwise have
+  left waiting for ever. Present in net-snmp up to 3.29.1, the latest.
+- **One HTTP request stopped the process.** A `Host` header of `a b`, or a
+  request target of `//[`, both accepted by the HTTP parser, threw while the
+  request's URL was parsed, before any route's error handling. The URL is
+  parsed against a fixed base, and an unparseable target is a 400.
+- **SNMPv3 traps were accepted.** With authorization off - the receiver has
+  no v3 users - a noAuthNoPriv v3 trap under any user name was delivered,
+  and v3 discovery requests were answered. Version 3 is now refused from the
+  datagram's first bytes, before it is parsed, as the documentation already
+  said. Refused and failed traps are counted and logged at most once a
+  minute, with control characters removed: a user name with a line break in
+  it had forged a log line.
+- **A syslog line could switch off an event rule, or hold ingest for
+  seconds.** A rule over its 50 ms budget is disarmed until edited, and
+  `.*error` took 54 ms on an 8 KB line, so one line from anyone disarmed
+  it; `.*(error|fail).*(timeout|refused).*` took 22.7 s. A leading or
+  trailing `.*` - which never changes what a rule matches - is now dropped
+  before the rule is compiled, a regex tests at most the first 4,096
+  characters of a message, and a pattern with two unbounded wildcards in a
+  row (`a.*b.*c`, cubic in the line) is refused when it is created. The
+  measured lines now take under 10 ms.
+- **A syslog timestamp in year 0 stopped message storage.** It parsed, and
+  PostgreSQL refused it, so its 2,000-row batch failed, went back to the
+  head of the queue, and nothing was stored until the queue overflowed. A
+  message time outside years 1 to 9999 is now no message time, and a batch
+  PostgreSQL refuses on its content is written around the refused rows
+  rather than retried whole; those rows are counted (`rowsRefused`).
+- **One device's value could cost the whole fleet's samples, or stop the
+  rollup.** An `ifOperStatus` of 70000 failed the shared sample write for
+  every device; a sensor reading of `1e200` made the hourly rollup's average
+  overflow, which stopped the rollup and, with it, retention; an absurd
+  summary value failed a device's own poll write and showed an answering
+  device as down. Values a device reports are now bounded to what their
+  columns and the rollup hold before they are written, and statuses to
+  their RFC 2863 domains.
+- **A backup could give root to whoever could change it.** A manifest value
+  reached root's shell arithmetic on `--test`; the configuration archive was
+  extracted into `/etc` as root with whatever paths and owners it named; the
+  dump was restored, and its tables counted, as the PostgreSQL superuser;
+  and a restored environment file's values reached a `sed` program run as
+  root. Every manifest line must now have the shape the backup tool writes,
+  the configuration archive may hold only plain files under `rscanvas/` and
+  is extracted without its owners, the dump is restored and read as the
+  installer's `rscanvas_admin` role, the installer writes its environment
+  file with `awk` (values as data), and a database password that is not of
+  the shape the installer mints stops the installer.
+- **A host name could slip past the per-rule event alert cap.** A sender
+  naming itself `*|1`, `*|2`, ... made keys that each read as the overflow
+  row and opened an alert each. `|`, `*` and `%` in a host are escaped in
+  the key, the overflow is one exact key, and the matches waiting for the
+  database are bounded too.
+- **The service could rewrite scripts that root runs.** The service account
+  owned `/opt/rscanvas`, and root runs the installer and the backup tool
+  from there, so code execution inside the service - the part that parses
+  syslog, traps and SNMP answers from the network - could become root. The
+  code is now root's, the service writes only `/var/lib/rscanvas` (where
+  exports moved), and the systemd unit is a sandbox: no new privileges, a
+  read-only filesystem apart from that directory, private `/tmp` and
+  devices, kernel settings out of reach, and two capabilities. The port
+  capability is the service's, granted by the unit, instead of being set
+  on the system-wide `node`, where every local user's node programs had it
+  and a `nodejs` package upgrade silently took it away. Upgrading applies
+  all of it; `--check` reports it. Bundles are packed as root's.
+- **Nothing limited how many notifications went out.** Each rule caps its
+  own alerts, but an outage across many rules - or a flood a sender drives -
+  sent one message per alert per channel as fast as they arrived, and mail
+  providers throttle well below that. Each channel now sends up to 60 at
+  once and then one a second (`ALERT_NOTIFY_BURST`,
+  `ALERT_NOTIFY_PER_MINUTE`); anything past that waits and goes out as one
+  message a minute listing what is waiting. Nothing is dropped: a waiting
+  alert's notification stays owed exactly as an undelivered one does, and
+  the System page's notify line says how many are waiting.
+- **The application's database role could delete all history and rewrite
+  the audit trail.** The retention function's safety limits were arguments
+  its caller chose, so the role could ask it, with every limit zeroed, to
+  drop every partition; and it could update and delete audit rows. The
+  function now enforces its own limits - settings can make retention
+  stricter, never looser - the audit trail is append-only for the
+  application, and only RSCanvas's own roles may connect to its database.
+- **A page on another port or a sibling host could act as a signed-in
+  user.** The session cookie's `SameSite=Lax` keeps it off requests from
+  another site, but another port on the same box, or another host under the
+  same domain, is the same site. A request that changes anything is now
+  refused when the browser says it came from anywhere but this page
+  (`Sec-Fetch-Site`, or `Origin` from older browsers). Tools that send
+  neither, like curl, are unaffected.
+- **The sign-in limit could be raced, reset, and sidestepped.** Concurrent
+  attempts all passed the check before the first failure counted; a
+  successful sign-in cleared its address's count; and only addresses were
+  counted, so one account could be guessed at from many. Attempts are now
+  reserved before the password is checked, a success clears only its own
+  account, IPv6 addresses count by their /64, and each account is counted
+  too: five failures lock it for a minute, doubling to fifteen. Changing
+  your own password goes through the same limit; it had none.
+- **A display's token no longer travels to the server in its URL.** Links
+  minted for a wall now carry it after `#`, which the browser keeps to
+  itself, instead of `?token=`, which reached proxy logs; a display already
+  pointed at a `?token=` link keeps working.
+- **`BIND_ADDRESS` bound only the syslog socket.** The web port and the trap
+  receiver listened everywhere whatever it said. It now binds all three;
+  unset, the web port still listens on every address, IPv6 included.
+- **`X-Forwarded-For` was read from the wrong end.** With `TRUST_PROXY=1`
+  the client address was the header's first entry, which the client
+  chooses even through a proxy that appends; it is now the last, the one
+  the proxy wrote, and only when it is an address (junk had been a 500).
+- **An `ALERT_SMTP_MODE` typo meant strippable STARTTLS.** `STARTTLS` or
+  `ssl` turned off both TLS settings, leaving nodemailer's opportunistic
+  upgrade. Case is now ignored, and an unknown value is `starttls` - upgrade
+  or fail - with a warning at startup.
+- **Smaller:** a malformed `%` escape in a user route was a 500 with a
+  stack trace before any check (now 400); device removal read its body
+  before authorising (now after); `?theme=constructor` stopped a wall from
+  polling; a trap's text had no size limit (now cut like a syslog line);
+  and a bundle built from a Linux clone skipped role hardening, because
+  `tools/harden-roles.sh` was stored without its executable bit and the
+  installer tested for it.
+
+### Documentation
+
+- `RSCANVAS_SECRET` does not sign sessions or tokens, as the README said: it
+  encrypts stored credential profiles, and changing it revokes nothing.
+- The ports' defaults differ between the installer and a run from source,
+  and the README now gives both; `TRUST_PROXY` and `COOKIE_SECURE` are
+  documented; the troubleshooting `curl` used a route that needs a session.
+
+### New
+
+- **The installer says where the data lives, and takes the days kept.**
+  Before installing anything it reports where PostgreSQL's data is going,
+  what that disk holds and how much is free, warns when it is the system
+  disk - and on a fresh install, while a data disk can still be mounted
+  first, asks once. It prints the days each kind of data is kept with a
+  size estimate for them, and `--raw-days` and `--message-days` set those
+  days (at least 7; written when given, kept on later runs when not).
+  `--check` reports the same.
+
+- **Errors and discards are separate lists on the Dashboard**, each ranked
+  and trended on its own, so a link discarding for want of buffers no
+  longer hides among links taking bad frames, or the other way round. Six
+  top-10 lists now: received, transmitted, errors, discards, CPU, memory.
+
+- **`INGEST_QUEUE_MAX`** sets how many syslog and trap messages may wait in
+  memory for the database, 50,000 as before unless set. It is a ceiling,
+  not an allocation: the queue fills only during a burst above what the
+  database writes, or while the database is down. `INSTALL.md` section 3
+  has what a queued message costs, measured (about 770 bytes for a typical
+  line), so a site expecting bursts can size it.
+- **Operators have the Boards and Thresholds panels** on the System tab,
+  which were shown to admins alone although the server has always let
+  operators change boards and read thresholds. An operator generates,
+  edits, catches up and deletes boards, revokes display tokens, and reads
+  every threshold override and default. Minting a display token and
+  changing a threshold stay with admins.
+
+### Fixed
+
+- **Syslog retention would never have run.** The samples and messages
+  retention jobs fired in the same instant every hour, and the cleanup lets
+  one run at a time: messages lost to samples, and its skip reported
+  success. Found on the 30,000-entity lab the first night anything was old
+  enough to drop - the samples partition went in under a second, the
+  messages one stayed. They now take turns. On an install keeping syslog 30
+  days, the first syslog drop - the one that would have been skipped, and
+  every one after it - is a month after the data began.
+- **The docs said a device mute covered its syslog and trap alerts.** It
+  never did - a mute silences what the device's polling raises - and now it
+  does not by decision: a syslog or trap rule is written on purpose, and a
+  BGP peer dropping on a muted router should still be heard. `INSTALL.md`
+  and two entries below said otherwise and are corrected.
+- **An event rule could open an alert per forged host name.** A syslog
+  message's host is whatever its sender says, and an event rule raises one
+  alert per host, so a sender that varied the name could open an alert, and
+  send a notification, for every name it invented - 500 names were 500
+  alerts in a test. A rule now holds at most 20 per-host alerts open
+  (`EVENT_ALERT_HOSTS_MAX`); past that, new hosts share one "<rule>: more
+  than 20 hosts" alert. Hosts already alerting keep their own, and room
+  reopens as they clear.
+- **IPMI events say what the BMC said.** A maker's own event types - a
+  Supermicro's power-on, its LAN link - decoded as "OEM sensor type 0xc8:
+  offset 0". A BMC that sends its own description beside the event now has
+  it lead the line ("IPMI: [PWR-0020] First AC Power on"), and a standard
+  event quotes it, which names the sensor ("CPU_FAN1"). Every entity the IPMI
+  specification names is named now; a sub-chassis printed as a number.
+- **An alert could never clear after its threshold was loosened.** An alert
+  clears once its reading falls a margin below the threshold it crossed,
+  and it kept judging that against the threshold it fired at. Loosen the
+  rule mid-incident - an override at 30% deleted so the default 45%
+  applies - and a reading of 32%, normal by the new rule, sat inside the
+  margin of the old one for good: the alert you changed the threshold to
+  silence stayed open, and the way out was to mute the threshold and
+  unmute it. It now clears against the more lenient of the two, so it
+  clears within the usual few scans. Nothing else changes: with the rule
+  unchanged the two are the same line.
+
 ## 0.1.0-alpha.4 - 2026-09-30
 
 The fourth alpha: group alerts, device health on the Dashboard, and IPMI
@@ -187,7 +444,7 @@ reload open browser tabs afterwards.
   header, so its messages were stored with an empty host: the Logs page's
   host column was blank, `host:` could not find them, and an event rule
   firing on one raised its alert against the bare address, outside the
-  device's maintenance window, mute and notify policy. A message that names
+  device's maintenance window and notify policy. A message that names
   no host now takes the name of the device at its source address, when
   exactly one device has it, as traps do since 0.1.0-alpha.3. A message
   that names its host keeps it.
@@ -294,8 +551,8 @@ bundle. Reload open browser tabs afterwards.
   - Standard traps are named (linkDown, coldStart and so on), with their
     trap OID, and a v1 trap carries the same OID as its v2 equivalent.
   - A trap's alert was attached to its bare source address, so the device's
-    maintenance window, mute and notify policy did not apply to it. It now
-    belongs to the device at that address.
+    maintenance window and notify policy did not apply to it. It now belongs
+    to the device at that address.
   - The varbinds follow as before, so existing rules still match. An open
     trap alert keyed by address will age out, and the next one is keyed by
     the device.
