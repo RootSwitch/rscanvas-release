@@ -153,14 +153,23 @@ fi
 
 echo "hardening $DB"
 
-S -c "DO \$\$ BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$OWNER_ROLE') THEN
-            CREATE ROLE $OWNER_ROLE NOLOGIN;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$ADMIN_ROLE') THEN
-            CREATE ROLE $ADMIN_ROLE LOGIN PASSWORD '$ADMIN_PASSWORD' IN ROLE $OWNER_ROLE;
-        END IF;
-      END \$\$"
+[[ "$ADMIN_PASSWORD" =~ ^[A-Za-z0-9._~+=-]{1,128}$ ]] \
+    || { echo "ADMIN_PASSWORD must be 1 to 128 of A-Z a-z 0-9 . _ ~ + = - (it is quoted into psql)" >&2; exit 1; }
+# ON STDIN, NOT -c (2026-10-02, review F18). As a DO block on psql's command
+# line the admin role's password was in `ps` and in sudo's log on every run -
+# the public dev default on an installer box, whose installer creates the role
+# first, but whatever ADMIN_PASSWORD held anywhere else. psql does not
+# interpolate variables inside a dollar-quoted block, so the conditional
+# CREATEs are built by format() and run with \gexec; :'pw' is quoted by psql.
+S <<SQL
+\\set owner '$OWNER_ROLE'
+\\set admin '$ADMIN_ROLE'
+\\set pw '$ADMIN_PASSWORD'
+SELECT format('CREATE ROLE %I NOLOGIN', :'owner')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'owner') \\gexec
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L IN ROLE %I', :'admin', :'pw', :'owner')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'admin') \\gexec
+SQL
 echo "  roles present"
 
 # Everything the app role owns IN THIS DATABASE. Enumerated from the catalogue

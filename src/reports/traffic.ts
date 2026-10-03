@@ -201,9 +201,18 @@ export function isDay(s: string | null): s is string {
     return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
-/** An IANA zone the runtime knows, e.g. America/Chicago. */
+/**
+ * An IANA zone the runtime knows, e.g. America/Chicago.
+ *
+ * A NAME, NOT AN OFFSET (2026-10-03, review L17). Intl accepts bare offsets
+ * - "+05", "+05:00", "-0500" all passed here - and PostgreSQL reads a bare
+ * offset as a POSIX zone, whose sign is the opposite of ISO's: "+05" there is
+ * five hours WEST of UTC. A report asked for at +05 summed its days ten hours
+ * off. Every IANA name begins with a letter (Etc/GMT+5 and
+ * America/Port-au-Prince included), so that is the rule.
+ */
 export function isTimeZone(tz: string | null): tz is string {
-    if (tz === null || tz.length > 64 || !/^[A-Za-z0-9_+\-/]+$/.test(tz)) return false;
+    if (tz === null || tz.length > 64 || !/^[A-Za-z][A-Za-z0-9_+\-/]*$/.test(tz)) return false;
     try {
         new Intl.DateTimeFormat('en-US', { timeZone: tz });
         return true;

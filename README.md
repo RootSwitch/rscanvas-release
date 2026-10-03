@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.5).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.6).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -74,7 +74,11 @@ so they show the page as the code now draws it.
   notify policies by device, location or application, escalation debt, and
   delivery by email, ntfy or syslog with a ledger of what is owed. A
   device's polled alerts (down, interfaces, sensors) can be muted, one device
-  or a selection at a time; its syslog and trap rules still alert. A location or application can raise one
+  or a selection at a time; its syslog and trap rules still alert. Adding a
+  device asks whether to track all its ports or only those up now, and
+  whether link-down alerts start on or manual - manual alerts only on the
+  ports turned on from the device page, such as a switch's uplinks and host
+  ports. A location or application can raise one
   group alert when enough of its devices are down, holding their own emails
   while it is open.
 - **Dashboard and reports.** Open alerts first, then the top 10 interfaces
@@ -143,7 +147,7 @@ from `ADMIN_USERNAME`, default `admin`). Without `COLLECTOR_ENABLED=1`
 nothing is polled and without `JOBS_ENABLED=1` nothing is rolled up or
 expired; retention stays a dry run until `RETENTION_DRY_RUN=0`, and with no
 `RSCANVAS_SECRET` credential profiles are off. The installer sets all four.
-`npm test` runs the offline suite: fifty-six test files, sixteen static
+`npm test` runs the offline suite: fifty-seven test files, sixteen static
 checkers and a type check, no database needed.
 
 ## Configuration

@@ -20,7 +20,14 @@
     "p50GapMs": 0,
     "p99GapMs": 1,
     "thresholdMs": 50,
-    "overThresholdCount": 0
+    "overThresholdCount": 0,
+    "worstGapAt": "2026-09-26T03:56:22.000Z",
+    "recent": {
+     "windowMs": 900000,
+     "ticks": 86310,
+     "worstGapMs": 13.7,
+     "overThresholdCount": 0
+    }
    },
    {
     "thread": "ingest",
@@ -29,7 +36,14 @@
     "p50GapMs": 0,
     "p99GapMs": 1,
     "thresholdMs": 50,
-    "overThresholdCount": 0
+    "overThresholdCount": 0,
+    "worstGapAt": "2026-09-26T03:56:22.000Z",
+    "recent": {
+     "windowMs": 900000,
+     "ticks": 86255,
+     "worstGapMs": 13.1,
+     "overThresholdCount": 0
+    }
    },
    {
     "thread": "collector",
@@ -38,7 +52,14 @@
     "p50GapMs": 0,
     "p99GapMs": 3,
     "thresholdMs": 50,
-    "overThresholdCount": 2
+    "overThresholdCount": 2,
+    "worstGapAt": "2026-09-26T03:56:22.000Z",
+    "recent": {
+     "windowMs": 900000,
+     "ticks": 85749,
+     "worstGapMs": 41,
+     "overThresholdCount": 0
+    }
    },
    {
     "thread": "jobs",
@@ -47,7 +68,14 @@
     "p50GapMs": 0,
     "p99GapMs": 2,
     "thresholdMs": 50,
-    "overThresholdCount": 618
+    "overThresholdCount": 618,
+    "worstGapAt": "2026-09-26T03:56:22.000Z",
+    "recent": {
+     "windowMs": 900000,
+     "ticks": 80865,
+     "worstGapMs": 364.6,
+     "overThresholdCount": 397
+    }
    }
   ]
  },

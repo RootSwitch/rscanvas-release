@@ -150,7 +150,7 @@ ok('AES-256 resolves Blumenthal and AES-256-C resolves Reeder, as net-snmp store
 
 // --- the REPORT PDU vocabulary - v3's diagnosability win -----------------------
 //
-// v2c answers a wrong community with silence (the the operator workstation lesson). These six
+// v2c answers a wrong community with silence (the operator workstation lesson). These six
 // are what v3 says instead, and each must map to a DIFFERENT operator action.
 {
     const cases: Array<[string, string]> = [

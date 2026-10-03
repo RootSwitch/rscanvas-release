@@ -25,6 +25,7 @@ import type http from 'node:http';
 import { OPS } from '../store/index.ts';
 import { hashPassword, verifyPassword, DUMMY_HASH } from './password.ts';
 import { isRole, type Principal, type Role } from './authorize.ts';
+import { safeLogArgs } from '../logsafe.ts';
 
 const SESSION_TTL_S = 30 * 24 * 3600;      // 30 days, sliding
 const SESSION_REFRESH_S = 15 * 24 * 3600;  // refresh when less than this remains
@@ -39,7 +40,7 @@ const MIN_PASSWORD = 8;
 const sha256 = (s: string): string => crypto.createHash('sha256').update(s).digest('hex');
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[auth]', ...args);
+    console.log(new Date().toISOString(), '[auth]', ...safeLogArgs(args));
 }
 
 export class AuthError extends Error {}
@@ -213,7 +214,15 @@ export async function createSession(
     return token;
 }
 
-export async function validateSession(token: string | null): Promise<Principal> {
+/**
+ * onSlid is called when this request slid the session's expiry, so the caller
+ * can send the cookie again (review L1, 2026-10-03). The row slid and the
+ * cookie never did: it carried the Max-Age it got at login, so the browser
+ * dropped it 30 days after sign-in however often the session was used, and a
+ * daily user was signed out monthly while the database still held a valid
+ * session. Re-sent only on a slide, so at most every 15 days, not per request.
+ */
+export async function validateSession(token: string | null, onSlid?: () => void): Promise<Principal> {
     if (!token) return { kind: 'anonymous' };
     const res = requireOk(await OPS.findSession(sha256(token)), 'findSession');
     const row = res.rows[0];
@@ -227,6 +236,7 @@ export async function validateSession(token: string | null): Promise<Principal> 
         // Same: a blip during any session refresh must not be fatal.
         OPS.refreshSession(row.token_hash, SESSION_TTL_S)
             .catch((err: unknown) => log('session refresh failed:', (err as Error).message));
+        onSlid?.();
     }
 
     return {

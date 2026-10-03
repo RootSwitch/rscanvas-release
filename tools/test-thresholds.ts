@@ -93,6 +93,13 @@ console.log('\nresolveRuleInfo agrees with evaluate():');
         ['a mute on ANOTHER interface', [{ scope: 'code', code: 'IFZZ', kind: 'if-down', enabled: false }]],
         ['code levels on if-util (99/100)', [{ scope: 'code', code: 'IFAA', kind: 'if-util', warn: 99, crit: 100, enabled: true }]],
         ['code mute on the cpu sensor', [{ scope: 'code', code: 'CPU1', kind: 'cpu', enabled: false }]],
+        // MANUAL LINK-DOWN (2026-10-02): the device-wide mute the add step
+        // writes, and the same with this port turned back on.
+        ['manual link-down (host-kind if-down mute)', [{ scope: 'host-kind', host: 'sw1', kind: 'if-down', enabled: false }]],
+        ['manual link-down, this port turned on', [
+            { scope: 'host-kind', host: 'sw1', kind: 'if-down', enabled: false },
+            { scope: 'code', code: 'IFAA', kind: 'if-down', enabled: true },
+        ]],
     ];
     let judged = 0;
     for (const [name, overrides] of cases) {
@@ -120,6 +127,21 @@ console.log('\nresolveRuleInfo agrees with evaluate():');
     eq('device-down keys by host and resolves too',
         resolveRuleInfo(buildOverrideIndex([{ scope: 'host-kind', host: 'sw1', kind: 'device-down', enabled: false }]),
             base, 'device-down', null, 'sw1').muted, true);
+    // The turned-on port must actually RAISE, not merely resolve as unmuted:
+    // the row is yes/no, so the engine must take the default severity from it.
+    const manualOn: Override[] = [
+        { scope: 'host-kind', host: 'sw1', kind: 'if-down', enabled: false },
+        { scope: 'code', code: 'IFAA', kind: 'if-down', enabled: true },
+    ];
+    const raised = evaluate(doc as never, { ...base, overrides: manualOn })
+        .find((c) => c.code === 'IFAA' && c.kind === 'if-down');
+    eq('a port turned on under a manual device raises crit', raised?.severity, 'crit');
+    const other = evaluate({ ...doc, interfaces: [{ ...doc.interfaces[0], id: 'sw1:2', code: 'IFBB', name: 'Gi0/2' }] } as never,
+        { ...base, overrides: manualOn }).find((c) => c.code === 'IFBB' && c.kind === 'if-down');
+    eq('and a port NOT turned on raises nothing', other, undefined);
+    eq('the device-level answer (no code) is the manual mute, from the host tier',
+        resolveRuleInfo(buildOverrideIndex(manualOn), base, 'if-down', null, 'sw1'),
+        { source: 'host override', muted: true, levels: null });
     eq('a kind the engine never evaluates answers none, even with a row naming it',
         resolveRuleInfo(buildOverrideIndex([{ scope: 'code', code: 'IFAA', kind: 'if-bogus', enabled: false }]),
             base, 'if-bogus', 'IFAA', 'sw1').source, 'none');

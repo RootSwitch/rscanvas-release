@@ -2570,6 +2570,17 @@ export const OPS = {
      * IS DISTINCT FROM keeps the no-change case a zero-row answer the
      * caller can name.
      */
+    /** A device's sensors as Rediscover judges them gone or not
+     *  (onboard.ts goneSensors): identity, tracked, and whether the poll
+     *  has a reading now. */
+    deviceSensorsForRediscover: (deviceId: string) => laneQuery<{
+        code: string; name: string; kind: string; snmp_index: string | null;
+        tracked: boolean; lv_v0: number | null;
+    }>('collector', `
+        SELECT code, name, kind, snmp_index, tracked, lv_v0
+          FROM entities
+         WHERE device_id = $1::bigint AND kind <> 'if' AND code IS NOT NULL`, [deviceId]),
+
     setEntitiesTrackedByCode: (
         deviceId: string, codes: string[], tracked: boolean[],
     ) => laneQuery<{ name: string; kind: string; tracked: boolean }>('collector', `
@@ -4067,6 +4078,21 @@ export const OPS = {
            SET warn = EXCLUDED.warn, crit = EXCLUDED.crit, enabled = EXCLUDED.enabled,
                note = EXCLUDED.note, updated_ts = now()
         RETURNING id::text AS id`, [kind, host, code, warn, crit, enabled, note]),
+
+    /**
+     * Manual link-down alerts for a batch of new devices: one device-wide
+     * (host-kind) if-down mute each, in ONE statement - the same row the
+     * device page's "every interface on <device>" Mute writes, so it reads,
+     * lists and deletes like any other override. A per-port override
+     * outranks it, which is how ports are turned back on one at a time.
+     */
+    muteLinkDownForDevices: (names: string[], note: string) => laneQuery<{ host: string }>('interactive', `
+        INSERT INTO threshold_overrides (kind, host, code, warn, crit, enabled, note)
+        SELECT 'if-down', n, NULL, NULL, NULL, false, $2
+          FROM unnest($1::text[]) AS n
+        ON CONFLICT (kind, host, code) DO UPDATE
+           SET warn = NULL, crit = NULL, enabled = false, note = EXCLUDED.note, updated_ts = now()
+        RETURNING host`, [names, note]),
 
     /** Delete by id. The next tier - or the default - takes over on the
      *  next scan. RETURNING so the route can say which target it was. */

@@ -416,7 +416,8 @@
             <div class="row">
                 <table class="list" id="hb-threads">
                     <thead><tr>
-                        <th>thread</th><th class="num">worst gap</th><th class="num">p99</th>
+                        <th>thread</th><th class="num">worst, 15 min</th>
+                        <th class="num">worst since start</th><th class="num">p99</th>
                         <th class="num">over 50ms</th>
                     </tr></thead>
                     <tbody></tbody>
@@ -574,6 +575,29 @@
                      nothing on a device knows it serves Exchange, so this is
                      the grouping the operator simply states - and stating it
                      here beats tagging the batch one page at a time after. -->
+                <!-- THE TWO CHOICES (2026-10-02, the operator's SolarWinds
+                     comparison): which ports to track, and whether link-down
+                     alerts start on. Before them every ethernet port on a
+                     switch was tracked AND alerting, so each idle-but-enabled
+                     port raised a crit on the first scans. Remembered per
+                     browser; the server's default is today's behaviour. -->
+                <div class="row">
+                    <label for="ob-track">track</label>
+                    <select id="ob-track">
+                        <option value="all">all ports</option>
+                        <option value="active">active ports only - up now</option>
+                    </select>
+                    <label for="ob-linkdown">link-down alerts</label>
+                    <select id="ob-linkdown">
+                        <option value="on">on for every tracked port</option>
+                        <option value="manual">manual - turn ports on from the device page</option>
+                    </select>
+                </div>
+                <div class="muted small">Untracked ports stay listed on the device page and can be
+                    ticked later. Manual mutes link down only - errors, discards and utilization
+                    still alert - and each port is switched on from its row (uplinks, host ports).
+                    A device added without an answer tracks by the usual rule when it first answers.</div>
+
                 <div class="row">
                     <label for="ob-application">application</label>
                     <input type="text" id="ob-application" class="grow" autocomplete="off" maxlength="120"
@@ -681,7 +705,7 @@
                 <span class="head-spacer"></span>
                 <button type="button" id="device-modify" class="small" aria-expanded="false"
                         aria-controls="device-edit"
-                        data-can="device.rename device.address alert.suppress device.group device.mute">Modify</button></h2>
+                        data-can="device.rename device.address alert.suppress device.group device.mute alertrule.write">Modify</button></h2>
             <!-- An open maintenance window is STATE, not a control, so it stays
                  visible above the folded edit block. -->
             <div id="dev-maint" class="hints hidden"></div>
@@ -762,6 +786,17 @@
                     Syslog and trap rules are not affected. Saves when toggled.</span>
                 <span id="mute-msg" class="small"></span>
             </div>
+            <!-- Manual link-down (2026-10-02): the device-wide link-down mute
+                 the add step can write, switchable here for devices added
+                 before it or with alerts on. A port's gear turns that port
+                 back on; its own setting outranks this one. -->
+            <div class="row" data-can="alertrule.write">
+                <label class="small"><input type="checkbox" id="dev-linkdown-manual"> manual link-down alerts</label>
+                <span class="muted small">link down alerts only on the ports you turn on with their
+                    "alert on" button - for uplinks and host ports on a switch. Errors, discards and
+                    utilization are unchanged. Saves when toggled.</span>
+                <span id="linkdown-msg" class="small"></span>
+            </div>
             </div>
             <!-- The device's own state, on the page about that device. The
                  roster showed down and this panel did not, so a dead device
@@ -840,6 +875,9 @@
                        placeholder="filter interfaces" autocomplete="off">
             </div>
             <div id="device-msg" class="allquiet hidden"></div>
+            <!-- Manual link-down said ONCE, above the ports it governs, rather
+                 than as a "muted" badge on every row of a 48-port switch. -->
+            <div id="dev-linkdown-note" class="hints hidden"></div>
             <div class="table-scroll">
                 <table class="list" id="entities">
                     <thead><tr>

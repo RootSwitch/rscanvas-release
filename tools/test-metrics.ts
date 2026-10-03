@@ -20,8 +20,9 @@ const has = (text: string, needle: string, label: string): void => {
 };
 
 const hb = (thread: string) => ({
-    thread, ticks: 100, worstGapMs: 12.5, p50GapMs: 0.1, p99GapMs: 2,
+    thread, ticks: 100, worstGapMs: 12.5, worstGapAt: null, p50GapMs: 0.1, p99GapMs: 2,
     thresholdMs: 50, overThresholdCount: 0,
+    recent: { windowMs: 900_000, ticks: 100, worstGapMs: 7.5, overThresholdCount: 0 },
 });
 
 const collector = {
@@ -67,6 +68,8 @@ console.log('the exposition contract:\n');
 has(text, '# TYPE rscanvas_up gauge', 'every family carries its TYPE header');
 has(text, 'rscanvas_uptime_seconds 3601', 'uptime rounds to whole seconds');
 has(text, 'rscanvas_heartbeat_worst_gap_ms{thread="main"} 12.5', 'heartbeats are labelled per thread');
+has(text, 'rscanvas_heartbeat_recent_worst_gap_ms{thread="main"} 7.5',
+    'and the 15-minute worst rides beside it - what the health verdict judges');
 has(text, 'rscanvas_poll_failures_total{kind="all"} 7', 'the failure total keeps its historic meaning');
 has(text, 'rscanvas_poll_failures_total{kind="auth"} 2', 'and the per-kind split rides the same family (E5)');
 has(text, 'rscanvas_poll_skipped_no_slot_total 0',

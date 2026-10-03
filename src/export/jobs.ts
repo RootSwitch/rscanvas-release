@@ -30,6 +30,7 @@ import { CONFIG } from '../config.ts';
 import { OPS, type SearchFilters } from '../store/index.ts';
 import { estimate, humanBytes, humanDuration, type Estimate } from './estimate.ts';
 import type { HeartbeatStats } from '../heartbeat.ts';
+import { safeLogArgs } from '../logsafe.ts';
 
 export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 
@@ -64,7 +65,7 @@ const queue: string[] = [];
 let running = 0;
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[export]', ...args);
+    console.log(new Date().toISOString(), '[export]', ...safeLogArgs(args));
 }
 
 function spoolDir(): string {

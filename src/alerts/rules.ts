@@ -224,6 +224,11 @@ function resolveBool(
 /** The four rules every interface carries, in the engine's words. */
 export const IF_RULE_KINDS = ['if-down', 'if-errors', 'if-discards', 'if-util'] as const;
 
+/** The yes/no rules: no levels, so an override is on or off and nothing else.
+ *  An ENABLED override of one is how a port alerts under a device-wide mute
+ *  (manual link-down, 2026-10-02) - resolveBoolInfo already honoured it. */
+export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down']);
+
 /** What governs one target today: which tier, whether it is muted, and the
  *  levels when the kind has levels. */
 export interface RuleInfo { source: string; muted: boolean; levels: Levels | null }

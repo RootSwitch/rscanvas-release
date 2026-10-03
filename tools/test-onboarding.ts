@@ -46,7 +46,8 @@ import {
 import {
     suggestLocations, selectForAdd, selectForForce, locationAssignments,
     normalizeProbeRequest, probedName, addOutcome, normalizeExplicitName,
-    probeStanding, standingFields,
+    probeStanding, standingFields, parseOnboardChoices, trackedFor, goneSensors,
+    type ExistingSensor,
 } from '../src/devices/onboard.ts';
 // Untyped (it is browser JS), so the shape is asserted at the boundary - the
 // same import shape test-render-hostile.ts uses for public/dom.js.
@@ -542,6 +543,66 @@ function main(): void {
         // the exact ambiguity this exists to resolve.
         const wrong = normalizeExplicitName(42);
         eq('a non-string override is refused, never ignored', wrong.ok, false);
+    }
+
+    // THE TWO ADD-STEP CHOICES (2026-10-02). Absent is today's behaviour,
+    // so a script that never heard of them gets what it got before; a typo
+    // is refused, because "manul" quietly arming 48 ports is the failure.
+    console.log('\nthe add step\'s two choices:');
+    {
+        eq('absent means all ports, alerts on', parseOnboardChoices({}),
+            { ok: true, choices: { track: 'all', linkDown: 'on' } });
+        eq('both chosen', parseOnboardChoices({ track: 'active', linkDownAlerts: 'manual' }),
+            { ok: true, choices: { track: 'active', linkDown: 'manual' } });
+        eq('a misspelt link-down choice is refused, not defaulted to on',
+            parseOnboardChoices({ linkDownAlerts: 'manul' }).ok, false);
+        eq('a misspelt track choice is refused', parseOnboardChoices({ track: 'up' }).ok, false);
+        eq('a non-string is refused', parseOnboardChoices({ track: 1 }).ok, false);
+
+        const port = (oper: number | null | undefined, tracked = true, kind = 'if') => ({ kind, tracked, operStatus: oper });
+        eq('all: a down port stays tracked, as today', trackedFor(port(2), 'all'), true);
+        eq('active: an up port is tracked', trackedFor(port(1), 'active'), true);
+        eq('active: a down port is not', trackedFor(port(2), 'active'), false);
+        eq('active: dormant is not up', trackedFor(port(5), 'active'), false);
+        eq('active: notPresent is not up', trackedFor(port(6), 'active'), false);
+        eq('active: lowerLayerDown is not up', trackedFor(port(7), 'active'), false);
+        // ONLY AN EXPLICIT ANSWER UNTICKS - the connector test's safety rule.
+        eq('active: no status from the agent keeps the default', trackedFor(port(null), 'active'), true);
+        eq('active: a status never read keeps the default', trackedFor(port(undefined), 'active'), true);
+        eq('active: unknown(4) is no answer, and keeps the default', trackedFor(port(4), 'active'), true);
+        // It only ever unticks.
+        eq('active never TICKS a port the discovery rule left out', trackedFor(port(1, false), 'active'), false);
+        eq('a sensor is not a port - active leaves it alone', trackedFor(port(null, true, 'cpu'), 'active'), true);
+        eq('an entity with no kind is an interface (the add route\'s own default)',
+            trackedFor({ tracked: true, operStatus: 2 }, 'active'), false);
+    }
+
+    // SENSORS THE AGENT NO LONGER SERVES (2026-10-02, the operator desktop's GPU swap):
+    // gone needs two witnesses - unlisted by the probe AND no reading - so a
+    // walk that failed cannot untrack a live sensor.
+    console.log('\nrediscover and the sensors that left:');
+    {
+        const s = (name: string, kind: string, idx: string, tracked: boolean, v: number | null): ExistingSensor =>
+            ({ code: `C-${name}`, name, kind, snmp_index: idx, tracked, lv_v0: v });
+        const existing = [
+            s('Util: fan-GPU0', 'gauge', 'ext-util-fan-GPU0', true, null),    // the 5090's fan
+            s('Temp: GPU1', 'temp', 'ext-temp-GPU1', true, 69),                // still served
+            s('Temp: GPU7', 'temp', 'ext-temp-GPU7', true, 50),                // unlisted, still reads
+            s('Power: old', 'power', 'ext-power-old', false, null),            // already untracked
+            s('eth9', 'if', '9', true, null),                                  // an interface
+        ];
+        const probed = [{ kind: 'temp', snmpIndex: 'ext-temp-GPU1' }, { kind: 'fan', snmpIndex: 'ext-fan-GPU1' }];
+        const g = goneSensors(existing, probed);
+        eq('the dead fan reading is untracked', g.untrack.map((x) => x.name), ['Util: fan-GPU0']);
+        eq('an unlisted sensor that still reads is named, not untracked', g.stillAnswering.map((x) => x.name), ['Temp: GPU7']);
+        eq('a sensor the probe lists is left alone, reading or not',
+            goneSensors([s('Temp: GPU1', 'temp', 'ext-temp-GPU1', true, null)], probed).untrack.length, 0);
+        eq('identity is kind AND index: the same index under another kind is not a match',
+            goneSensors([s('Util: GPU1', 'gauge', 'ext-temp-GPU1', true, null)], probed).untrack.length, 1);
+        // A WALK THAT FAILED returns no sensors at all: every live one still
+        // has its reading, so nothing is untracked.
+        const live = existing.filter((x) => x.lv_v0 !== null);
+        eq('an empty probe untracks no sensor that is reading', goneSensors(live, []).untrack.length, 0);
     }
 
     console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

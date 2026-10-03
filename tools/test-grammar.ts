@@ -85,6 +85,20 @@ expect('an IPv6 address is /128', parseIpValue('2001:db8::1'), '2001:db8::1/128'
 expect('a 999 octet does not parse', parseIpValue('999.0.0.'), null);
 expect('a bare partial without the dot does not parse - genuinely ambiguous', parseIpValue('10.0'), null);
 expect('an out-of-range mask does not parse', parseIpValue('10.0.0.0/40'), null);
+// Review L16: Number() took all of these, and ::inet then refused them as a 500.
+expect('a hex mask does not parse', parseIpValue('10.0.0.0/0x18'), null);
+expect('an exponent mask does not parse', parseIpValue('10.0.0.0/1e1'), null);
+expect('an empty mask is not /0', parseIpValue('10.0.0.0/'), null);
+expect('a padded mask does not parse', parseIpValue('10.0.0.0/ 24'), null);
+{
+    // And levels past their scale are search text, not a smallint overflow.
+    const sev = parseQuery('sev:<=99999');
+    expect('sev:<=99999 is not a severity clause', sev.some((c) => c.kind === 'severity'), false);
+    const fac = parseQuery('fac:24');
+    expect('fac:24 is not a facility clause (0-23)', fac.some((c) => c.kind === 'facility'), false);
+    const ok = parseQuery('sev:<=7 fac:23');
+    expect('sev:<=7 and fac:23 still are', ok.map((c) => c.kind).join(','), 'severity,facility');
+}
 expect('ip: with a parseable value is a containment clause', one('ip:10.0.0.'),
     { kind: 'ip', cidr: '10.0.0.0/24', negate: false });
 expect('ip: with an unparseable value is TEXT, not an error', one('ip:banana'),

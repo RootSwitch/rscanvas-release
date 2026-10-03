@@ -31,6 +31,7 @@ import { startHeartbeat } from '../heartbeat.ts';
 import { installSafetyNet } from '../safety.ts';
 import { streamExportCsv, closeAll, type SearchFilters } from '../store/index.ts';
 import { csvHeader, csvRowFromRecord } from '../export/csv.ts';
+import { safeLogArgs } from '../logsafe.ts';
 
 const hb = startHeartbeat('export', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdMs);
 installSafetyNet({ thread: 'export' });
@@ -39,7 +40,7 @@ const cancelled = new Set<string>();
 let active = 0;
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[export-worker]', ...args);
+    console.log(new Date().toISOString(), '[export-worker]', ...safeLogArgs(args));
 }
 
 interface RunMessage {

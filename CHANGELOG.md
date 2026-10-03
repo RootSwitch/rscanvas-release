@@ -1,5 +1,181 @@
 # Changelog
 
+## 0.1.0-alpha.6 - 2026-10-03
+
+The sixth alpha. Every earlier installer wrote both database passwords into
+the system's logs, on every install and upgrade; this one does not, and
+`rscanvas-setup.sh --rotate-db-passwords` makes the copies already written
+worthless. The health page stops holding one stall against the service
+until a restart. Adding a device now asks whether to track all its ports or
+only those up, and whether link-down alerts start on or manual - so a switch
+with idle ports no longer raises an alert per idle port. Rediscover clears
+sensors whose hardware has left, and their history opens without tracking
+them again. The rest of the outside review's smaller findings are fixed.
+All of it was drilled on a factory-fresh VM, installed from a bundle built
+out of the public tree on a fresh Linux clone.
+
+### Upgrading
+
+Unpack the bundle over the install and re-run the installer, as `INSTALL.md`
+section 4 describes. Take a backup first with `rscanvas-backup.sh`, and
+reload open browser tabs afterwards. There is no schema change.
+
+- **Then change the database passwords**, once, on any install made before
+  this release: `sudo ./rscanvas-setup.sh --rotate-db-passwords`. The old
+  ones are in `/var/log/auth.log` and the journal until those rotate. The
+  service restarts once; nothing else changes. A backup taken before the
+  rotation brings the old passwords back if restored - rotate again after.
+- **A stall now shows on the health page for fifteen minutes and clears.**
+  A VM paused by its host's nightly backup reads red for a quarter of an
+  hour after each pause, where it used to stay red until a restart.
+- **Adding a device asks two things**: track all ports or only those up,
+  and link-down alerts on or manual. The defaults are what adding did
+  before; the add step remembers your last choice per browser.
+- **Rediscover untracks a sensor the agent no longer serves** and that has
+  no reading - a GPU's fan after the card was swapped, say. Its history
+  stays and its chart still opens.
+- **The installer refuses flags it used to take**: `--user` naming an
+  account that can log in (or root), `--db postgres`, `--dir /` and the
+  like, and a `--http-port` outside 1-65535 - before changing anything.
+  An install that already uses its own account is unaffected.
+- **`--uninstall --purge` keeps databases that only look like its copies**
+  and says so; it drops `<db>`, `<db>_restore_test` and
+  `<db>_pre_restore_<stamp>` alone.
+- **Scripts calling the API**: the traffic report takes IANA zone names
+  only (`tz=+05` is refused - use `Etc/GMT-5`), an empty search parameter
+  means no filter, and `facility` and `severityAtMost` must be on their
+  scales.
+- **Log lines escape control characters** (`\n`, `\u001b`) inside the line,
+  and a device that stays down is logged when it fails and then about
+  hourly, not every poll.
+
+### New
+
+- **Choose what a new device tracks and alerts on.** Adding a device used
+  to track every ethernet port and alert on every one that was enabled but
+  not linked, so a 48-port switch with idle ports raised a critical alert
+  per idle port on its first scans. The add step now asks two things for
+  the batch: track all ports or only those up now (the report shows "48
+  (12 up)" beside the interface count to choose against), and link-down
+  alerts on, or manual. Manual writes one device-wide link-down mute; each
+  port is then turned on from its row on the device page ("alert on"),
+  which outranks the device's setting, and the device's Modify block
+  switches it back. Errors,
+  discards and utilization are unaffected. An add that names neither gets
+  today's behaviour, and a value that is neither choice is refused. An
+  existing device can be made manual from Modify the same way.
+- **Rediscover untracks sensors the agent no longer serves.** It only
+  ever added, so a sensor whose hardware left - a GPU's fan after the card
+  was swapped - stayed tracked with no reading forever. A sensor is now
+  untracked when the probe no longer lists it AND its poll has no reading;
+  both, because sensor discovery skips a section silently when a walk
+  fails, and absence alone would let one flaky answer untrack live
+  sensors. One that is unlisted but still reads is named and left alone.
+  The report and the audit name each one, the history stays, and a tick on
+  the device page undoes it. Plain Rediscover does this; "Rediscover +
+  reset tracking" is not needed.
+- **An untracked sensor or interface opens its history chart.** Only
+  tracked ones did, so reading the history of a sensor whose hardware left
+  meant tracking it again - which also restarted polling something that is
+  not there. Its chart now opens, saying "not watched now: recorded while
+  it was", or that nothing was recorded in the range.
+- **A link-down override can be "on".** The alert-rule route refused an
+  enabled override with no levels, which left the engine's per-port
+  enable unreachable for the two yes/no rules (link down, device down);
+  it now accepts one, and refuses levels for them instead of storing
+  numbers the engine ignores.
+
+### Security
+
+- **The installer no longer writes the database passwords into the
+  system's logs.** It set the two role passwords with `psql -c "...
+  PASSWORD '...'"` and ran the schema step as `sudo env
+  DATABASE_URL=postgres://rscanvas_admin:<password>@...`, so both
+  passwords were on a command line - in `ps` while it ran, and in sudo's
+  log (`auth.log` and the journal) on every install and upgrade. The
+  passwords now go to psql on stdin as a quoted variable, and the admin URL
+  in the environment (review F18). Lines written by earlier runs stay until
+  the logs rotate; `rscanvas-setup.sh --rotate-db-passwords` (below) makes
+  them dead text.
+- **`rscanvas-setup.sh --rotate-db-passwords`** gives the `rscanvas` and
+  `rscanvas_admin` roles new random passwords, writes them to the env file
+  (both password keys and `DATABASE_URL`), proves each logs in, restarts the
+  service and waits for `/api/health/work` - nothing else changes. If
+  PostgreSQL refuses either change, the roles and the env file are put back
+  as they were. Run it once after upgrading an install made before this
+  release (INSTALL.md, section 4).
+- **`--uninstall --purge` drops only the databases it made, by exact name**
+  (review L11). It matched set-aside copies by prefix and split the list on
+  spaces, so on a shared PostgreSQL server a database named
+  `rscanvas_pre_restore_x postgres` would have dropped `postgres`. Only the
+  backup tool's own names (`_restore_test`, `_pre_restore_<stamp>`) are taken
+  now, walked as an array; set-aside config directories likewise.
+- **The installer checks its flags before changing anything** (review L10).
+  `--db` reached SQL as typed; `--dir /` was refused only after packages
+  and the kernel setting had changed; and `--user` named any existing
+  account - `--user root` would have moved root's home to
+  `/var/lib/rscanvas` and run the service as root. Each is refused up front.
+- **One log line per log call** (review L9). Device strings - an interface
+  name, an agent's error text - could carry a line break into the log and
+  forge the next line; every log helper now escapes control characters
+  (`\n`, `\u001b`) on the line they belong to.
+- **Confirm dialogs show names on one line** (review L7). Board, device and
+  credential names were interpolated raw into "are you sure?" dialogs, so
+  embedded line breaks could rewrite what an admin agreed to.
+
+### Fixed
+
+- **Signed-in sessions stay signed in** (review L1). The session's
+  database row slid its expiry on use but the browser cookie kept the
+  30-day Max-Age it got at sign-in, so a daily user was signed out every
+  month. The cookie is re-sent whenever the row slides.
+- **The page keeps rendering on a slow server** (review L4). Each 10-second
+  refresh superseded the one still loading, so a server slower than that
+  rendered nothing and took a fresh set of requests every tick. The timer
+  now waits for its own round (up to a minute); actions still refresh at
+  once.
+- **`rscanvas-backup.sh --out` leaves an existing directory's mode alone**
+  (review L12). It set 0700 on whatever it was given, so `--out /tmp`
+  removed /tmp's sticky bit.
+- **Search inputs that passed checks and then failed in the database**
+  (review L16): `sev:<=99999` and out-of-range facilities are search text,
+  `ip:10.0.0.0/0x18` and other non-decimal prefix lengths do not parse, and
+  an empty `sourceIp=` or `facility=` means no filter instead of a 500 or
+  facility 0.
+- **The traffic report refuses bare UTC offsets** (review L17). `+05` was
+  accepted and PostgreSQL reads it as a POSIX zone, west of UTC - days
+  summed ten hours off. IANA names only.
+- **A device that stays down is not re-logged every poll.** The failure log
+  was limited per error kind, fleet-wide, every 30 s - the poll interval -
+  so one switched-off transient device logged 2,300 lines a day. A device's
+  first failed poll is logged, then a reminder about hourly while it lasts.
+
+- **"credential profiles loaded" is logged when it changes**, not on every
+  30-second reload - 2,880 identical lines a day on production. The first
+  load and any change (a profile turning undecryptable among them) are
+  still logged.
+
+- **One stall no longer holds health red until a restart.** The heartbeat
+  verdict read each thread's worst gap since the service started, and a
+  maximum never falls: on production the VM host's 06:00 backup held every
+  poll up to 2.2 s, and the health page said "stalled" from then until the
+  next restart, every morning after one. The verdict now reads the last 15
+  minutes, both the single-stall bound (500 ms) and the sustained rate
+  (0.1% of ticks); the rate since start also hid a bad day after weeks of
+  uptime. The health page shows the 15-minute worst beside the worst since
+  start, which keeps its time, and `/metrics` gains
+  `rscanvas_heartbeat_recent_worst_gap_ms`
+  (`tools/test-heartbeat-window.ts`).
+
+### Documentation
+
+- INSTALL.md names the settings read outside `src/config.ts` (review D5),
+  instead of claiming every one is listed there.
+- The public tree no longer reads "the the operator workstation" where the
+  source said "the" before a host name (review P4).
+- The System screenshot shows the health table as it is now: the worst gap
+  in the last 15 minutes beside the worst since start, and when.
+
 ## 0.1.0-alpha.5 - 2026-10-01
 
 The fifth alpha, and a security release. An outside review of the fourth

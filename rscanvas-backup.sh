@@ -383,7 +383,13 @@ if [ "$MODE" = backup ]; then
     # uncompressed size - a compressed dump is several times smaller, so this
     # errs toward refusing. Filling a disk the database shares is how a
     # backup takes down the thing it protects.
-    install -d -m 0700 "$OUT_DIR"
+    # CREATED 0700 WHEN ABSENT, LEFT ALONE WHEN NOT (2026-10-03, review L12).
+    # `install -d -m 0700` also re-modes a directory that exists, so
+    # `--out /tmp` turned /tmp into 0700 root - sticky bit and every other
+    # user's access gone. The backup does not need its directory private:
+    # the archive is written 0600 under umask 077 and staged in a mktemp -d
+    # directory, which is 0700 by itself.
+    [ -d "$OUT_DIR" ] || install -d -m 0700 "$OUT_DIR"
     AVAIL=$(df --output=avail -BM "$OUT_DIR" | tail -1 | tr -dc 0-9)
     [ "$AVAIL" -ge $((HEAP / 1048576 + 64)) ] \
         || die "$OUT_DIR has ${AVAIL} MB free and this backup could need $((HEAP / 1048576 + 64)) MB - choose another place with --out"

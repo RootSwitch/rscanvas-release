@@ -12,6 +12,7 @@ import {
 import { snmpVersion, guardTrapReceiver, logSafe } from '../src/syslog/trap-guard.ts';
 import { parse } from '../src/syslog/parse.ts';
 import { explainCommunityTimeout } from '../src/credentials/v3.ts';
+import { escapeControl, safeLogArgs } from '../src/logsafe.ts';
 
 // House rule since test-walk: fail unless the run reaches its verdict.
 process.exitCode = 1;
@@ -143,6 +144,17 @@ const INFORM_INT2_32 = Buffer.from('30530201010408616e797468696e67a6440201010201
     eq('an empty datagram is not SNMP', snmpVersion(Buffer.alloc(0)), null);
     const s = logSafe('u2\r\n2026-10-01T00:00:00Z [ingest] forged');
     eq('a CR LF in logged text cannot start a new line', s.includes('\n') || s.includes('\r'), false);
+
+    // EVERY log helper now escapes (src/logsafe.ts, review L9), not only
+    // the trap path: a device string is one argument among the line's.
+    const forged = escapeControl('sw1\n2026-10-03T00:00:00Z [auth] admin password changed');
+    eq('a line break in a device string arrives as a visible \\n', forged, 'sw1\\n2026-10-03T00:00:00Z [auth] admin password changed');
+    eq('a terminal escape cannot reach the terminal', escapeControl(`red${String.fromCharCode(27)}[31m`), 'red\\u001b[31m');
+    eq('nor a Unicode line separator', escapeControl(`a${String.fromCharCode(0x2028)}b`), 'a\\u2028b');
+    eq('a tab stays - it cannot start a line', escapeControl('a\tb'), 'a\tb');
+    const err = safeLogArgs([new Error('agent said\nforged')])[0];
+    eq('an Error, stack and all, is one line', String(err).includes('\n'), false);
+    eq('an object is left to console.log, which escapes inside it', safeLogArgs([{ a: 'x\n' }])[0], { a: 'x\n' });
 }
 
 console.log('\none datagram cannot stop the receiver (review F1, F10) - loopback, the app\'s receiver options:');

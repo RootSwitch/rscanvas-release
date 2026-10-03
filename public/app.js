@@ -33,6 +33,20 @@ async function api(path, opts) {
     return { status: res.status, ...(await res.json()) };
 }
 
+/**
+ * A name as ONE LINE, for text the operator agrees to (2026-10-03, review
+ * L7). window.confirm renders line breaks, and board names (operators write
+ * them), device names (a device's own sysName at onboarding) and credential
+ * names were interpolated raw - so "Lab\n\nThis only renames the board." could
+ * rewrite what an admin believed they were confirming. Control characters,
+ * including the Unicode line and paragraph separators, become spaces, and a
+ * long name is clipped so it cannot push the real question off the dialog.
+ */
+function oneLine(s, max = 120) {
+    const flat = String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+    return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
+}
+
 function fmtAgo(iso) {
     if (!iso) return '';
     const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
@@ -965,6 +979,15 @@ async function rediscoverSelected(retrack) {
         if (d.startedTracking?.length) {
             bits.push(`started tracking ${d.startedTracking.length}: ${d.startedTracking.slice(0, 8).join(', ')}`);
         }
+        // Sensors whose hardware left (2026-10-02): unlisted by the agent and
+        // reading nothing, so untracked - named, because "1 sensor untracked"
+        // sends somebody looking for which.
+        if (d.goneUntracked?.length) {
+            bits.push(`no longer served, untracked (history kept) ${d.goneUntracked.length}: ${d.goneUntracked.slice(0, 8).join(', ')}`);
+        }
+        if (d.goneAnswering?.length) {
+            bits.push(`not listed by the agent but still reading, left tracked: ${d.goneAnswering.slice(0, 8).join(', ')}`);
+        }
         gate.appendChild(factLine(d.name, bits.join(' - ')));
     }
     for (const m of r.missing || []) gate.appendChild(factLine(m, 'no such device'));
@@ -1796,9 +1819,17 @@ async function openChart(entity) {
     // NAMING THE SOURCE, because raw and rollup look different and an
     // operator should not have to wonder why last week is smoother than
     // this morning.
+    // AN UNTRACKED ENTITY OPENS ITS CHART TOO (2026-10-02, operator: seeing
+    // a gone GPU fan's history meant tracking it again, which also restarts
+    // polling a sensor that is not there). Its history is what was recorded
+    // while it was watched, and the line says so, so a dead series cannot
+    // pass for a live one.
+    const unwatched = entity.tracked === false;
     $('chart-sub').textContent = any
-        ? `${r.points.length} points, ${r.source}`
-        : 'no readings in this window';
+        ? `${r.points.length} points, ${r.source}${unwatched ? ' - not watched now: recorded while it was' : ''}`
+        : (unwatched
+            ? 'not watched, and nothing recorded in this window - a longer range may hold its history, or it was never watched'
+            : 'no readings in this window');
     Charts.render($('chart-body'), {
         series, from: r.from, to: r.to, unit: spec.unit,
         yMax: spec.yMax, bucketSec: r.bucketSec,
@@ -2056,13 +2087,17 @@ function renderSensorCards(sensors) {
         if (s.tracked) {
             card.className = `${p.alarm ? 'card alarm' : 'card'} clickable`;
             card.title = 'click for history';
-            card.addEventListener('click', () => openChart(s));
         } else {
             // Discovery's own judgement (implausible readings, FS noise)
             // lands here too, dimmed - the operator can overrule it, and
-            // "we saw this and chose not to watch it" stays visible.
-            card.className = 'card untracked';
+            // "we saw this and chose not to watch it" stays visible. It opens
+            // its chart as well (2026-10-02): what was recorded while it was
+            // watched, said as such - a sensor whose hardware left keeps a
+            // history worth reading without re-tracking it.
+            card.className = 'card untracked clickable';
+            card.title = 'not watched - click for what was recorded while it was';
         }
+        card.addEventListener('click', () => openChart(s));
         // THE NAME TRUNCATES, THE CONTROLS DO NOT (operator, 2026-09-23: a
         // long ZFS dataset name on a TrueNAS box pushed "untrack" out of the
         // card). The buttons used to live INSIDE the ellipsis box with the
@@ -2208,10 +2243,38 @@ const IF_RULES = [
 ];
 const IF_RULE_LABEL = new Map(IF_RULES);
 let lastIfRuleDefaults = null;
+// The device's own link-down setting, from /api/device (2026-10-02):
+// { source, muted, deviceRowId }, null when the server could not resolve it.
+let lastLinkDown = null;
+
+/** Manual link-down: this device's own row mutes link down for every port
+ *  without one, and a port alerts only once turned on. */
+function linkDownManual() {
+    return lastLinkDown !== null && lastLinkDown.source === 'host override' && lastLinkDown.muted === true;
+}
+
+/** Is this port's link-down silenced by the DEVICE's manual setting rather
+ *  than anything set on the port? Said once above the table, not per row. */
+function linkDownByDevice(e) {
+    return linkDownManual() && e.ifRules?.['if-down']?.muted === true
+        && e.ifRules['if-down'].source === 'host override';
+}
+
+/** Has this port been turned on under a manual device? */
+function linkDownTurnedOn(e) {
+    const r = e.ifRules?.['if-down'];
+    return r !== undefined && r.muted === false && r.source === 'override';
+}
+
+/** The rules muted on this ROW: the device's manual link-down is the
+ *  device's state, not the port's, so it is left out. */
+function rowMutedRules(e) {
+    return IF_RULES.filter(([k]) => e.ifRules?.[k]?.muted && !(k === 'if-down' && linkDownByDevice(e)));
+}
 
 function ifScopeWords(source, device) {
     return source === 'override' ? 'this interface'
-        : source === 'host override' ? `every interface on ${device}`
+        : source === 'host override' ? `every interface on ${oneLine(device)}`
             : source === 'kind override' ? 'every interface everywhere' : 'default';
 }
 
@@ -2220,17 +2283,22 @@ function ifScopeWords(source, device) {
  *  the quiet norm draws nothing. */
 function ifRuleBadge(e) {
     if (!e.ifRules) return null;
-    const muted = IF_RULES.filter(([k]) => e.ifRules[k]?.muted);
-    const tuned = IF_RULES.filter(([k]) => !e.ifRules[k]?.muted
+    const muted = rowMutedRules(e);
+    const tuned = IF_RULES.filter(([k]) => !e.ifRules[k]?.muted && k !== 'if-down'
         && e.ifRules[k] && e.ifRules[k].source !== 'default' && e.ifRules[k].source !== 'none');
-    if (muted.length === 0 && tuned.length === 0) return null;
+    // Link down is yes/no, so a port's own override that is not a mute means
+    // ON - on a manual device, the port that alerts. No levels to show.
+    const on = linkDownTurnedOn(e);
+    if (muted.length === 0 && tuned.length === 0 && !on) return null;
     const lines = [
         ...muted.map(([k, l]) => `${l}: muted (${ifScopeWords(e.ifRules[k].source, currentDevice)})`),
+        ...(on ? [`link down: alerting (${ifScopeWords(e.ifRules['if-down'].source, currentDevice)})`] : []),
         ...tuned.map(([k, l]) => `${l}: warn ${e.ifRules[k].warn ?? 'off'} / crit ${e.ifRules[k].crit ?? 'off'} (${ifScopeWords(e.ifRules[k].source, currentDevice)})`),
     ];
     const text = muted.length === IF_RULES.length ? 'muted'
         : muted.length > 0 ? `${muted.map(([, l]) => l).join(', ')} muted`
-            : 'custom thresholds';
+            : on && tuned.length === 0 ? 'link down on'
+                : 'custom thresholds';
     // A span, not pill(): pill() builds a whole cell, and this sits inside
     // the name cell beside the interface's name.
     const b = document.createElement('span');
@@ -2244,7 +2312,7 @@ function ifRuleBadge(e) {
  *  scope comes from the server-resolved source, exactly as unmuteSensor
  *  finds its row, so precedence stays decided in the engine. */
 async function unmuteInterface(e) {
-    const muted = IF_RULES.filter(([k]) => e.ifRules?.[k]?.muted);
+    const muted = rowMutedRules(e);
     if (muted.length === 0) return;
     const list = await api('/api/thresholds');
     if (list.status === 401) { showLogin(); return; }
@@ -2270,6 +2338,39 @@ async function unmuteInterface(e) {
         if (!r.ok) { window.alert(r.detail || `refused (${r.status})`); break; }
     }
     if (currentDevice) await showDevice(currentDevice);
+}
+
+/** "alert on" / "alert off" for one port of a manual device: on writes the
+ *  port's own link-down row (it outranks the device's), off deletes it. */
+function portLinkDownButton(e, on) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn-track';
+    b.textContent = on ? 'alert on' : 'alert off';
+    b.title = on
+        ? 'Raise link down for this port - this device\'s link-down alerts are manual'
+        : 'Stop raising link down for this port, back to the device\'s manual setting';
+    b.addEventListener('click', async (ev) => {
+        ev.stopPropagation();   // the row itself opens the history chart
+        b.disabled = true;
+        let r;
+        if (on) {
+            r = await saveThreshold({ kind: 'if-down', host: null, code: e.code, warn: null, crit: null,
+                enabled: true, note: 'link down on - device link-down alerts are manual' });
+        } else {
+            const list = await api('/api/thresholds');
+            if (list.status === 401) { showLogin(); return; }
+            const row = (list.overrides || []).find((o) => o.kind === 'if-down' && o.code === e.code);
+            r = row === undefined ? { ok: true }
+                : await api('/api/thresholds/delete', {
+                    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: row.id }),
+                });
+        }
+        if (r.status === 401) { showLogin(); return; }
+        if (!r.ok) { b.disabled = false; window.alert(r.detail || `refused (${r.status})`); return; }
+        if (currentDevice) await showDevice(currentDevice);
+    });
+    return b;
 }
 
 /**
@@ -2307,6 +2408,11 @@ function ifRuleControl(e, tr) {
         const save = document.createElement('button'); save.type = 'submit'; save.className = 'btn-primary'; save.textContent = 'Set';
         const mute = document.createElement('button'); mute.type = 'button'; mute.textContent = 'Mute';
         mute.title = 'Suspend the chosen rule(s) at the chosen scope. Polling and history continue; an open alert clears as source-removed.';
+        // Link down is yes/no, so its counterpart to Mute is Turn on: the
+        // way a port alerts on a device whose link-down alerts are manual,
+        // because the narrower scope's setting outranks the wider one.
+        const turnOn = document.createElement('button'); turnOn.type = 'button'; turnOn.textContent = 'Turn on';
+        turnOn.title = 'Alert on link down at the chosen scope, even where a wider scope mutes it - how a port alerts on a device whose link-down alerts are manual';
         const msg = document.createElement('span'); msg.className = 'muted small';
         // Levels only mean something for the three rate rules. The inputs
         // prefill with what applies now: this row's override, else the
@@ -2315,6 +2421,7 @@ function ifRuleControl(e, tr) {
             const k = which.value;
             const leveled = k !== 'all' && k !== 'if-down';
             for (const el of [warn, crit, save]) el.classList.toggle('hidden', !leveled);
+            turnOn.classList.toggle('hidden', k !== 'if-down');
             warn.value = ''; crit.value = '';
             if (!leveled) return;
             const cur = e.ifRules?.[k] && !e.ifRules[k].muted ? e.ifRules[k] : lastIfRuleDefaults?.[k];
@@ -2355,7 +2462,12 @@ function ifRuleControl(e, tr) {
             for (const k of kinds) results.push(await saveThreshold(bodyFor(k, false)));
             finish(results);
         });
-        f.append(which, scope, warn, crit, note, save, mute, msg);
+        turnOn.addEventListener('click', async () => {
+            if (scope.value === 'kind' && !window.confirm(
+                'Turn link down ON for every interface everywhere? A device\'s or a port\'s own setting still outranks it.')) return;
+            finish([await saveThreshold(bodyFor('if-down', true))]);
+        });
+        f.append(which, scope, warn, crit, note, save, mute, turnOn, msg);
         td.appendChild(f);
         row.appendChild(td);
         tr.after(row);
@@ -2424,6 +2536,8 @@ function renderEntities(data) {
         lastPollSlots = data.pollSlots ?? null;
         lastAvailability = data.availability24h ?? null;
         lastIfRuleDefaults = data.ifRuleDefaults ?? null;
+        lastLinkDown = data.linkDown ?? null;
+        syncLinkDownControl();
     }
 
     // THE SPLIT on kind (sensors slice): sensors become the cards above the
@@ -2453,6 +2567,17 @@ function renderEntities(data) {
     }
     $('entities-more').textContent = moreNote.join('; ');
     $('entities-more').classList.toggle('hidden', moreNote.length === 0);
+    // Counted over every tracked port, not the filtered rows: the note is
+    // about the device, and a filter must not change what it says.
+    const manual = linkDownManual();
+    if (manual) {
+        const tracked = lastEntities.filter((e) => (!e.kind || e.kind === 'if') && e.tracked);
+        const on = tracked.filter(linkDownTurnedOn).length;
+        $('dev-linkdown-note').textContent = `Link-down alerts are manual on this device: on for ${on} of `
+            + `${tracked.length} tracked port${tracked.length === 1 ? '' : 's'}. `
+            + (can('alertrule.write') ? 'Turn a port on with its "alert on" button; Modify switches the device back.' : '');
+    }
+    $('dev-linkdown-note').classList.toggle('hidden', !manual);
     const tbody = $('entities').querySelector('tbody');
     tbody.replaceChildren();
     for (const e of shown) {
@@ -2531,7 +2656,7 @@ function renderEntities(data) {
             cell('', 'num'), cell('', 'num'), cell('', 'num'), cell('', 'num'),
             stale
                 ? cell(`not watched - no reading since ${fmtAgo(e.lv_stale_since)}, cleanup removes it after a week if a live duplicate exists`, 'muted')
-                : cell('not watched - no alerts, no charts', 'muted'),
+                : cell('not watched - no alerts, no new readings', 'muted'),
         ]);
         tr.appendChild(trackTd);
         // The rule gear beside untrack, admin-only like the sensor gear
@@ -2543,7 +2668,17 @@ function renderEntities(data) {
                 const g = ifRuleControl(e, tr);
                 trackTd.appendChild(g);
             }
-            if (IF_RULES.some(([k]) => e.ifRules?.[k]?.muted)) {
+            // MANUAL LINK-DOWN (2026-10-02): a port under the device's
+            // manual setting offers "alert on", one turned on offers "alert
+            // off" - one click each, because on a switch this is the whole
+            // job. Its unmute would have deleted the DEVICE's setting, so
+            // that mute is left out of the row's unmute below.
+            if (e.tracked && linkDownByDevice(e)) {
+                trackTd.appendChild(portLinkDownButton(e, true));
+            } else if (e.tracked && linkDownManual() && linkDownTurnedOn(e)) {
+                trackTd.appendChild(portLinkDownButton(e, false));
+            }
+            if (rowMutedRules(e).length > 0) {
                 const un = document.createElement('button');
                 un.type = 'button';
                 un.className = 'btn-track';
@@ -2561,15 +2696,17 @@ function renderEntities(data) {
         if (e.hc_missing) {
             tr.title = 'this agent serves no 64-bit (ifHC) counters for this interface - '
                 + 'rates use 32-bit counters with wrap correction, capped at plausibility'
-                + (e.tracked ? '; click for history' : '');
+                + (e.tracked ? '; click for history' : '; not watched - click for what was recorded while it was');
         }
         if (e.tracked) {
             tr.className = 'clickable';
             if (!e.hc_missing) tr.title = 'click for history';
-            tr.addEventListener('click', () => openChart(e));
         } else {
-            tr.className = 'untracked';
+            // Opens its chart too (2026-10-02) - see renderSensorCards.
+            tr.className = 'untracked clickable';
+            if (!e.hc_missing) tr.title = 'not watched - click for what was recorded while it was';
         }
+        tr.addEventListener('click', () => openChart(e));
         tbody.appendChild(tr);
     }
 
@@ -2834,6 +2971,10 @@ async function showDevice(name) {
     $('transient-msg').textContent = '';
     $('dev-muted').checked = known?.alerts_muted === true;
     $('mute-msg').textContent = '';
+    // The link-down setting arrives with /api/device; until then it is
+    // unknown, not the previous device's. Its message survives a refresh of
+    // the same device, which is what follows a toggle.
+    if (arriving) { lastLinkDown = null; $('linkdown-msg').textContent = ''; syncLinkDownControl(); }
     if (arriving) setDeviceEditOpen(deviceEditRemembered());
     renderDeviceHeader();
     $('grouping-msg').textContent = '';
@@ -3029,6 +3170,48 @@ $('dev-muted').addEventListener('change', async () => {
         : 'UNMUTED - anything still true raises again on the next scan';
     const d = await api('/api/devices');
     if (d.ok) renderDevices(d);
+});
+
+// MANUAL LINK-DOWN for the device on screen (2026-10-02): the same device-
+// wide link-down row the add step writes, saved on toggle like the two
+// boxes above. Unticking deletes the device's row; ports turned on keep
+// their own rows, which then say the same as the default.
+function syncLinkDownControl() {
+    const ld = lastLinkDown;
+    $('dev-linkdown-manual').checked = linkDownManual();
+    $('dev-linkdown-manual').disabled = ld === null;
+    const note = ld === null ? ''
+        : ld.source === 'kind override' && ld.muted ? 'link down is muted for every device by a fleet-wide rule'
+            : ld.source === 'none' ? 'link down alerts are off in this server\'s rules' : '';
+    if (note !== '') $('linkdown-msg').textContent = note;
+}
+
+$('dev-linkdown-manual').addEventListener('change', async () => {
+    if (currentDevice === null) return;
+    const box = $('dev-linkdown-manual');
+    const want = box.checked;
+    let r;
+    if (want) {
+        r = await saveThreshold({ kind: 'if-down', host: currentDevice, code: null, warn: null, crit: null,
+            enabled: false, note: 'link-down alerts manual' });
+    } else if (lastLinkDown?.deviceRowId) {
+        r = await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: lastLinkDown.deviceRowId }),
+        });
+    } else {
+        r = { ok: true };
+    }
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        box.checked = !want;   // the change did not take
+        $('linkdown-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('linkdown-msg').textContent = want
+        ? 'MANUAL - link down raises only on ports turned on; open link-down alerts on the rest clear within a few scans'
+        : 'ON - every tracked port raises link down again from the next scan';
+    await showDevice(currentDevice);
 });
 
 $('device-back').addEventListener('click', showRoster);
@@ -3294,11 +3477,14 @@ function renderHealth(h) {
     const ttbody = $('hb-threads').querySelector('tbody');
     ttbody.replaceChildren();
     for (const t of h.heartbeat?.threads || []) {
-        const worst = cell(`${t.worstGapMs}ms`, 'num');
-        if (t.worstGapMs > (t.thresholdMs ?? 50)) worst.classList.add('cell-warn');
+        // The verdict reads the last 15 minutes; the since-start worst stays
+        // beside it, with when, as the record (2026-10-02).
+        const recent = cell(t.recent ? `${t.recent.worstGapMs}ms` : '', 'num');
+        if (t.recent && t.recent.worstGapMs > (t.thresholdMs ?? 50)) recent.classList.add('cell-warn');
         ttbody.appendChild(rowEl([
             cell(t.thread),
-            worst,
+            recent,
+            cell(`${t.worstGapMs}ms${t.worstGapAt ? `, ${fmtWhen(t.worstGapAt)}` : ''}`, 'num'),
             cell(`${t.p99GapMs}ms`, 'num'),
             cell(t.overThresholdCount > 0 ? String(t.overThresholdCount) : '', 'num'),
         ]));
@@ -3974,8 +4160,16 @@ function renderProbe(r) {
                 + 'if it never answers it reads DOWN after about a day (PENDING_CONTACT_H) '
                 + 'and pages once, so a wrong community string cannot hide as pending.';
         }
+        // "(44 up)" is what the active-ports-only choice would keep, so the
+        // choice below is made against a number (2026-10-02). It sits by the
+        // interface count, not the tracked one: tracked counts sensors too,
+        // and "50 (44 up)" read as six ports down on a switch with two.
+        const ifCell = cell(d.ok && d.entities > 0 && typeof d.trackedUp === 'number'
+            ? `${d.entities} (${d.trackedUp} up)` : String(d.entities), 'num');
+        ifCell.title = 'interfaces found, and how many the discovery rule tracks that are up now - '
+            + 'what "active ports only" keeps';
         const row = rowEl([
-            cell(''), cell(d.host), cell(d.name), cell(String(d.entities), 'num'),
+            cell(''), cell(d.host), cell(d.name), ifCell,
             cell(String(d.tracked), 'num'),
             // Sensors separately from interfaces: "25 interfaces, 9 sensors"
             // is checkable against the box an operator knows; a merged count
@@ -4084,6 +4278,21 @@ function renderLocationSuggestion(sug) {
     }
 }
 
+// The two add-step choices, remembered per browser: an operator who onboards
+// switches with manual link-down should not re-pick it every batch. A
+// convenience only - an unreadable store means today's defaults.
+const OB_CHOICES_KEY = 'rscanvas.onboardChoices';
+function rememberOnboardChoices(track, linkDownAlerts) {
+    try { localStorage.setItem(OB_CHOICES_KEY, JSON.stringify({ track, linkDownAlerts })); } catch { /* session only */ }
+}
+function restoreOnboardChoices() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(OB_CHOICES_KEY) || 'null'); } catch { /* defaults */ }
+    $('ob-track').value = saved?.track === 'active' ? 'active' : 'all';
+    $('ob-linkdown').value = saved?.linkDownAlerts === 'manual' ? 'manual' : 'on';
+}
+restoreOnboardChoices();
+
 $('ob-add').addEventListener('click', async () => {
     if (probeToken === null) return;
     // Two lists from one set of ticks: an answered row goes to accept, a
@@ -4118,11 +4327,14 @@ $('ob-add').addEventListener('click', async () => {
     // stating it here beats tagging six machines one page at a time
     // afterwards, which is what they had to do for the guest PCs.
     const application = $('ob-application').value.trim();
+    const track = $('ob-track').value;
+    const linkDownAlerts = $('ob-linkdown').value;
+    rememberOnboardChoices(track, linkDownAlerts);
     const r = await api('/api/devices', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-            probeToken, accept, locations,
+            probeToken, accept, locations, track, linkDownAlerts,
             ...(Object.keys(names).length > 0 ? { names } : {}),
             ...(force.length > 0 ? { force } : {}),
             ...(application !== '' ? { application } : {}),
@@ -4134,6 +4346,10 @@ $('ob-add').addEventListener('click', async () => {
           // Forced rows are counted apart from added, because "pending
           // first contact" must never read as "probed and discovered".
           + (r.forced?.length ? `, ${r.forced.length} forced (pending first contact)` : '')
+          + (r.linkDownManual?.length ? `, link-down alerts manual on ${r.linkDownManual.length}` : '')
+          // Said loudly: the devices were added, but alerting is ON where
+          // the operator asked for manual.
+          + (r.linkDownRefused ? ` - ${r.linkDownRefused}` : '')
           + (r.taggedApp ? `, ${r.taggedApp} into "${application}"` : '')
           + (r.skipped?.length ? `, skipped ${r.skipped.length}` : '')
           // A dropped duplicate means one sensor is invisible on that device.
@@ -4143,9 +4359,10 @@ $('ob-add').addEventListener('click', async () => {
     // EVERY REFUSAL NAMED, in the panel the operator is already looking at.
     // "skipped 5" is what made a per-device database refusal indistinguishable
     // from "already known" for two rounds of testing.
-    if (r.ok && ((r.collisions?.length ?? 0) > 0 || (r.skipped?.length ?? 0) > 0)) {
+    if (r.ok && ((r.collisions?.length ?? 0) > 0 || (r.skipped?.length ?? 0) > 0 || r.linkDownRefused)) {
         const gate = $('roster-gate');
         gate.replaceChildren();
+        if (r.linkDownRefused) gate.appendChild(factLine('link-down alerts', r.linkDownRefused));
         for (const s of r.skipped || []) gate.appendChild(factLine(s.host, s.why));
         for (const c of r.collisions || []) {
             gate.appendChild(factLine(c.device, `duplicate identity, not added: ${c.dropped}`));
@@ -5188,7 +5405,7 @@ function renderBoards(boards, gridFields, gridDefaults, manual) {
             const warn = live > 0
                 ? `\n\nThis revokes ${live} live display token(s) - any screen showing this board goes dark.`
                 : '';
-            if (!window.confirm(`Delete the board "${b.name}"?${warn}`)) return;
+            if (!window.confirm(`Delete the board "${oneLine(b.name)}"?${warn}`)) return;
             const r = await api(`/api/boards/${encodeURIComponent(b.id)}`, { method: 'DELETE' });
             adminSay('boards-msg', r, `deleted "${b.name}"`);
             refreshSystem();
@@ -5273,7 +5490,7 @@ function renderBoards(boards, gridFields, gridDefaults, manual) {
                 + 'The board id and its display tokens survive - that is the point of this '
                 + 'over delete-and-recreate.';
             rbBtn.addEventListener('click', () => {
-                if (!window.confirm(`Rebuild "${b.name}" from its group?\n\nThis discards every `
+                if (!window.confirm(`Rebuild "${oneLine(b.name)}" from its group?\n\nThis discards every `
                     + 'hand placement on it. The board id and its display tokens survive.')) return;
                 void rec('rebuild', { confirm: true });
             });
@@ -5777,7 +5994,7 @@ async function saveThreshold(body) {
 }
 
 async function deleteThreshold(id, o) {
-    const what = o.code ? `the override on sensor ${o.code}` : o.host ? `the ${o.kind} override on ${o.host}` : `the ${o.kind} override for every device`;
+    const what = o.code ? `the override on sensor ${oneLine(o.code)}` : o.host ? `the ${oneLine(o.kind)} override on ${oneLine(o.host)}` : `the ${oneLine(o.kind)} override for every device`;
     if (!window.confirm(`Remove ${what}? The next tier or the default applies on the next scan.`)) return;
     const r = await api('/api/thresholds/delete', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
@@ -6016,8 +6233,8 @@ async function deleteCredential(name, devices) {
     // credential is revoked, so it is never blocked - but the operator should
     // know how many devices go dark.
     const q = devices > 0
-        ? `Delete "${name}"? ${devices} device(s) name it and will refuse to poll until re-pointed. This is how a credential is revoked.`
-        : `Delete "${name}"?`;
+        ? `Delete "${oneLine(name)}"? ${devices} device(s) name it and will refuse to poll until re-pointed. This is how a credential is revoked.`
+        : `Delete "${oneLine(name)}"?`;
     if (!window.confirm(q)) return;
     const r = await api('/api/credentials/delete', {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -6098,7 +6315,34 @@ function freshenShown() {
     }
 }
 
+// THE TIMER WAITS FOR ITS OWN ROUND (2026-10-03, review L4). The generation
+// counter above is right for an ACTION's refresh, which must win; it was
+// wrong for the timer. On a server slower than 10 s per round every tick
+// superseded the round still in flight, so nothing ever rendered, and each
+// tick piled another full set of requests onto the server that was already
+// too slow. A tick now skips while a round is in flight - unless that round
+// has been out for a minute, because api() has no timeout and a request that
+// never answers must not freeze the page for good. Actions and sign-in still
+// refresh at once, and still win.
+let refreshesInFlight = 0;
+let refreshStartedAt = 0;
+const REFRESH_STUCK_MS = 60_000;
+function refreshTick() {
+    if (refreshesInFlight > 0 && Date.now() - refreshStartedAt < REFRESH_STUCK_MS) return;
+    refresh({ onlyShown: true });
+}
+
 async function refresh(opts = {}) {
+    refreshesInFlight++;
+    refreshStartedAt = Date.now();
+    try {
+        await refreshRound(opts);
+    } finally {
+        refreshesInFlight--;
+    }
+}
+
+async function refreshRound(opts) {
     const onlyShown = opts.onlyShown === true;
     if (onlyShown && document.hidden) return;
     const gen = ++refreshGen;
@@ -6238,7 +6482,7 @@ async function showApp(me) {
     if (deep !== null) await openDeepLink();
     if (can('alertrule.read')) loadEventRules();
     clearInterval(timer);
-    timer = setInterval(() => refresh({ onlyShown: true }), 10_000);
+    timer = setInterval(refreshTick, 10_000);
 }
 
 // Back to a tab that stopped refreshing while hidden: everything, now.

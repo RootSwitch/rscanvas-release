@@ -493,9 +493,15 @@ control<FrontierState | null>(
 // branched on overThresholdCount while the guard beside it validated
 // worstGapMs. A payload with a good worstGapMs and no overThresholdCount passed
 // both and reported every thread within threshold.
+//
+// Since 2026-10-02 the verdict reads `recent`, the last fifteen minutes, and
+// the since-start fields are display: corrupting them must change NOTHING
+// (the latch control below), and corrupting `recent` must flip it.
+const win = (ticks: number, worstGapMs: number, overThresholdCount: number): HeartbeatStats['recent'] =>
+    ({ windowMs: 15 * 60_000, ticks, worstGapMs, overThresholdCount });
 const healthyThread: HeartbeatStats = {
-    thread: 'ingest', ticks: 1000, worstGapMs: 12, p50GapMs: 10, p99GapMs: 11,
-    thresholdMs: 50, overThresholdCount: 0,
+    thread: 'ingest', ticks: 1000, worstGapMs: 12, worstGapAt: null, p50GapMs: 10, p99GapMs: 11,
+    thresholdMs: 50, overThresholdCount: 0, recent: win(1000, 12, 0),
 };
 control<HeartbeatStats[]>(
     'HeartbeatStats',
@@ -503,27 +509,68 @@ control<HeartbeatStats[]>(
     (ts) => isHeartbeatHealthy(ts),
     [
         {
-            field: 'overThresholdCount', mode: 'ABSENT',
+            field: 'recent', mode: 'ABSENT',
             corrupt: ([t]) => {
-                const { overThresholdCount: _drop, ...rest } = t as HeartbeatStats;
+                const { recent: _drop, ...rest } = t as HeartbeatStats;
                 return [rest as HeartbeatStats];
             },
-            names: /overThresholdCount/,
+            names: /no usable recent window/,
         },
         {
-            field: 'overThresholdCount', mode: 'WRONG',
+            field: 'recent.overThresholdCount', mode: 'ABSENT',
+            corrupt: ([t]) => {
+                const { overThresholdCount: _drop, ...rest } = (t as HeartbeatStats).recent;
+                return [{ ...(t as HeartbeatStats), recent: rest as HeartbeatStats['recent'] }];
+            },
+            names: /no usable recent window/,
+        },
+        {
+            field: 'recent.ticks', mode: 'WRONG',
+            corrupt: ([t]) => [{ ...(t as HeartbeatStats), recent: { ...(t as HeartbeatStats).recent, ticks: NaN } }],
+            names: /no usable recent window/,
+        },
+        {
+            field: 'recent.overThresholdCount', mode: 'WRONG',
             // SUSTAINED: 70 of 1000 ticks is 7%, far past the 0.1% rate.
-            corrupt: ([t]) => [{ ...(t as HeartbeatStats), overThresholdCount: 70, worstGapMs: 210 }],
+            corrupt: ([t]) => [{ ...(t as HeartbeatStats), recent: win(1000, 210, 70) }],
             names: /sustained past/,
         },
         {
-            field: 'worstGapMs', mode: 'WRONG',
+            field: 'recent.worstGapMs', mode: 'WRONG',
             // ACUTE: one gap over 500ms is a real stall whatever the rate.
-            corrupt: ([t]) => [{ ...(t as HeartbeatStats), worstGapMs: 900, overThresholdCount: 1 }],
-            names: /stalled 900ms in one tick/,
+            corrupt: ([t]) => [{ ...(t as HeartbeatStats), recent: win(1000, 900, 1) }],
+            names: /stalled 900ms in one tick in the last 15 min/,
         },
     ],
 );
+
+// --- THE LATCH (production, 2026-10-02) ---------------------------------------
+//
+// The acute bound read the since-start maximum, which never falls: a 06:00
+// backup on the VM host held polls up to 2.2 s and health stayed red until a
+// restart. A stall that left the window must read healthy, its record kept;
+// and a bad quarter-hour after a month of clean uptime must still fail,
+// which the since-start rate diluted below the bound.
+{
+    const morningAfter: HeartbeatStats = {
+        ...healthyThread, thread: 'collector', ticks: 1_700_000, worstGapMs: 2213,
+        worstGapAt: '2026-10-02T11:00:41.000Z', overThresholdCount: 40, recent: win(90_000, 31, 0),
+    };
+    const v = isHeartbeatHealthy([morningAfter]);
+    if (v.healthy) ok('a 2,213 ms stall that has left the window is healthy - the old bound held it forever');
+    else bad('a stall outside the window still fails health', v);
+
+    const lateBadDay: HeartbeatStats = {
+        ...healthyThread, thread: 'collector', ticks: 260_000_000, worstGapMs: 180,
+        overThresholdCount: 9_000, recent: win(90_000, 180, 900),
+    };
+    const v2 = isHeartbeatHealthy([lateBadDay]);
+    if (!v2.healthy && /collector is over 50ms on 1\.00% of ticks in the last 15 min/.test(v2.problem)) {
+        ok('1% of ticks stalling now FAILS after a month of uptime - since start it read 0.003%');
+    } else {
+        bad('a bad quarter-hour was diluted by uptime', v2);
+    }
+}
 
 // --- AND THE THREE PROPERTIES THE PORTED METRIC GOT WRONG ---------------------
 //
@@ -535,8 +582,8 @@ control<HeartbeatStats[]>(
 // 503 permanently.
 {
     const busyJobs: HeartbeatStats = {
-        thread: 'jobs', ticks: 60_000, worstGapMs: 115, p50GapMs: 10, p99GapMs: 60,
-        thresholdMs: 50, overThresholdCount: 509,
+        thread: 'jobs', ticks: 60_000, worstGapMs: 115, worstGapAt: null, p50GapMs: 10, p99GapMs: 60,
+        thresholdMs: 50, overThresholdCount: 509, recent: win(60_000, 115, 509),
     };
     const v = isHeartbeatHealthy([healthyThread, busyJobs]);
     if (v.healthy) {
@@ -549,8 +596,8 @@ control<HeartbeatStats[]>(
     // nothing resets it, so "any tick ever" degrades permanently on the first
     // transient. One 150ms blip in twenty minutes must stay healthy.
     const oneBlip: HeartbeatStats = {
-        thread: 'ingest', ticks: 120_000, worstGapMs: 151, p50GapMs: 10, p99GapMs: 11,
-        thresholdMs: 50, overThresholdCount: 1,
+        thread: 'ingest', ticks: 120_000, worstGapMs: 151, worstGapAt: null, p50GapMs: 10, p99GapMs: 11,
+        thresholdMs: 50, overThresholdCount: 1, recent: win(90_000, 151, 1),
     };
     const v2 = isHeartbeatHealthy([oneBlip]);
     if (v2.healthy) {
@@ -562,8 +609,8 @@ control<HeartbeatStats[]>(
     // And the negative control on the same axis: a LATENCY-SENSITIVE thread
     // stalling constantly must still fail, or the loosening went too far.
     const stalling: HeartbeatStats = {
-        thread: 'collector', ticks: 10_000, worstGapMs: 120, p50GapMs: 10, p99GapMs: 90,
-        thresholdMs: 50, overThresholdCount: 800,
+        thread: 'collector', ticks: 10_000, worstGapMs: 120, worstGapAt: null, p50GapMs: 10, p99GapMs: 90,
+        thresholdMs: 50, overThresholdCount: 800, recent: win(10_000, 120, 800),
     };
     const v3 = isHeartbeatHealthy([stalling]);
     if (!v3.healthy && /collector/.test(v3.problem ?? '')) {

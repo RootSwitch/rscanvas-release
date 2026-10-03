@@ -23,7 +23,7 @@ and the instruments that produced every number are in `tools/`.
 - **A daily fault window** (`tools/soak-fault.sh`): a slice of the fleet
   taken away for ten minutes each night, so alerting and recovery are
   exercised every day of a run rather than assumed.
-- **The offline suite** (`npm test`): fifty-six test files and sixteen
+- **The offline suite** (`npm test`): fifty-seven test files and sixteen
   static checkers that hold invariants the reviews kept finding one instance
   at a time - every query on a declared lane, no DOM injection sinks, no
   duplicate SQL definitions, every worker message type with a sender, and
@@ -108,6 +108,22 @@ fix, on the Ryzen box above unless it says otherwise.
 | a board after retagging | a board generated from a location reports one missing and one moved away when devices change location, and its add and drop actions bring it back to none of either |
 | the database itself | on a disposable database with the full schema: retention picks the same UTC days from sessions in UTC+14 and UTC-11, the rollup writes whole hours and the Dashboard weights them by readings (150, not the 250 of a mean of means), event alerts fold, keep their severity and are born again after clearing, and every installed function is its newest definition (`tools/test-scratch-db.ts`, `tools/test-apply-convergence.ts`) |
 | interface tracking | on the operator's network 232 untracked interfaces were sampled every poll beside 104 tracked ones, and five tracked Wi-Fi and tunnel interfaces had never been read. After the fix, no untracked rows, and the five started recording |
+
+## Since the fifth alpha: the installer end to end, and the passwords
+
+Run 2026-10-02 and 10-03 on two clean Ubuntu 24.04 VMs and the lab boxes,
+for the installer changes behind the sixth alpha.
+
+| measurement | what it found |
+|---|---|
+| the build an outsider makes | the public tree, cloned on a Linux box, `npm ci`, `tools/make-bundle.sh`: the three scripts executable, no carriage returns, the dependency audit clean, 1,133 entries |
+| a fresh install from that bundle | on a VM reverted to its factory snapshot: every step through, the three roles created through stdin (the owner without a login, the application and maintenance roles with passwords, maintenance a member of the owner), the service up with no restarts, health 200, sign-in working, and no password on any line sudo logged or the journal kept |
+| `--rotate-db-passwords` | on the fresh box and on an upgraded one: the three env values and both roles' stored passwords changed, each role signed in with its new one, the service back at once; a planted refusal of the second change put the env file back byte for byte with no restart; nothing password-bearing in sudo's log |
+| backup, rotate, restore, rotate | restoring a backup taken before a rotation brought the old passwords back, as INSTALL.md says, and the service with them; rotating again gave new ones. The backup, written into an existing 1777 directory, left it 1777 and wrote the archive 0600 |
+| `--uninstall --purge` beside lookalikes | with `rscanvas_pre_restore_x postgres`, a prefix-only name and a set-aside directory with a space beside a real copy: the install and the real copy gone, `postgres` and every lookalike kept and named. The first run's own verify step still used the old prefix match and failed a correct purge; fixed and re-run clean |
+| the installer's flags | `--user root`, `--user` naming a person's account, `--dir /`, `--db postgres` and `--http-port 0` refused on an installed box before any change; root's home and `/etc/passwd` untouched |
+| health's 15-minute window at 30k | 21 hours, 253 samples, nothing red but the 15 minutes after a deliberate 1.5-second pause of the whole process |
+| the collector's failure log at 30k | 20 lines in the ten minutes before the change, from devices dead by design; none in the nine after, the same devices still failing every 30 seconds |
 
 ## What was not tested
 

@@ -377,3 +377,108 @@ export function normalizeProbeRequest(
         },
     };
 }
+
+/**
+ * THE TWO ONBOARDING CHOICES (2026-10-02, the operator's SolarWinds
+ * comparison): which interfaces to track, and whether link-down alerts start
+ * on. Before them a switch onboarded with every ethernet port tracked AND
+ * alerting, so each idle-but-enabled access port raised a crit on the first
+ * scans - fine on a lab where unused ports are shut, unpleasant anywhere else.
+ *
+ *   track         'all'     today's discovery rule (oids.ts defaultTracked)
+ *                 'active'  that rule AND oper up when probed
+ *   linkDown      'on'      link down alerts on every tracked port (today)
+ *                 'manual'  a device-wide link-down mute, written at add; the
+ *                           operator turns ports on one by one, and a
+ *                           per-port override outranks the device's
+ *
+ * Absent means today's behaviour, so an older client or a script that never
+ * heard of the choices gets exactly what it got before. A value that is
+ * neither is refused, not defaulted: a typo in "manual" must not quietly
+ * arm every port on a 48-port switch.
+ */
+export type TrackChoice = 'all' | 'active';
+export type LinkDownChoice = 'on' | 'manual';
+export interface OnboardChoices { track: TrackChoice; linkDown: LinkDownChoice }
+
+export function parseOnboardChoices(
+    body: Record<string, unknown>,
+): { ok: true; choices: OnboardChoices } | { ok: false; detail: string } {
+    const track = body.track ?? 'all';
+    const linkDown = body.linkDownAlerts ?? 'on';
+    if (track !== 'all' && track !== 'active') {
+        return { ok: false, detail: 'track must be "all" or "active"' };
+    }
+    if (linkDown !== 'on' && linkDown !== 'manual') {
+        return { ok: false, detail: 'linkDownAlerts must be "on" or "manual"' };
+    }
+    return { ok: true, choices: { track, linkDown } };
+}
+
+/** ifOperStatus up(1). Everything else - down, dormant, notPresent,
+ *  lowerLayerDown, testing - is not carrying traffic now. */
+const OPER_UP = 1;
+/** unknown(4) is the agent saying it cannot tell, which is no answer. */
+const OPER_UNKNOWN = 4;
+
+/**
+ * Is this probed entity tracked, under the operator's choice?
+ *
+ * 'active' only ever UNTICKS, and only on an explicit answer: an interface
+ * the default rule leaves untracked stays untracked, a sensor is not an
+ * interface and is untouched, and an interface whose agent gave no status
+ * (or said unknown) keeps the default. Same safety property as
+ * defaultTracked's connector test - only an explicit "not up" removes a
+ * port, so an agent that skips ifOperStatus loses nothing.
+ */
+export function trackedFor(
+    e: { kind?: unknown; tracked?: unknown; operStatus?: unknown },
+    choice: TrackChoice,
+): boolean {
+    const base = e.tracked === true;
+    if (!base || choice === 'all' || String(e.kind ?? 'if') !== 'if') return base;
+    const oper = typeof e.operStatus === 'number' ? e.operStatus : null;
+    if (oper === null || oper === OPER_UNKNOWN) return base;
+    return oper === OPER_UP;
+}
+
+/**
+ * SENSORS THE AGENT NO LONGER SERVES (2026-10-02, the operator's GPU swap on
+ * the operator desktop: an RTX 5090 out, a 7900 XTX in, and "Util: fan-GPU0" left
+ * polling nothing). Rediscover only ever ADDED, so a sensor whose hardware
+ * left stayed tracked with no reading forever; SNMPCanvas's rediscover cleared
+ * it, and the operator expected the same.
+ *
+ * GONE NEEDS TWO WITNESSES. Absent from this probe alone is not enough:
+ * sensor discovery skips a section silently when a walk fails, so a flaky
+ * answer would read as every sensor in that section leaving. A sensor is
+ * untracked only when the probe did not list it AND its regular poll has no
+ * reading now. One that is unlisted but still reads is named and left
+ * alone. Interfaces are not judged here - absence is the rekey planner's and
+ * the stale stamp's business for them. Untracking keeps the history, and a
+ * tick on the device page undoes it.
+ */
+export interface ExistingSensor {
+    code: string;
+    name: string;
+    kind: string;
+    snmp_index: string | null;
+    tracked: boolean;
+    lv_v0: number | null;
+}
+
+export function goneSensors(
+    existing: ExistingSensor[],
+    probed: Array<{ kind?: unknown; snmpIndex?: unknown }>,
+): { untrack: ExistingSensor[]; stillAnswering: ExistingSensor[] } {
+    const listed = new Set(probed.map((e) => `${String(e.kind ?? 'if')} ${String(e.snmpIndex)}`));
+    const untrack: ExistingSensor[] = [];
+    const stillAnswering: ExistingSensor[] = [];
+    for (const s of existing) {
+        if (s.kind === 'if' || !s.tracked || s.snmp_index === null) continue;
+        if (listed.has(`${s.kind} ${s.snmp_index}`)) continue;
+        if (s.lv_v0 === null) untrack.push(s);
+        else stillAnswering.push(s);
+    }
+    return { untrack, stillAnswering };
+}

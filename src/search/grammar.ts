@@ -111,16 +111,23 @@ export function parseWhen(s: string): Date | null {
     return d;
 }
 
-/** sev:<=3 / sev:err / fac:local0 -> { op, value }, or null when unparseable. */
-function parseLeveled(value: string, names: Record<string, number>): { op: Cmp; value: number } | null {
+/**
+ * sev:<=3 / sev:err / fac:local0 -> { op, value }, or null when unparseable.
+ *
+ * IN RANGE OR NOT A LEVEL (2026-10-03, review L16): any digit string was
+ * accepted, so sev:<=99999 reached a smallint column and came back as a 500.
+ * A number past the scale - severities 0-7, facilities 0-23 - is not a level,
+ * so it is search text like any other token the grammar cannot digest.
+ */
+function parseLeveled(value: string, names: Record<string, number>, max: number): { op: Cmp; value: number } | null {
     const m = /^(<=|>=|<|>)?(.+)$/.exec(value);
     if (!m) return null;
     const op = (m[1] ?? '=') as Cmp;
     const word = (m[2] as string).toLowerCase();
     const n = names[word] !== undefined
         ? names[word]
-        : (/^\d+$/.test(word) ? parseInt(word, 10) : null);
-    return n === null || n === undefined ? null : { op, value: n };
+        : (/^\d{1,3}$/.test(word) ? parseInt(word, 10) : null);
+    return n === null || n === undefined || n > max ? null : { op, value: n };
 }
 
 /**
@@ -144,7 +151,11 @@ export function parseIpValue(value: string): string | null {
     const slash = value.indexOf('/');
     if (slash > 0) {
         const addr = value.slice(0, slash);
-        const bits = Number(value.slice(slash + 1));
+        // DIGITS ONLY (review L16): Number() also takes "0x18", "1e1", " 24"
+        // and "" - the last as 0 - and the string went to ::inet verbatim,
+        // so 10.0.0.0/0x18 passed here and failed there as a 500.
+        const rawBits = value.slice(slash + 1);
+        const bits = /^\d{1,3}$/.test(rawBits) ? Number(rawBits) : NaN;
         const fam = net.isIP(addr);
         if (fam === 4 && Number.isInteger(bits) && bits >= 0 && bits <= 32) return value;
         if (fam === 6 && Number.isInteger(bits) && bits >= 0 && bits <= 128) return value;
@@ -202,11 +213,11 @@ export function tokenToClause(token: string): Clause {
                 // Unparseable: falls through to free text below.
             }
             if (key === 'sev' || key === 'severity') {
-                const lv = parseLeveled(value, SEVERITIES);
+                const lv = parseLeveled(value, SEVERITIES, 7);
                 if (lv) return { kind: 'severity', op: lv.op, value: lv.value, negate };
             }
             if (key === 'fac' || key === 'facility') {
-                const lv = parseLeveled(value, FACILITIES);
+                const lv = parseLeveled(value, FACILITIES, 23);
                 if (lv) return { kind: 'facility', op: lv.op, value: lv.value, negate };
             }
             if (key === 'proto') {

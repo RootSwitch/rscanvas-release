@@ -32,11 +32,12 @@ import { dispatchEvent, retryPass, flushDigests } from '../alerts/notify.ts';
 import { NotifyBudget } from '../alerts/notify-budget.ts';
 import { serial } from './serial.ts';
 import type { FrontierState, JobsStats } from './protocol.ts';
+import { safeLogArgs } from '../logsafe.ts';
 
 const hb = startHeartbeat('jobs', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdMs);
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[jobs]', ...args);
+    console.log(new Date().toISOString(), '[jobs]', ...safeLogArgs(args));
 }
 
 let asyncErrors = 0;

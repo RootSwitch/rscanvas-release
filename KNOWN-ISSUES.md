@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.5
+# Known issues, as of 0.1.0-alpha.6
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30 and 2026-10-01 for the second to the fifth. Everything here is
+2026-09-30, 2026-10-01 and 2026-10-03 for the second to the sixth. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
@@ -50,6 +50,21 @@ what each alpha fixed.
 - **A traffic report covers an interface's tracked history only.** An
   interface the discovery defaults leave untracked (some sub-interface
   types) has none until it is tracked.
+- **"Active ports only" is decided once, when a device is added**
+  (2026-10-02). Ports that appear later, a Rediscover, and a device added
+  before it ever answered are tracked by the usual discovery rule; a port
+  is ticked or unticked by hand on the device page after that.
+- **Manual link-down alerts are set one device at a time**, at the add
+  step or in the device's Modify block; there is no roster-wide switch. It
+  covers link down only - errors, discards and utilization still alert on
+  every tracked port. Switching a device back to "on" leaves the ports
+  that were turned on with their own setting, which then says the same as
+  the device's.
+- **A stall shows on the health page for fifteen minutes** (2026-10-02).
+  The heartbeat verdict judges the last fifteen minutes, so a VM paused by
+  its host - a nightly backup, say - reads red for a quarter of an hour
+  after each pause and then clears; the worst stall since start, and when,
+  stays in the thread table. Before, one stall held it red until a restart.
 
 ## Findings still open
 
@@ -64,8 +79,18 @@ what each alpha fixed.
 ## Security findings still open
 
 From the 2026-09-30 review. The ones a single packet or request could use
-are fixed (`CHANGELOG.md`, Unreleased); these remain, and each needs a
+are fixed (`CHANGELOG.md`, 0.1.0-alpha.5); these remain, and each needs a
 decision or a drill before it is changed.
+
+- **Database passwords from earlier installs are in the system's logs.**
+  Before 0.1.0-alpha.6 the installer put both database passwords on a command
+  line - `psql -c "... PASSWORD '...'"` and the schema step's admin URL - so
+  every install and upgrade wrote them into sudo's log (`/var/log/auth.log`
+  and the journal, readable by root and the `adm` group) and showed them in
+  `ps` while it ran. The installer now passes them on stdin and in the
+  environment, but the lines already written stay until the logs rotate.
+  Changing the two passwords after upgrading turns them into dead text:
+  `sudo ./rscanvas-setup.sh --rotate-db-passwords` (INSTALL.md, section 4).
 
 - **The service holds the raw-socket capability**, for `fping`. Under the
   unit's `NoNewPrivileges` a program cannot gain a capability its parent

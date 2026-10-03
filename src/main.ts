@@ -39,14 +39,14 @@ import { compileRule } from './alerts/events.ts';
 import {
     suggestLocations, selectForAdd, selectForForce, locationAssignments,
     normalizeProbeRequest, probedName, addOutcome, normalizeExplicitName, probeStanding,
-    standingFields,
+    standingFields, parseOnboardChoices, trackedFor, goneSensors,
 } from './devices/onboard.ts';
 import { encrypt, decrypt, credentialStoreReady, CredentialKeyMissing } from './credentials/crypto.ts';
 import { validateProfile, isPermittedEnvRef, type ProfileView } from './credentials/profiles.ts';
 import { loadRulesConfig } from './alerts/scan.ts';
 import { mergeOverrides } from './alerts/overrides.ts';
 import { GROUP_KIND, parseGroupKey } from './alerts/groups.ts';
-import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS } from './alerts/rules.ts';
+import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS, BOOL_RULE_KINDS } from './alerts/rules.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
 import { parseSourceDeclaration, sameCoverage } from './boards/source.ts';
@@ -73,6 +73,7 @@ import {
     DASHBOARD_WINDOWS, parseWindowHours, bytesFromHourlyBps, countFromHourlyRate, coverage, trend,
     reportLines, reportCsv, isDay, isTimeZone,
 } from './reports/traffic.ts';
+import { safeLogArgs } from './logsafe.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const STARTED = Date.now();
@@ -120,7 +121,7 @@ const hb = startHeartbeat('main', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdM
 installSafetyNet({ thread: 'main' });
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[main]', ...args);
+    console.log(new Date().toISOString(), '[main]', ...safeLogArgs(args));
 }
 
 // --- ingest worker -----------------------------------------------------------
@@ -552,7 +553,7 @@ function filtersFrom(window: { from: Date; to: Date }, params: URLSearchParams):
     return {
         from: window.from,
         to: window.to,
-        ...(params.get('host') !== null ? { host: params.get('host') as string } : {}),
+        ...(filterParam(params, 'host') !== null ? { host: params.get('host') as string } : {}),
         // THE SAME NORMALIZER THE ip: CLAUSE USES, not a raw pass to ::inet.
         // The fielded filter panel exists so an operator does not have to know
         // the grammar, and it would be a poor trade if the field were WEAKER
@@ -560,13 +561,15 @@ function filtersFrom(window: { from: Date; to: Date }, params: URLSearchParams):
         // `10.0.0.` has to work in the box's replacement. Raw, it reaches
         // Postgres as an invalid inet literal and comes back a 503 - the
         // database blamed for a UI that promised a format it did not accept.
-        // Unparseable values are rejected up front by validateFilters below.
-        ...(params.get('sourceIp') !== null
+        // Unparseable values are rejected up front by ipParamError and
+        // numParamError, which every caller runs before this; empty ones are
+        // absent (filterParam).
+        ...(filterParam(params, 'sourceIp') !== null
             ? { sourceIp: parseIpValue(params.get('sourceIp') as string) ?? params.get('sourceIp') as string }
             : {}),
-        ...(params.get('app') !== null ? { app: params.get('app') as string } : {}),
-        ...(params.get('facility') !== null ? { facility: Number(params.get('facility')) } : {}),
-        ...(params.get('severityAtMost') !== null ? { severityAtMost: Number(params.get('severityAtMost')) } : {}),
+        ...(filterParam(params, 'app') !== null ? { app: params.get('app') as string } : {}),
+        ...(filterParam(params, 'facility') !== null ? { facility: Number(params.get('facility')) } : {}),
+        ...(filterParam(params, 'severityAtMost') !== null ? { severityAtMost: Number(params.get('severityAtMost')) } : {}),
         // `q` is the SEARCH BOX: it goes through the grammar, so a query can
         // express host~, ip:, sev:<=3, negation and quoted phrases. `fragment`
         // stays as the plain-substring parameter for callers that mean exactly
@@ -574,7 +577,7 @@ function filtersFrom(window: { from: Date; to: Date }, params: URLSearchParams):
         // want no parsing between them and the predicate).
         ...(params.get('q') !== null ? { clauses: parseQuery(params.get('q') as string) } : {}),
         ...(params.get('fragment') !== null ? { fragment: params.get('fragment') as string } : {}),
-        ...(params.get('limit') !== null ? { limit: Number(params.get('limit')) } : {}),
+        ...(filterParam(params, 'limit') !== null ? { limit: Number(params.get('limit')) } : {}),
     };
 }
 
@@ -607,7 +610,27 @@ function numParamError(params: URLSearchParams): string | null {
             return `"${raw}" is not a number for ${name}`;
         }
     }
+    // ON THE SCALE (review L16): a finite number was enough, so
+    // severityAtMost=99999 reached a smallint and failed there as a 500.
+    for (const [name, max] of [['facility', 23], ['severityAtMost', 7]] as const) {
+        const raw = params.get(name);
+        if (raw === null || raw.trim() === '') continue;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 0 || n > max) return `${name} is a whole number from 0 to ${max}, got "${raw}"`;
+    }
     return null;
+}
+
+/**
+ * A filter parameter, with an EMPTY value read as absent (review L16). An
+ * empty form field arrives as `name=`, and was taken at its word: sourceIp=
+ * became ''::inet and a 500, facility= became Number('') - facility 0,
+ * kern, silently filtering for it. Both checks above already skipped empty
+ * values; the builder below now agrees with them.
+ */
+function filterParam(params: URLSearchParams, name: string): string | null {
+    const v = params.get(name);
+    return v === null || v.trim() === '' ? null : v;
 }
 
 async function search(res: http.ServerResponse, params: URLSearchParams): Promise<void> {
@@ -1001,7 +1024,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                 sendJson(res, 401, { ok: false, detail: 'metrics needs `authorization: Bearer <METRICS_TOKEN>`' });
                 return;
             }
-            const threads: Array<{ thread: string; worstGapMs: number; p99GapMs: number; overThresholdCount: number }> = [hb.stats()];
+            const threads: HeartbeatStats[] = [hb.stats()];
             if (ingestStats) threads.push(ingestStats.heartbeat);
             if (collectorStats) threads.push(collectorStats.heartbeat);
             if (jobsStats) threads.push(jobsStats.heartbeat);
@@ -1035,7 +1058,13 @@ const server = createWebServer(tlsPair, (req, res) => {
             return;
         }
 
-        const principal: Principal = await auth.validateSession(auth.tokenFromRequest(req));
+        const sessionToken = auth.tokenFromRequest(req);
+        const principal: Principal = await auth.validateSession(sessionToken, () => {
+            // The row slid, so the cookie slides with it (review L1). Set as a
+            // header now; the route's own writeHead merges with it, and
+            // logout's cookie-clearing header replaces it.
+            if (sessionToken) res.setHeader('set-cookie', auth.sessionCookie(sessionToken));
+        });
 
         if (path === '/api/logout') {
             if (method !== 'POST') { sendJson(res, 405, { ok: false, detail: 'POST only' }); return; }
@@ -1699,10 +1728,22 @@ const server = createWebServer(tlsPair, (req, res) => {
                 sendJson(res, 400, { ok: false, detail: 'warn and crit must be numbers, or absent' }); return;
             }
             const enabled = body.enabled !== false;
+            // A YES/NO RULE HAS NO LEVELS, so for link down and device down
+            // an enabled override is simply "on" - the way a port alerts
+            // under a device-wide mute (manual link-down, 2026-10-02). This
+            // check used to refuse it, which left the engine's per-port
+            // enable unreachable. Levels sent for one are refused rather than
+            // stored, because the engine would ignore them and the list would
+            // show numbers that do nothing.
+            const yesNo = BOOL_RULE_KINDS.has(kind);
+            if (yesNo && (warn !== null || crit !== null)) {
+                sendJson(res, 400, { ok: false, detail: `${kind} is on or off - it takes no warn or crit level` });
+                return;
+            }
             // An ENABLED override with no levels at all would replace the
             // default with nothing - which is a mute wearing the wrong name.
             // Say what you mean: enabled:false.
-            if (enabled && warn === null && crit === null) {
+            if (!yesNo && enabled && warn === null && crit === null) {
                 sendJson(res, 400, { ok: false, detail: 'an enabled override needs a warn or a crit level - to suspend the rule instead, send enabled:false' });
                 return;
             }
@@ -1715,7 +1756,8 @@ const server = createWebServer(tlsPair, (req, res) => {
             sendJson(res, 200, {
                 ok: true, id: w.rows[0]?.id,
                 detail: enabled
-                    ? `${target}: warn ${warn ?? '-'} / crit ${crit ?? '-'} - live on the next scan`
+                    ? (yesNo ? `${target}: alerting on - live on the next scan`
+                        : `${target}: warn ${warn ?? '-'} / crit ${crit ?? '-'} - live on the next scan`)
                     : `${target}: rule suspended - live on the next scan`,
             });
             return;
@@ -1848,6 +1890,12 @@ const server = createWebServer(tlsPair, (req, res) => {
             // what applies without a second fetch. Null when resolution
             // failed - the form then opens blank, which is still correct.
             let ifRuleDefaults: Record<string, { warn: number | null; crit: number | null } | null> | null = null;
+            // THE DEVICE'S LINK-DOWN SETTING (manual link-down, 2026-10-02):
+            // what governs a port with no override of its own, resolved by
+            // the engine's resolver with no code, plus the id of this
+            // device's own row so the page can switch it back. Null when
+            // resolution failed - the page then offers no switch.
+            let linkDown: { source: string; muted: boolean; deviceRowId: string | null } | null = null;
             try {
                 let cfg = loadRulesConfig();
                 const orows = await OPS.thresholdOverrides('interactive');
@@ -1858,6 +1906,10 @@ const server = createWebServer(tlsPair, (req, res) => {
                     'if-discards': cfg.ifRules.discards ?? null,
                     'if-util': cfg.ifRules.util ?? null,
                 };
+                const ld = resolveRuleInfo(idx, cfg, 'if-down', null, name);
+                const own = orows.ok
+                    ? orows.rows.find((o) => o.kind === 'if-down' && o.host === name && o.code === null) : undefined;
+                linkDown = { source: ld.source, muted: ld.muted, deviceRowId: own?.id ?? null };
                 // The collector-to-engine kind rename, the same one
                 // alertScanSensors makes in SQL and the POST route makes on
                 // write. Three sites is two too many; if a third kind ever
@@ -1911,7 +1963,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             const availRow = avail.ok ? avail.rows[0] : undefined;
             const probes = Number(availRow?.probes ?? 0);
             sendJson(res, 200, {
-                ok: true, device: name, entities, ifRuleDefaults,
+                ok: true, device: name, entities, ifRuleDefaults, linkDown,
                 entitiesCapped: rows.rows.length >= UI_DEVICE_ENTITY_CAP,
                 availability24h: probes > 0
                     ? { probes, misses: Number(availRow?.misses ?? 0) }
@@ -2147,6 +2199,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             const takenCodes = new Set(taken.rows.map((t) => t.code));
 
             const report: Array<Record<string, unknown>> = [];
+            const untrackedGone: string[] = [];
             for (const d of found.rows) {
                 const r = probed.find((p) => String(p.host) === d.host);
                 if (r === undefined || r.ok !== true) {
@@ -2177,6 +2230,31 @@ const server = createWebServer(tlsPair, (req, res) => {
                     if (created.ok && created.rows.length > 0) added.push(String(e.name));
                 }
 
+                // SENSORS THE AGENT NO LONGER SERVES (onboard.ts goneSensors):
+                // unlisted by this probe AND no reading from the poll - two
+                // witnesses, because a walk that fails skips its section
+                // silently. Untracked with history kept, and named; one that
+                // is unlisted but still reads is named and left tracked.
+                // Plain Rediscover does this, not only the reset: the reset
+                // also returns every port to policy, a big hammer for a dead
+                // fan reading.
+                let goneUntracked: string[] = [];
+                let goneAnswering: string[] = [];
+                // WRITE-IN-LOOP-OK: a READ, one per device an operator named.
+                const cur = await OPS.deviceSensorsForRediscover(d.id);
+                if (cur.ok) {
+                    const g = goneSensors(cur.rows, ents);
+                    goneAnswering = g.stillAnswering.map((s) => s.name);
+                    if (g.untrack.length > 0) {
+                        // WRITE-IN-LOOP-OK: one statement per DEVICE (the
+                        // codes unnest inside the UPDATE), over devices an
+                        // operator named; nothing is written when none left.
+                        const t = await OPS.setEntitiesTrackedByCode(
+                            d.id, g.untrack.map((s) => s.code), g.untrack.map(() => false));
+                        if (t.ok) goneUntracked = t.rows.map((x) => x.name);
+                    }
+                }
+
                 let moved: Array<{ name: string; tracked: boolean }> = [];
                 if (retrack && ents.length > 0) {
                     // WRITE-IN-LOOP-OK: one statement per DEVICE, not per
@@ -2201,11 +2279,15 @@ const server = createWebServer(tlsPair, (req, res) => {
                     // somebody hunting for which nine.
                     stoppedTracking: moved.filter((m) => !m.tracked).map((m) => m.name),
                     startedTracking: moved.filter((m) => m.tracked).map((m) => m.name),
+                    goneUntracked,
+                    goneAnswering,
                 });
+                for (const n of goneUntracked) untrackedGone.push(`${d.name}: ${n}`);
             }
 
             await auth.audit(principal, 'device.rediscover',
-                `${found.rows.length} device(s)`, { retrack }, inetOrNull(clientIp(req)));
+                `${found.rows.length} device(s)`,
+                { retrack, ...(untrackedGone.length > 0 ? { untrackedGone } : {}) }, inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, retrack, missing, devices: report });
             return;
         }
@@ -2596,6 +2678,9 @@ const server = createWebServer(tlsPair, (req, res) => {
                     sensors: Array.isArray(r.entities)
                         ? (r.entities as Array<{ kind?: string }>).filter((e) => e.kind !== 'if').length : 0,
                     tracked: r.trackedCount ?? 0,
+                    // What "active ports only" would keep, so the choice is
+                    // made against a number rather than a guess.
+                    trackedUp: r.trackedUpCount ?? 0,
                     ...standingFields(probeStanding(probedName(r), String(r.host), port, known.rows)),
                     error: r.error,
                     errorKind: r.errorKind,
@@ -2621,6 +2706,22 @@ const server = createWebServer(tlsPair, (req, res) => {
                     reason: 'probe-expired',
                     detail: 'that probe has expired or was never made - run the probe again. '
                         + 'A device can only be added from a probe that answered.',
+                });
+                return;
+            }
+            // THE TWO CHOICES (src/devices/onboard.ts): track all ports or
+            // the active ones, and link-down alerts on or manual. Refused
+            // before anything is written, and manual needs the right to
+            // write alert rules, because that is what it writes - an add
+            // must not be a side door to muting.
+            const parsedChoices = parseOnboardChoices(body);
+            if (!parsedChoices.ok) { sendJson(res, 400, { ok: false, detail: parsedChoices.detail }); return; }
+            const choices = parsedChoices.choices;
+            if (choices.linkDown === 'manual' && !authorize(principal, 'alertrule.write').allowed) {
+                sendJson(res, 403, {
+                    ok: false,
+                    detail: 'manual link-down alerts writes an alert rule, which this account may not - '
+                        + 'add with link-down alerts on, or ask an admin',
                 });
                 return;
             }
@@ -2751,7 +2852,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                         ents.map((e) => (e.descr ?? null) as string | null),
                         ents.map((e) => (e.alias ?? null) as string | null),
                         ents.map((e) => (e.speedBps ?? null) as number | null),
-                        ents.map((e) => e.tracked === true),
+                        ents.map((e) => trackedFor(e, choices.track)),
                         ents.map((e) => mint(name, String(e.name))),
                         ents.map((e) => (e.extra ? JSON.stringify(e.extra) : null)),
                         );
@@ -2881,10 +2982,29 @@ const server = createWebServer(tlsPair, (req, res) => {
                 if (t.ok) taggedApp = t.rowCount;
             }
 
+            // MANUAL LINK-DOWN: one device-wide mute per device this request
+            // created, in one statement. AFTER the inserts and only for names
+            // that were added, so a refused collision cannot mute the
+            // incumbent that owns the name. The window between the insert and
+            // this write is harmless: the scan reads only polled devices, and
+            // a raise needs consecutive scans. A refused write leaves the
+            // devices added with alerts ON, and the report says so - the
+            // loud failure, not the quiet one.
+            const created = [...new Set([...added, ...forced])];
+            let linkDownManual: string[] = [];
+            let linkDownRefused: string | null = null;
+            if (choices.linkDown === 'manual' && created.length > 0) {
+                const m = await OPS.muteLinkDownForDevices(created, 'link-down alerts manual, chosen at onboarding');
+                if (m.ok) linkDownManual = m.rows.map((r) => r.host);
+                else linkDownRefused = `link-down alerts are ON for these devices - the mute was refused (${m.reason})`;
+            }
+
             await auth.audit(principal, 'device.create', `${added.length + forced.length} device(s)`,
                 {
                     added, skipped: skipped.length, tagged, collisions: collisions.length,
-                    nameCollisions,
+                    nameCollisions, track: choices.track, linkDownAlerts: choices.linkDown,
+                    ...(linkDownManual.length > 0 ? { linkDownManual } : {}),
+                    ...(linkDownRefused !== null ? { linkDownRefused } : {}),
                     ...(forced.length > 0 ? { forced } : {}),
                     ...(application !== null ? { application, taggedApp } : {}),
                 },
@@ -2894,7 +3014,10 @@ const server = createWebServer(tlsPair, (req, res) => {
             // two different defects that both earned the word, kept apart.
             // `forced` is separate from `added` because the report must not
             // let "pending first contact" read as "probed and discovered".
-            sendJson(res, 200, { ok: true, added, forced, skipped, tagged, taggedApp, collisions, nameCollisions });
+            sendJson(res, 200, {
+                ok: true, added, forced, skipped, tagged, taggedApp, collisions, nameCollisions,
+                track: choices.track, linkDownAlerts: choices.linkDown, linkDownManual, linkDownRefused,
+            });
             return;
         }
 
@@ -4697,14 +4820,20 @@ async function shutdown(signal: string): Promise<void> {
     // sigterm drill asserts the blocks are PRESENT per started worker
     // rather than trusting a clean exit - if final stats ever go missing
     // intermittently, this race is where to look first.
+    // NOT through log(), whose escaping (review L9) would fold these blocks
+    // onto one line: tools/chaos.sh reads them as indented JSON up to the
+    // closing brace. They need no escaping - JSON.stringify escapes every
+    // control character inside a string, so their line breaks are its own.
+    const logJsonBlock = (label: string, value: unknown): void =>
+        console.log(new Date().toISOString(), '[main]', label, JSON.stringify(value, null, 2));
     if (ingestStats) {
-        log('final ingest stats:', JSON.stringify(ingestStats, null, 2));
+        logJsonBlock('final ingest stats:', ingestStats);
     }
     if (collector !== null && collectorStats) {
-        log('final collector stats:', JSON.stringify(collectorStats, null, 2));
+        logJsonBlock('final collector stats:', collectorStats);
     }
     if (jobsWorker !== null && jobsStats) {
-        log('final jobs stats:', JSON.stringify(jobsStats, null, 2));
+        logJsonBlock('final jobs stats:', jobsStats);
     }
     hb.stop();
     await closeAll();

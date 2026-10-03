@@ -23,6 +23,7 @@ export interface HeartbeatLike {
     worstGapMs: number;
     p99GapMs: number;
     overThresholdCount: number;
+    recent?: { worstGapMs: number };
 }
 
 export interface MetricsInput {
@@ -61,10 +62,12 @@ export function serializeMetrics(m: MetricsInput): string {
         line('worker_reporting', stats === null ? 0 : 1, `thread="${thread}"`);
     }
 
-    family('heartbeat_worst_gap_ms', 'gauge', 'Worst event-loop gap per thread - the isolation thesis metric.');
+    family('heartbeat_worst_gap_ms', 'gauge', 'Worst event-loop gap per thread since start - the isolation thesis metric.');
+    family('heartbeat_recent_worst_gap_ms', 'gauge', 'Worst event-loop gap per thread in the last 15 minutes - what health judges.');
     family('heartbeat_over_threshold_total', 'counter', 'Gaps over the per-thread threshold.');
     for (const h of m.heartbeats) {
         line('heartbeat_worst_gap_ms', h.worstGapMs, `thread="${esc(h.thread)}"`);
+        line('heartbeat_recent_worst_gap_ms', h.recent?.worstGapMs, `thread="${esc(h.thread)}"`);
         line('heartbeat_over_threshold_total', h.overThresholdCount, `thread="${esc(h.thread)}"`);
     }
 

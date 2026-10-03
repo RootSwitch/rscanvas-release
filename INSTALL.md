@@ -94,6 +94,7 @@ Flags worth knowing:
 | `--high-ports` | syslog on 5514 and traps on 15162, so the service needs no privilege; otherwise the installer grants `cap_net_bind_service` to node for 514 and 162 |
 | `--raw-days N`, `--message-days N` | how many days raw per-poll samples and syslog/trap messages are kept; defaults 14 and 30, at least 7; written to the env file when given and kept on later runs when not |
 | `--http-port N`, `--db NAME`, `--dir DIR`, `--user NAME` | the obvious overrides; defaults 18080, `rscanvas`, `/opt/rscanvas`, `rscanvas` |
+| `--rotate-db-passwords` | on its own: new random passwords for the `rscanvas` and `rscanvas_admin` database roles, written to the env file, then the service restarted - nothing else changes (section 4 says when) |
 | `--yes` | no prompts |
 
 Then open `https://<box>:18080`, sign in as `admin` with the printed
@@ -227,6 +228,21 @@ an unchanged box changes nothing. It keeps what the install already uses -
 the database name, ports, service user and TLS - unless you pass a flag
 again. Take a backup first (section 5).
 
+**From an install made before 0.1.0-alpha.6, change the database passwords
+afterwards.** Installers before then put both database passwords on a
+command line, so sudo wrote them into `/var/log/auth.log` and the journal on
+every install and upgrade; the current one does not, but what was written
+stays until the logs rotate. Once the upgrade is done:
+
+    sudo ./rscanvas-setup.sh --rotate-db-passwords
+
+It gives both roles new passwords, writes them to the env file, proves each
+logs in, restarts the service and waits for it to answer; if PostgreSQL
+refuses either change, it puts everything back as it was. The service is
+down for the restart only, as in an upgrade. A backup taken before the
+rotation still carries the old passwords in its copy of the env file, and
+restoring it brings them back, so rotate again after such a restore.
+
 ## 5. Back up and restore
 
 Two things must survive: the database, and `/etc/rscanvas`. The env file in
@@ -328,6 +344,15 @@ Retention days (section 2) are how to stop it happening again.
     DATABASE_URL=... ADMIN_PASSWORD=... node src/main.ts
 
 The first start with no users creates an admin from `ADMIN_PASSWORD`.
-`npm test` runs the offline suite with no database. Everything the
-application reads from the environment is listed in `src/config.ts` with
-the reasoning behind each default.
+`npm test` runs the offline suite with no database. Nearly everything the
+application reads from the environment is in `src/config.ts`, with the
+reasoning behind each default. A few are read where they are used instead:
+`RSCANVAS_SECRET` (`src/credentials/crypto.ts`), `ADMIN_USERNAME` and
+`ADMIN_PASSWORD` (`src/auth/index.ts`, first start only), `COOKIE_SECURE`
+(`src/auth/index.ts`), `TRUST_PROXY` (`src/http/respond.ts`),
+`SNMP_COMMUNITY` and any variable a device's credential reference names
+(the collector), `PARTITION_LOOKAHEAD_DAYS` and
+`PARTITION_RUNWAY_ALARM_DAYS` (the collector and ingest workers, which keep
+their partitions ahead), `DATA_DEVICE` (`src/residency.ts`, the cache
+residency check), and the test-only `DESTRUCTIVE_TEST_DB` and
+`ALLOW_FIXTURE_DROPS`.

@@ -72,7 +72,7 @@ import type { HeartbeatStats } from '../heartbeat.ts';
 //                       17, 47, 124 ... 561, 561 - one stall, nine breaches.
 //                       Fixed by checking MOVEMENT rather than value.
 //
-// So a consumer of a cumulative field must do ONE of three things, and the
+// So a consumer of a cumulative field must do ONE of these things, and the
 // audit below says which applies to each:
 //
 //   BASELINE   subtract a starting value, as the ingest worker does.
@@ -84,14 +84,24 @@ import type { HeartbeatStats } from '../heartbeat.ts';
 //
 //   syslogDrops, trapDrops    VERDICT, and BASELINED at bind. Correct, and the
 //                             origin of the rule.
-//   worstGapMs                VERDICT via the acute bound in isHeartbeatHealthy
-//                             - which is safe BECAUSE it is a maximum: "worst
-//                             ever exceeded 500ms" is a true statement about a
-//                             real stall, and it is deliberately paired with
-//                             the rate so recovery is possible on the rate
-//                             half. The SOAK consumes it by MOVEMENT.
-//   overThresholdCount        VERDICT via RATE. Fixed 2026-07-28.
-//   ticks                     DISPLAY, and the denominator of that rate.
+//   worstGapMs                DISPLAY since 2026-10-02, with worstGapAt beside
+//                             it. It was VERDICT via the acute bound, and this
+//                             audit called that safe because a maximum states
+//                             a true fact about a real stall. True, and not a
+//                             verdict: the acute branch is tested first and a
+//                             since-start maximum never falls, so one stall
+//                             held health red until a restart (production,
+//                             the morning after alpha.5). The SOAK still
+//                             consumes it by MOVEMENT.
+//   overThresholdCount        DISPLAY since 2026-10-02 (was VERDICT via RATE,
+//                             2026-07-28 - a rate since start recovers, but
+//                             after weeks of uptime a new day of stalls is
+//                             diluted below the bound and never shows).
+//   ticks                     DISPLAY.
+//   recent.*                  VERDICT, and a fourth way out of the rule above:
+//                             WINDOW - count only the last fifteen minutes
+//                             (heartbeat.ts gapWindow), so both the acute
+//                             bound and the rate judge now and can clear.
 //   received/written/queued   DISPLAY. Never thresholded; the conservation law
 //   flushes/flushFailures     is asserted by chaos.sh against FINAL stats on
 //   truncated/nulsStripped    shutdown, which is a delta by construction.
@@ -241,7 +251,7 @@ export interface IngestStats {
     kernel: KernelUdpState;
     /** VERDICT. isPartitionHealthy(_, 'ingest'). */
     partitions: PartitionState;
-    /** VERDICT. isReporting (presence) and isHeartbeatHealthy (overThresholdCount). */
+    /** VERDICT. isReporting (presence) and isHeartbeatHealthy (recent). */
     heartbeat: HeartbeatStats;
 }
 
@@ -938,17 +948,34 @@ export const LATENCY_JUDGED: ReadonlySet<string> = new Set(['main', 'ingest', 'c
  *
  * A thread with one 150ms transient in twenty minutes passes both, and
  * should: it cost 2% of the ingest buffer and dropped nothing.
+ *
+ * AND THE ACUTE BOUND WAS MONOTONE TOO - the third face, found in production
+ * on 2026-10-02. It read the since-start `worstGapMs`, and a maximum never
+ * falls: the VM host's 06:00 backup stalled every poll for up to 2.2 s, and
+ * health said "stalled" from then until a restart. The rate had a quieter
+ * version of the same fault: since start, a bad day after a month of good
+ * ones is diluted under the bound. Both now read `recent`, the last fifteen
+ * minutes, so a stall is reported while it is news and the since-start
+ * figures stay on the page as the record.
  */
 export const HEARTBEAT_SUSTAINED_RATE = 0.001;
 export const HEARTBEAT_ACUTE_GAP_MS = 500;
 
+function usableWindow(w: unknown): w is HeartbeatStats['recent'] {
+    if (w === null || typeof w !== 'object') return false;
+    const r = w as Record<string, unknown>;
+    return (['windowMs', 'ticks', 'worstGapMs', 'overThresholdCount'] as const)
+        .every((f) => typeof r[f] === 'number' && Number.isFinite(r[f] as number))
+        && (r.windowMs as number) > 0;
+}
+
 export function isHeartbeatHealthy(threads: HeartbeatStats[]): HealthVerdict {
     for (const t of threads) {
-        if (typeof t.overThresholdCount !== 'number' || !Number.isFinite(t.overThresholdCount)) {
+        if (!usableWindow(t.recent)) {
             return {
                 healthy: false,
                 problem: `the ${t.thread ?? 'unknown'} thread published no usable `
-                    + 'overThresholdCount, so its heartbeat cannot be judged',
+                    + 'recent window, so its heartbeat cannot be judged',
             };
         }
     }
@@ -956,14 +983,15 @@ export function isHeartbeatHealthy(threads: HeartbeatStats[]): HealthVerdict {
     const problems: string[] = [];
     for (const t of threads) {
         if (!LATENCY_JUDGED.has(t.thread)) continue;
-        const ticks = typeof t.ticks === 'number' && t.ticks > 0 ? t.ticks : 0;
-        const rate = ticks > 0 ? t.overThresholdCount / ticks : 0;
-        if (t.worstGapMs > HEARTBEAT_ACUTE_GAP_MS) {
-            problems.push(`${t.thread} stalled ${t.worstGapMs}ms in one tick `
+        const r = t.recent;
+        const within = `in the last ${Math.round(r.windowMs / 60_000)} min`;
+        const rate = r.ticks > 0 ? r.overThresholdCount / r.ticks : 0;
+        if (r.worstGapMs > HEARTBEAT_ACUTE_GAP_MS) {
+            problems.push(`${t.thread} stalled ${r.worstGapMs}ms in one tick ${within} `
                 + `(limit ${HEARTBEAT_ACUTE_GAP_MS}ms)`);
         } else if (rate > HEARTBEAT_SUSTAINED_RATE) {
             problems.push(`${t.thread} is over ${t.thresholdMs}ms on `
-                + `${(rate * 100).toFixed(2)}% of ticks (${t.overThresholdCount} of ${ticks}), `
+                + `${(rate * 100).toFixed(2)}% of ticks ${within} (${r.overThresholdCount} of ${r.ticks}), `
                 + `sustained past ${(HEARTBEAT_SUSTAINED_RATE * 100).toFixed(2)}%`);
         }
     }

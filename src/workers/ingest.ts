@@ -46,6 +46,7 @@ import { renderTrap, renderValue, deviceForAddress, hostForMessage, keptVarbinds
 import { guardTrapReceiver, logSafe, type TrapDrop } from '../syslog/trap-guard.ts';
 import { copyIsolating, isDataError } from './copy-isolate.ts';
 import { decodePet, petSyslogSeverity } from '../syslog/pet.ts';
+import { safeLogArgs } from '../logsafe.ts';
 
 const FLUSH_MS = 300;
 const FLUSH_ROWS = 200;
@@ -126,7 +127,7 @@ let baselineSystem = { rcvbufErrors: 0, inErrors: 0 };
 let peakRxQueueBytes = 0;
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[ingest]', ...args);
+    console.log(new Date().toISOString(), '[ingest]', ...safeLogArgs(args));
 }
 
 // Traps refused or failed, counted always and logged at most once a minute

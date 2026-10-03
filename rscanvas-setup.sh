@@ -38,6 +38,12 @@
 #   --purge          with --uninstall: also drop the database (and any copies
 #                    rscanvas-backup.sh set aside), the roles, /etc/rscanvas and
 #                    the service account. Backups and packages are never removed.
+#   --rotate-db-passwords
+#                    give the two database roles (rscanvas, rscanvas_admin) new
+#                    random passwords, write them to the env file and restart
+#                    the service - nothing else. For when the old ones were
+#                    exposed: installs before 2026-10-02 wrote them into sudo's
+#                    log. Runs on its own, on the database the install uses.
 #   --yes            do not prompt
 #
 #   --raw-days and --message-days are written to the env file when given and
@@ -79,6 +85,7 @@ ENV_FILE=/etc/rscanvas/rscanvas.env
 SET_DB=0; SET_USER=0; SET_HTTP=0; SET_PORTS=0; SET_DIR=0
 DO_UNINSTALL=0
 DO_PURGE=0
+DO_ROTATE=0
 RAW_DAYS=""
 MSG_DAYS=""
 
@@ -87,6 +94,7 @@ while [ $# -gt 0 ]; do
         --check)       DO_CHECK=1 ;;
         --uninstall)   DO_UNINSTALL=1 ;;
         --purge)       DO_PURGE=1 ;;
+        --rotate-db-passwords) DO_ROTATE=1 ;;
         --db)          DB_NAME="$2"; SET_DB=1; shift ;;
         --dir)         APP_DIR="$2"; SET_DIR=1; shift ;;
         --user)        SVC_USER="$2"; SET_USER=1; shift ;;
@@ -110,6 +118,12 @@ done
 # meaning something else entirely; it only ever qualifies --uninstall.
 if [ "$DO_PURGE" = 1 ] && [ "$DO_UNINSTALL" = 0 ]; then
     echo "--purge only means something with --uninstall: sudo $0 --uninstall --purge" >&2
+    exit 2
+fi
+# A rotation is its own errand: folded into a check it would change what a
+# check promises not to, and into an uninstall it would be pointless.
+if [ "$DO_ROTATE" = 1 ] && { [ "$DO_CHECK" = 1 ] || [ "$DO_UNINSTALL" = 1 ]; }; then
+    echo "--rotate-db-passwords runs on its own: sudo $0 --rotate-db-passwords" >&2
     exit 2
 fi
 # Checked before anything changes. Retention never keeps less than 7 days
@@ -138,6 +152,43 @@ psql_su() { sudo -u postgres psql -v ON_ERROR_STOP=1 "$@"; }
 # which is what SUDO_OK below is for.
 q()       { sudo -n -u postgres psql -tAq -c "$1" 2>/dev/null || true; }
 qd()      { sudo -n -u postgres psql -tAq -d "$1" -c "$2" 2>/dev/null || true; }
+
+# PASSWORDS TRAVEL ON STDIN, NEVER ARGV (2026-10-02, review F18). These were
+# `psql_su -c "... PASSWORD '<pw>'"`: the whole statement was psql's command
+# line, so both database passwords showed in `ps` to every local user while it
+# ran, and sudo wrote the command line - passwords included - to auth.log and
+# the journal, again on every upgrade. Production's logs held both. Now the
+# password is a psql variable set on stdin and quoted by psql itself (:'pw');
+# the command line says only "psql". Callers check the password's shape first
+# (12 to 128 of A-Z a-z 0-9 . _ ~ + = -), so the \set quoting cannot be broken.
+role_password_sql() {   # $1 the statement, with :'pw' where the password goes; $2 the password
+    printf '\\set pw %s\n%s;\n' "'$2'" "$1" | psql_su
+}
+
+# The env file's secrets. read_secret needs root (the file is 0600 root).
+read_secret() { sed -n "s/^$1=//p" "$ENV_FILE" | head -1; }
+# WRITTEN BY awk, WITH THE VALUE AS DATA (2026-10-01, review F5). This was
+# `sed -i "s|^$k=.*|$k=$v|"`, which made the value part of a sed PROGRAM: a
+# value of `x|e;#` ended the substitution and added sed's e flag, which runs
+# the line as a shell command - as root. The values come back from the env
+# file, and --restore puts a backup's env file in place before re-running
+# this script, so a tampered backup was root by this door too. awk reads the
+# key and value from its environment, where nothing is syntax.
+set_secret() {
+    local k="$1" v="$2" tmp
+    case "$v" in *$'\n'*|*$'\r'*) die "refusing to write $k: its value contains a line break" ;; esac
+    tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+    K="$k" V="$v" awk '
+        BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; n = length(k) + 1; seen = 0 }
+        substr($0, 1, n) == k "=" { print k "=" v; seen = 1; next }
+        { print }
+        END { if (!seen) print k "=" v }' "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; die "could not write $k to $ENV_FILE"; }
+    chmod 600 "$tmp"; chown root:root "$tmp"
+    mv "$tmp" "$ENV_FILE"
+    # ASSERT READABLE. Writing a secret and not reading it back is how an
+    # install reports success over a file the service cannot use.
+    [ "$(read_secret "$k")" = "$v" ] || die "wrote $k but could not read it back from $ENV_FILE"
+}
 
 # DF, AND THE DIFFERENCE BETWEEN EMPTY AND UNMEASURED.
 #
@@ -432,6 +483,44 @@ app_dir_state() {
 # from StateDirectory= and gives it to the service account. Exports go here.
 STATE_DIR=/var/lib/rscanvas
 
+# ----- the flags, checked before anything changes (2026-10-03, review L10) ----
+#
+# The values read back from an install are shape-checked where they are read;
+# these are the ones typed on THIS command line, which were trusted until
+# used. --db reached SQL as typed. --dir was refused only at the service
+# account step, after packages and the kernel setting had already changed.
+# And --user named an existing account and kept going: the account step moves
+# that account's home to the state directory and the unit runs the service as
+# it - so `--user root` would have moved root's home and run a network-facing
+# service as root. Each is now refused here, before the first change.
+if [ "$SET_DB" = 1 ]; then
+    [[ "$DB_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] \
+        || die "--db $DB_NAME: a database name here is 1 to 63 letters, digits and underscores, not starting with a digit"
+    case "$DB_NAME" in postgres|template0|template1)
+        die "--db $DB_NAME is PostgreSQL's own database - choose a name of RSCanvas's own, such as rscanvas" ;;
+    esac
+fi
+if [ "$SET_USER" = 1 ]; then
+    [[ "$SVC_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+        || die "--user $SVC_USER: an account name here is 1 to 32 lower-case letters, digits, _ and -"
+    [ "$SVC_USER" != root ] || die "--user root: the service runs unprivileged - choose an account of its own, such as rscanvas"
+    if id -u "$SVC_USER" >/dev/null 2>&1; then
+        # The purge's rule: only a system account with no login shell is one
+        # this installer may make its own.
+        u_uid="$(id -u "$SVC_USER")"; u_sh="$(getent passwd "$SVC_USER" | cut -d: -f7)"
+        if ! { [ "$u_uid" -gt 0 ] && [ "$u_uid" -lt 1000 ] && [[ "$u_sh" = */nologin || "$u_sh" = */false ]]; }; then
+            die "--user $SVC_USER is an existing account that can log in - the installer would move its home and run the service as it; choose a new name, or a system account with no login"
+        fi
+    fi
+fi
+if [ "$SET_DIR" = 1 ] && [ "$(app_dir_state)" = refuse ]; then
+    die "--dir $APP_DIR is not a directory this installer will take over - choose one of its own, such as /opt/rscanvas"
+fi
+if [ "$SET_HTTP" = 1 ]; then
+    { [[ "$HTTP_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$HTTP_PORT" -ge 1 ] && [ "$HTTP_PORT" -le 65535 ]; } \
+        || die "--http-port takes a port from 1 to 65535, got: $HTTP_PORT"
+fi
+
 # ----- uninstall: take RSCanvas off the box, keep (or purge) its data ----------
 #
 # KEEP IS THE DEFAULT (the operator's ruling, 2026-09-28). An uninstall is
@@ -462,14 +551,35 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         die "PostgreSQL is not answering, and --purge needs it to drop the database - start it, or run --uninstall alone"
     # The databases this install made: its own, plus the copies
     # rscanvas-backup.sh sets aside (<db>_pre_restore_<stamp>) or tests into.
-    DBS=""
-    [ "$PG_UP" = 1 ] && DBS="$(q "SELECT string_agg(datname, ' ' ORDER BY datname) FROM pg_database
-        WHERE datname = '$DB_NAME' OR datname = '${DB_NAME}_restore_test' OR datname LIKE '${DB_NAME}\\_pre\\_restore\\_%'")"
-    # `|| true` is load-bearing: with no match, ls exits 2, pipefail carries
-    # that into the assignment, and set -e ended the whole uninstall there -
-    # silently, on every box that had never been restored. The drill caught
-    # it only on its second pass; the first box had a set-aside copy.
-    ASIDE_ETC="$(ls -d /etc/rscanvas.pre-restore-* 2>/dev/null | xargs || true)"
+    #
+    # EXACT NAMES, IN AN ARRAY (2026-10-03, review L11). This was a LIKE on
+    # the prefix, joined with spaces and walked as `for d in $DBS`: on a
+    # shared cluster a database named "rscanvas_pre_restore_x postgres"
+    # matched the prefix and split into two words, the second of them
+    # "postgres" - DROP DATABASE "postgres". Now only the shapes the backup
+    # tool makes are taken (its stamp is YYYYMMDDTHHMMSSZ), every one of them
+    # word characters, and the loop walks an array. DB_NAME was checked
+    # against the same character class above, so it is safe inside the regex.
+    DBS_LIST=()
+    [ "$PG_UP" = 1 ] && mapfile -t DBS_LIST < <(q "SELECT datname FROM pg_database
+        WHERE datname = '$DB_NAME' OR datname ~ '^${DB_NAME}_(restore_test|pre_restore_[0-9]{8}T[0-9]{6}Z)\$'
+        ORDER BY datname")
+    DBS="${DBS_LIST[*]}"   # for the report only - the drop walks DBS_LIST
+    # Databases that LOOK like copies but are not names the backup tool makes
+    # are kept, and said so - before the purge and after it - rather than
+    # silently left (or, as the old prefix match had it, dropped).
+    LOOKALIKES=""
+    [ "$PG_UP" = 1 ] && LOOKALIKES="$(q "SELECT string_agg(quote_ident(datname), ' ' ORDER BY datname) FROM pg_database
+        WHERE datname LIKE '${DB_NAME}\\_%' AND datname <> '$DB_NAME'
+          AND datname !~ '^${DB_NAME}_(restore_test|pre_restore_[0-9]{8}T[0-9]{6}Z)\$'")"
+    # The set-aside config directories, by the same rule: a glob into an
+    # array, each name held to the stamp shape before anything removes it.
+    # (This was `ls | xargs`, word-split on the way into rm -rf.)
+    ASIDE_LIST=()
+    for p in /etc/rscanvas.pre-restore-*; do
+        [[ "$p" =~ ^/etc/rscanvas\.pre-restore-[0-9]{8}T[0-9]{6}Z$ ]] && [ -d "$p" ] && ASIDE_LIST+=("$p")
+    done
+    ASIDE_ETC="${ASIDE_LIST[*]}"
     HAS_CAP=0
     [ -n "$NODE_BIN" ] && getcap "$NODE_BIN" 2>/dev/null | grep -q cap_net_bind_service && HAS_CAP=1
     NBACKUPS="$(ls "$BACKUP_DIR" 2>/dev/null | grep -c '\.tar$' || true)"
@@ -491,6 +601,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         && say "  removes    the restart-on-failure policy it gave PostgreSQL's unit"
     if [ "$DO_PURGE" = 1 ]; then
         [ -n "$DBS" ] && say "  DROPS      database$( [ "$(wc -w <<< "$DBS")" -gt 1 ] && echo s) $DBS"
+        [ -n "$LOOKALIKES" ] && say "  keeps      $LOOKALIKES - named like copies, but not names the backup tool makes"
         say "  DROPS      the roles rscanvas_owner, rscanvas and rscanvas_admin, unless they own something else"
         [ -d /etc/rscanvas ] && say "  DELETES    /etc/rscanvas - the env file with its secrets, and the TLS pair"
         [ -d "$STATE_DIR" ] && say "  DELETES    $STATE_DIR - the service's working files (exports waiting to be downloaded)"
@@ -549,7 +660,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
 
     if [ "$DO_PURGE" = 1 ]; then
         step "the data"
-        for d in $DBS; do
+        for d in "${DBS_LIST[@]}"; do
             psql_su -c "DROP DATABASE \"$d\" WITH (FORCE)" >/dev/null && good "database $d dropped"
         done
         # rscanvas_admin first: it is a member of rscanvas_owner.
@@ -562,7 +673,7 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         done
         if [ -e /etc/rscanvas ]; then rm -rf -- /etc/rscanvas && good "/etc/rscanvas removed"; fi
         if [ -d "$STATE_DIR" ]; then rm -rf -- "$STATE_DIR" && good "$STATE_DIR removed"; fi
-        for d in $ASIDE_ETC; do rm -rf -- "$d" && good "$d removed"; done
+        for d in "${ASIDE_LIST[@]}"; do rm -rf -- "$d" && good "$d removed"; done
         rm -rf /var/tmp/rscanvas-restore.* 2>/dev/null || true
         # Only a SYSTEM account with no login shell, which is what this
         # installer creates - never a person's account named by a stray --user.
@@ -584,8 +695,13 @@ if [ "$DO_UNINSTALL" = 1 ]; then
     [ -n "$NODE_BIN" ] && getcap "$NODE_BIN" 2>/dev/null | grep -q cap_net_bind_service && { bad "$NODE_BIN still has cap_net_bind_service"; ok=0; }
     [ "$APP_STATE" = ours ] && [ -e "$APP_DIR" ] && { bad "$APP_DIR is still there"; ok=0; }
     if [ "$DO_PURGE" = 1 ]; then
-        left="$(q "SELECT string_agg(datname, ' ') FROM pg_database WHERE datname = '$DB_NAME' OR datname LIKE '${DB_NAME}\\_pre\\_restore\\_%'")"
+        # The same exact-name rule the drop used: a lookalike it kept on
+        # purpose is not a failure (the rs-test-1 drill, 2026-10-03, failed
+        # a correct purge on exactly that before this matched).
+        left="$(q "SELECT string_agg(quote_ident(datname), ' ') FROM pg_database WHERE datname = '$DB_NAME'
+            OR datname ~ '^${DB_NAME}_(restore_test|pre_restore_[0-9]{8}T[0-9]{6}Z)\$'")"
         [ -n "$left" ] && { bad "database(s) still present: $left"; ok=0; }
+        [ -n "$LOOKALIKES" ] && warn "kept $LOOKALIKES - named like copies, but not names the backup tool makes; drop by hand if they are yours"
         [ -e /etc/rscanvas ] && { bad "/etc/rscanvas is still there"; ok=0; }
     elif [ -n "$DBS" ]; then
         [ -n "$(q "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'")" ] || { bad "database $DB_NAME is GONE - it should have been kept"; ok=0; }
@@ -611,6 +727,106 @@ if [ "$DO_UNINSTALL" = 1 ]; then
     say "  repositories. Removing postgresql-18 deletes EVERY database on this box."
     say ""
     [ "$ok" = 1 ] || die "uninstall finished with the failures above"
+    exit 0
+fi
+
+# ----- --rotate-db-passwords: new database passwords, and nothing else --------
+#
+# WHY (2026-10-02, review F18). Until then every install and upgrade put both
+# database passwords on a command line, so sudo wrote them into auth.log and
+# the journal. The installer no longer does, but the lines already written
+# stay until the logs rotate; changing the passwords turns them into dead
+# text. This touches only the two role passwords and the three env keys that
+# carry them (RSCANVAS_DB_PASSWORD, RSCANVAS_ADMIN_DB_PASSWORD and the
+# password inside DATABASE_URL), then restarts the service - no packages, no
+# schema, no unit.
+#
+# THE ORDER IS CHOSEN SO A FAILURE LEAVES A WORKING BOX. The env file is
+# written first (the running service read it at start and ignores it), then
+# each role is ALTERed through stdin. A refused ALTER puts the old values back
+# - the env file and any role already changed - and stops. Between the ALTERs
+# and the restart the running service keeps its open connections (a password
+# change does not end a session); only a connection opened in that second or
+# so is refused, and the restart follows at once. The passwords are never
+# printed.
+if [ "$DO_ROTATE" = 1 ]; then
+    [ "$(id -u)" = 0 ] || die "run with sudo (changes two database roles and the env file, restarts the service)"
+    [ -f "$ENV_FILE" ] || die "no $ENV_FILE - there is no install on this box to rotate"
+    [[ "$DB_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "database name '$DB_NAME' is not one this installer would have made"
+    # The database stays the one the install uses. DATABASE_URL is rewritten
+    # with the new password, so a --db naming anything else would point the
+    # service at another database - a move, not a rotation.
+    u="$(read_secret DATABASE_URL)"; u="${u##*/}"; u="${u%%\?*}"
+    [ -z "$u" ] || [ "$u" = "$DB_NAME" ] \
+        || die "this install uses database $u; --rotate-db-passwords keeps it (drop --db $DB_NAME)"
+    OLD_DB="$(read_secret RSCANVAS_DB_PASSWORD)"
+    OLD_ADMIN="$(read_secret RSCANVAS_ADMIN_DB_PASSWORD)"
+    { [ -n "$OLD_DB" ] && [ -n "$OLD_ADMIN" ]; } \
+        || die "$ENV_FILE holds no database passwords - run the installer without --rotate-db-passwords first"
+    [ -n "$(q 'SELECT 1')" ] || die "PostgreSQL is not answering - start it and run this again"
+    q "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 \
+        || die "there is no database $DB_NAME - run the installer without --rotate-db-passwords first"
+    for r in rscanvas rscanvas_admin; do
+        q "SELECT 1 FROM pg_roles WHERE rolname='$r'" | grep -q 1 \
+            || die "role $r does not exist - run the installer without --rotate-db-passwords first"
+    done
+
+    step "rotate the database passwords (database $DB_NAME)"
+    NEW_DB="$(openssl rand -hex 24)"
+    NEW_ADMIN="$(openssl rand -hex 24)"
+    put_env() {   # $1 app password, $2 admin password
+        set_secret RSCANVAS_DB_PASSWORD "$1"
+        set_secret RSCANVAS_ADMIN_DB_PASSWORD "$2"
+        set_secret DATABASE_URL "postgres://rscanvas:$1@localhost:5432/$DB_NAME"
+    }
+    put_env "$NEW_DB" "$NEW_ADMIN"
+    good "$ENV_FILE holds the new passwords"
+    if ! role_password_sql "ALTER ROLE rscanvas PASSWORD :'pw'" "$NEW_DB" >/dev/null; then
+        put_env "$OLD_DB" "$OLD_ADMIN"
+        die "PostgreSQL refused the new password for rscanvas - nothing was changed (the env file is back as it was)"
+    fi
+    if ! role_password_sql "ALTER ROLE rscanvas_admin PASSWORD :'pw'" "$NEW_ADMIN" >/dev/null; then
+        role_password_sql "ALTER ROLE rscanvas PASSWORD :'pw'" "$OLD_DB" >/dev/null \
+            || bad "and could not put rscanvas's old password back - run this again to give both new ones"
+        put_env "$OLD_DB" "$OLD_ADMIN"
+        die "PostgreSQL refused the new password for rscanvas_admin - both roles and the env file are back as they were"
+    fi
+    good "rscanvas and rscanvas_admin have new passwords"
+
+    ok=1
+    # PROVEN, NOT ASSUMED: each role logs in with its new password over TCP,
+    # the way the service connects. PGPASSWORD is this process's environment,
+    # not an argument, and this psql is not run through sudo.
+    if PGPASSWORD="$NEW_DB" psql -w -h localhost -p 5432 -U rscanvas -d "$DB_NAME" -tAqc 'SELECT 1' >/dev/null 2>&1; then
+        good "rscanvas logs in with its new password"
+    else bad "rscanvas cannot log in with its new password"; ok=0; fi
+    if PGPASSWORD="$NEW_ADMIN" psql -w -h localhost -p 5432 -U rscanvas_admin -d "$DB_NAME" -tAqc 'SELECT 1' >/dev/null 2>&1; then
+        good "rscanvas_admin logs in with its new password"
+    else bad "rscanvas_admin cannot log in with its new password"; ok=0; fi
+
+    if systemctl is-enabled rscanvas >/dev/null 2>&1; then
+        systemctl restart rscanvas
+        SCHEME=http; CURL_K=""
+        [ -n "$(read_secret TLS_CERT)" ] && { SCHEME=https; CURL_K="-k"; }
+        port="$(read_secret HTTP_PORT)"; port="${port:-$HTTP_PORT}"
+        code=000
+        for _ in $(seq 1 30); do
+            code=$(curl -s $CURL_K -o /dev/null -w '%{http_code}' --max-time 2 "$SCHEME://127.0.0.1:$port/api/health/work" || true)
+            [ "$code" = 200 ] && break
+            sleep 1
+        done
+        if [ "$code" = 200 ]; then good "rscanvas.service restarted on the new passwords; /api/health/work answers 200"
+        else bad "rscanvas.service restarted, but /api/health/work answers ${code:-nothing} - see journalctl -u rscanvas"; ok=0; fi
+    else
+        warn "no rscanvas.service on this box - whatever runs RSCanvas must be restarted to read $ENV_FILE"
+    fi
+
+    say ""
+    say "  The old passwords no longer open anything, so the copies earlier installs left in"
+    say "  /var/log/auth.log and the journal are dead text; they leave with log rotation."
+    say "  Backups taken before now still hold the old passwords in their copy of the env"
+    say "  file, and restoring one brings them back - rotate again after such a restore."
+    [ "$ok" = 1 ] || die "rotation finished with the failures above"
     exit 0
 fi
 
@@ -791,31 +1007,10 @@ step "secrets"
 # NEVER REGENERATE. An existing value is read back and reused, so re-running
 # this script cannot lock anyone out of an instance they already have. Only the
 # absent ones are minted. This is the single most important idempotency
-# property in the file.
+# property in the file. (--rotate-db-passwords, above, is the one deliberate
+# exception, and it is a separate command.) read_secret and set_secret live
+# with the other helpers near the top, because the rotation uses them too.
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:root "$ENV_FILE"
-read_secret() { sed -n "s/^$1=//p" "$ENV_FILE" | head -1; }
-# WRITTEN BY awk, WITH THE VALUE AS DATA (2026-10-01, review F5). This was
-# `sed -i "s|^$k=.*|$k=$v|"`, which made the value part of a sed PROGRAM: a
-# value of `x|e;#` ended the substitution and added sed's e flag, which runs
-# the line as a shell command - as root. The values come back from the env
-# file, and --restore puts a backup's env file in place before re-running
-# this script, so a tampered backup was root by this door too. awk reads the
-# key and value from its environment, where nothing is syntax.
-set_secret() {
-    local k="$1" v="$2" tmp
-    case "$v" in *$'\n'*|*$'\r'*) die "refusing to write $k: its value contains a line break" ;; esac
-    tmp="$(mktemp "$ENV_FILE.XXXXXX")"
-    K="$k" V="$v" awk '
-        BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; n = length(k) + 1; seen = 0 }
-        substr($0, 1, n) == k "=" { print k "=" v; seen = 1; next }
-        { print }
-        END { if (!seen) print k "=" v }' "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; die "could not write $k to $ENV_FILE"; }
-    chmod 600 "$tmp"; chown root:root "$tmp"
-    mv "$tmp" "$ENV_FILE"
-    # ASSERT READABLE. Writing a secret and not reading it back is how an
-    # install reports success over a file the service cannot use.
-    [ "$(read_secret "$k")" = "$v" ] || die "wrote $k but could not read it back from $ENV_FILE"
-}
 
 DB_PASS="$(read_secret RSCANVAS_DB_PASSWORD)"
 DB_NEW=0
@@ -835,8 +1030,9 @@ CRED_KEY_NEW=0
 if [ -z "$CRED_KEY" ]; then CRED_KEY="$(openssl rand -base64 32)"; CRED_KEY_NEW=1; fi
 ADMIN_PASS_DB="$(read_secret RSCANVAS_ADMIN_DB_PASSWORD)"
 [ -n "$ADMIN_PASS_DB" ] || ADMIN_PASS_DB="$(openssl rand -hex 24)"
-# The two database passwords go into superuser SQL ('...' below) and into a
-# URL, so they must be of a shape that is neither (review F5: a restored env
+# The two database passwords go into a quoted psql variable for superuser SQL
+# (role_password_sql below) and into a URL, so they must be of a shape that
+# can break neither (review F5: a restored env
 # file is a backup's, and a backup is input). This installer only ever mints
 # hex; anything else was edited in by hand or arrived in a backup.
 for pw in "RSCANVAS_DB_PASSWORD:$DB_PASS" "RSCANVAS_ADMIN_DB_PASSWORD:$ADMIN_PASS_DB"; do
@@ -963,6 +1159,8 @@ if [ "$DO_TLS" != 1 ] && [ -n "$(read_secret TLS_CERT)" ]; then
 fi
 
 step "roles and database"
+# The passwords are set through role_password_sql (with the helpers near the
+# top): on stdin, never on psql's command line (review F18).
 # THE THREE-ROLE SPLIT. rscanvas_owner owns and cannot log in; rscanvas is the
 # application and gets DML only, so `DROP TABLE` comes back "must be owner"
 # from Postgres itself before any guard in this repo is consulted;
@@ -970,14 +1168,14 @@ step "roles and database"
 q "SELECT 1 FROM pg_roles WHERE rolname='rscanvas_owner'" | grep -q 1 || \
     psql_su -c "CREATE ROLE rscanvas_owner NOLOGIN"
 if q "SELECT 1 FROM pg_roles WHERE rolname='rscanvas'" | grep -q 1; then
-    psql_su -c "ALTER ROLE rscanvas LOGIN PASSWORD '$DB_PASS'"
+    role_password_sql "ALTER ROLE rscanvas LOGIN PASSWORD :'pw'" "$DB_PASS"
 else
-    psql_su -c "CREATE ROLE rscanvas LOGIN PASSWORD '$DB_PASS'"
+    role_password_sql "CREATE ROLE rscanvas LOGIN PASSWORD :'pw'" "$DB_PASS"
 fi
 if q "SELECT 1 FROM pg_roles WHERE rolname='rscanvas_admin'" | grep -q 1; then
-    psql_su -c "ALTER ROLE rscanvas_admin LOGIN PASSWORD '$ADMIN_PASS_DB'"
+    role_password_sql "ALTER ROLE rscanvas_admin LOGIN PASSWORD :'pw'" "$ADMIN_PASS_DB"
 else
-    psql_su -c "CREATE ROLE rscanvas_admin LOGIN PASSWORD '$ADMIN_PASS_DB' IN ROLE rscanvas_owner"
+    role_password_sql "CREATE ROLE rscanvas_admin LOGIN PASSWORD :'pw' IN ROLE rscanvas_owner" "$ADMIN_PASS_DB"
 fi
 q "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 || \
     psql_su -c "CREATE DATABASE $DB_NAME OWNER rscanvas_owner"
@@ -1015,9 +1213,15 @@ step "schema - BUILD, then HARDEN, never the other way round"
 # DEFINER and those functions are created by the slice files, while
 # apply-schema needs a CREATE privilege hardening has just revoked. The cycle
 # was never in the tools, only in the sequence. INSTALL.md carries the order.
-sudo -u "$SVC_USER" env \
-    DATABASE_URL="postgres://rscanvas_admin:$ADMIN_PASS_DB@localhost:5432/$DB_NAME" \
-    node "$APP_DIR/src/db/apply-schema.ts" --with-retention
+# The admin URL rides in the ENVIRONMENT, through runuser (review F18). As
+# `sudo -u svc env DATABASE_URL=...` it was argv - in `ps` and in sudo's log
+# line on every upgrade. `sudo --preserve-env=DATABASE_URL` was tried next and
+# the rs-test-2 drill caught it: sudo logs preserved variables too, as
+# "ENV=DATABASE_URL=postgres://rscanvas_admin:<password>@...". runuser logs a
+# session line and nothing of the command or its environment; the variable
+# sits only in /proc/<pid>/environ, which the service account and root read.
+DATABASE_URL="postgres://rscanvas_admin:$ADMIN_PASS_DB@localhost:5432/$DB_NAME" \
+    runuser -u "$SVC_USER" -- node "$APP_DIR/src/db/apply-schema.ts" --with-retention
 good "schema applied as rscanvas_admin, with retention"
 
 # PRESENT, NOT EXECUTABLE (2026-10-01, review F13a). The test was -x, and git

@@ -42,6 +42,10 @@ export interface ProbeEntity {
     /** Sensor polling instruction (slice14) - null for interfaces, whose
      *  polling derives from ifIndex as it always has. */
     extra: SensorExtra | null;
+    /** ifOperStatus at probe time, interfaces only; null when the agent did
+     *  not answer it. Read for the "active ports only" choice at add time
+     *  (src/devices/onboard.ts trackedFor), never stored. */
+    operStatus?: number | null;
 }
 
 export interface ProbeResult {
@@ -53,6 +57,9 @@ export interface ProbeResult {
     entities: ProbeEntity[];
     /** Of those, how many the default policy tracks. The number that matters. */
     trackedCount: number;
+    /** Of the tracked INTERFACES, how many were oper up when probed: what
+     *  "active ports only" would keep. */
+    trackedUpCount: number;
     error: string | null;
     errorKind: 'timeout' | 'auth' | 'other' | null;
 }
@@ -352,7 +359,7 @@ export async function discoverSensors(
 export async function probeTarget(target: Target): Promise<ProbeResult> {
     const result: ProbeResult = {
         host: target.host, ok: false, sysName: null, sysDescr: null, sysLocation: null,
-        entities: [], trackedCount: 0, error: null, errorKind: null,
+        entities: [], trackedCount: 0, trackedUpCount: 0, error: null, errorKind: null,
     };
     const session = createSession(target);
     try {
@@ -362,7 +369,7 @@ export async function probeTarget(target: Target): Promise<ProbeResult> {
         result.sysLocation = asString(sys.get(SYS.sysLocation) ?? null);
         const sysObjectID = asString(sys.get(SYS.sysObjectID) ?? null);
 
-        const [names, descrs, types, aliases, highSpeed, speed, connector] = await Promise.all([
+        const [names, descrs, types, aliases, highSpeed, speed, connector, oper] = await Promise.all([
             walk(session, IFX.ifName),
             walk(session, IF.ifDescr),
             walk(session, IF.ifType),
@@ -373,6 +380,10 @@ export async function probeTarget(target: Target): Promise<ProbeResult> {
             // that does not implement it returns nothing and every value
             // reads null, which defaultTracked treats as "no opinion".
             walk(session, IFX.ifConnectorPresent),
+            // Link state NOW, for the add step's "active ports only" choice
+            // (2026-10-02). Read here and carried to the add; the poller reads
+            // its own every cycle, so nothing stores this one.
+            walk(session, IF.ifOperStatus),
         ]);
 
         // Index off ifDescr rather than ifName: ifName is in the ifXTable and
@@ -412,6 +423,7 @@ export async function probeTarget(target: Target): Promise<ProbeResult> {
                 // pseudo-interface zoo claims ethernetCsmacd.
                 tracked: defaultTracked(ifType, name, asString(descrs.get(idx) ?? null), asNumber(connector.get(idx) ?? null)),
                 extra: null,
+                operStatus: asNumber(oper.get(idx) ?? null),
             });
         }
         result.entities.sort((a, b) => Number(a.snmpIndex) - Number(b.snmpIndex));
@@ -426,6 +438,7 @@ export async function probeTarget(target: Target): Promise<ProbeResult> {
         } catch { /* sensor walk died; the interface probe stands */ }
 
         result.trackedCount = result.entities.filter((e) => e.tracked).length;
+        result.trackedUpCount = result.entities.filter((e) => e.kind === 'if' && e.tracked && e.operStatus === 1).length;
         result.ok = true;
     } catch (err) {
         const m = (err as Error).message ?? String(err);

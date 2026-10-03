@@ -44,6 +44,7 @@ import type { CollectorStats } from './protocol.ts';
 import { decrypt, credentialStoreReady } from '../credentials/crypto.ts';
 import { credentialFields, sessionVersion, type Credential } from '../credentials/v3.ts';
 import { isPermittedEnvRef } from '../credentials/profiles.ts';
+import { safeLogArgs } from '../logsafe.ts';
 
 const hb = startHeartbeat('collector', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdMs);
 
@@ -72,6 +73,8 @@ const community = process.env[
  */
 const profiles = new Map<string, Credential>();
 const undecryptable = new Set<string>();
+/** The last "credential profiles loaded" line, so a reload repeats it only when it changes. */
+let lastProfileSummary = '';
 
 async function loadProfiles(): Promise<void> {
     if (!credentialStoreReady()) return;   // env-only deployment: nothing to load
@@ -112,9 +115,18 @@ async function loadProfiles(): Promise<void> {
         if (plain === null) { undecryptable.add(p.name); continue; }
         profiles.set(p.name, { version: p.version, community: plain });
     }
-    log(`credential profiles loaded: ${profiles.size} usable`
+    // SAID WHEN IT CHANGES (2026-10-02). The reload runs every 30 s and this
+    // line went out every time - 2,880 identical lines a day on production,
+    // burying whatever sat between them. The first load is logged, and so is
+    // every load whose answer differs; a profile turning UNDECRYPTABLE is a
+    // difference, so the line that matters still arrives the moment it is true.
+    const summary = `credential profiles loaded: ${profiles.size} usable`
         + (v3 > 0 ? ` (${v3} SNMPv3)` : '')
-        + (undecryptable.size > 0 ? `, ${undecryptable.size} UNDECRYPTABLE under the current RSCANVAS_SECRET: ${[...undecryptable].join(', ')}` : ''));
+        + (undecryptable.size > 0 ? `, ${undecryptable.size} UNDECRYPTABLE under the current RSCANVAS_SECRET: ${[...undecryptable].join(', ')}` : '');
+    if (summary !== lastProfileSummary) {
+        log(summary);
+        lastProfileSummary = summary;
+    }
 }
 
 /**
@@ -249,7 +261,7 @@ let lastWriteMs = 0;
 const failureLog = new Map<string, number>();
 
 function log(...args: unknown[]): void {
-    console.log(new Date().toISOString(), '[collector]', ...args);
+    console.log(new Date().toISOString(), '[collector]', ...safeLogArgs(args));
 }
 
 let asyncErrors = 0;
@@ -422,11 +434,25 @@ async function runPoll(device: {
             // is to notice a NEW failure, not to transcribe a known one.
             const key = res.errorKind ?? 'other';
             failuresByKind[key in failuresByKind ? key as keyof typeof failuresByKind : 'other']++;
+            // A KNOWN FAILURE IS NOT RE-TOLD EVERY POLL (2026-10-03). The
+            // limit above was per KIND, fleet-wide, and 30 s is the default
+            // poll interval: one device that stays down - a transient laptop
+            // that is simply off - logged a line on every poll, 2,300 a day
+            // on production. Now a device's FIRST failed poll in a streak is
+            // told, then a reminder about once an hour while it lasts. The
+            // streak is the row's own count of failed polls before this one,
+            // so this costs no state. The per-kind 30 s limit stays, as the
+            // flood guard for many devices failing at once.
+            const streak = device.consecutive_failures;
+            const perHour = Math.max(1, Math.round(3600 / Math.max(1, device.poll_interval_s)));
+            const reminder = streak > 0 && (streak + 1) % perHour === 0;
             const seen = failureLog.get(key) ?? 0;
-            if (Date.now() - seen > 30_000) {
+            if ((streak === 0 || reminder) && Date.now() - seen > 30_000) {
                 failureLog.set(key, Date.now());
                 log(`poll of ${device.name} at ${device.host}:${device.snmp_port} failed `
-                    + `(${key}): ${res.error} [further ${key} failures quiet for 30s]`);
+                    + `(${key}): ${res.error}`
+                    + (reminder ? ` [still failing: ${streak + 1} polls in a row; reminded about hourly]`
+                        : ` [further ${key} failures quiet for 30s; this device's are retold about hourly]`));
             }
         }
         discovered += res.discovered;
@@ -978,7 +1004,7 @@ parentPort?.on('message', async (msg: {
             if (!cred.ok) {
                 refused.push({
                     host: t.host, ok: false, sysName: null, sysDescr: null, sysLocation: null,
-                    entities: [], trackedCount: 0, error: cred.detail, errorKind: 'auth',
+                    entities: [], trackedCount: 0, trackedUpCount: 0, error: cred.detail, errorKind: 'auth',
                 });
                 continue;
             }
@@ -1005,7 +1031,7 @@ parentPort?.on('message', async (msg: {
             const detail = (err as Error).message;
             results = targets.map((t: Target) => ({
                 host: t.host, ok: false, sysName: null, sysDescr: null, sysLocation: null,
-                entities: [], trackedCount: 0, error: detail, errorKind: 'other' as const,
+                entities: [], trackedCount: 0, trackedUpCount: 0, error: detail, errorKind: 'other' as const,
             }));
         }
         parentPort?.postMessage({ type: 'probe-result', id: msg.id, results });

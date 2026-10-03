@@ -27,7 +27,7 @@ is('stamped exactly at the horizon is still held - the gate is strictly past it'
     isGhostInterface('2026-09-01T11:00:00Z', now, HOUR), false);
 is('one millisecond past the horizon is a ghost',
     isGhostInterface(new Date(now - HOUR - 1), now, HOUR), true);
-is('a twelve-day corpse is a ghost - the the operator workstation shape',
+is('a twelve-day corpse is a ghost - the operator workstation shape',
     isGhostInterface('2026-08-20T08:29:51Z', now, HOUR), true);
 
 console.log('\nthe inputs the store can hand it:');

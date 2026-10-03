@@ -97,6 +97,11 @@ ok('an impossible date is not', !isDay('2026-02-30') && !isDay('2026-9-25') && !
 ok('IANA zones are accepted', isTimeZone('America/Chicago') && isTimeZone('UTC') && isTimeZone('Etc/GMT+6'));
 ok('anything else is refused before it reaches SQL',
     !isTimeZone('Mars/Olympus') && !isTimeZone("UTC'; DROP TABLE x;--") && !isTimeZone(null));
+// Review L17: Intl takes bare offsets, PostgreSQL reads them as POSIX with
+// the sign reversed - a +05 report summed its days ten hours off.
+ok('a bare offset is refused, in every spelling Intl accepts',
+    !isTimeZone('+05') && !isTimeZone('+05:00') && !isTimeZone('-0500'));
+ok('names with + and - in them still pass', isTimeZone('America/Port-au-Prince') && isTimeZone('Etc/GMT-14'));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail === 0 ? 0 : 1;
