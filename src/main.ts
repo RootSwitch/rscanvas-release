@@ -45,8 +45,8 @@ import { encrypt, decrypt, credentialStoreReady, CredentialKeyMissing } from './
 import { validateProfile, isPermittedEnvRef, type ProfileView } from './credentials/profiles.ts';
 import { loadRulesConfig } from './alerts/scan.ts';
 import { mergeOverrides } from './alerts/overrides.ts';
-import { GROUP_KIND, parseGroupKey } from './alerts/groups.ts';
-import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS, BOOL_RULE_KINDS } from './alerts/rules.ts';
+import { GROUP_KIND, OUTSIDE_VALUE, parseGroupKey } from './alerts/groups.ts';
+import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS, BOOL_RULE_KINDS, PATH_RULE_KINDS, SERVICE_RULE_KINDS, THROUGHPUT_RULE_KINDS } from './alerts/rules.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
 import { parseSourceDeclaration, sameCoverage } from './boards/source.ts';
@@ -58,6 +58,12 @@ import { serializeMetrics } from './health/metrics.ts';
 // can actually probe.
 import { SUPPORTED_CHECKS } from './collector/reach.ts';
 import {
+    defaultCheckName, isCheckKind, isPathKind, OUTCOME_TEXT, outcomeName, parseCheckDef, parseCheckName, storedDef,
+    throughputFits,
+    type CheckDef, type CheckKind, type CheckResult, type HttpCheckDef, type TcpCheckDef, type ThroughputCheckDef,
+    type VoiceCheckDef,
+} from './checks/model.ts';
+import {
     sendJson, sendJsonGzip, enforce, readJsonBody, readBodyOr400, containsNul, clientIp, inetOrNull, BODY_CAP_BULK, BODY_CAP_DOC, securityHeaders,
     crossSiteRefusal,
 } from './http/respond.ts';
@@ -66,13 +72,14 @@ import * as exportRoutes from './http/routes-export.ts';
 import * as exportJobs from './export/jobs.ts';
 import {
     isPartitionHealthy, isFrontierHealthy, isJobsHealthy, isHeartbeatHealthy,
-    isKernelDropFree, evaluateWorkers, isDbSelfHealthy, isRetentionEnforcing, isNotifyDelivering,
+    isKernelDropFree, evaluateWorkers, isDbSelfHealthy, isRetentionEnforcing, isNotifyDelivering, isPollRecording,
     type IngestStats, type CollectorStats, type JobsStats, type DbSelfState,
 } from './workers/protocol.ts';
 import {
     DASHBOARD_WINDOWS, parseWindowHours, bytesFromHourlyBps, countFromHourlyRate, coverage, trend,
     reportLines, reportCsv, isDay, isTimeZone,
 } from './reports/traffic.ts';
+import { parseReportKind, REPORT_KINDS, serviceCsv, serviceLines, SERVICE_COLUMNS } from './reports/services.ts';
 import { safeLogArgs } from './logsafe.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -103,6 +110,9 @@ let dashboardLastAsked = 0;
 let dashboardWarming = false;
 const REPORT_MAX_INTERFACES = 50;
 const REPORT_MAX_DAYS = 366;
+/** A services report names at most this many checks; none named is every
+ *  check of its kind, which a fleet of sites will usually want. */
+const REPORT_MAX_CHECKS = 500;
 
 // THE ORDERING IS CHECKED, NOT TRUSTED. Main must outwait the ingest worker's
 // drain deadline; if it does not, main exits while the worker is still writing
@@ -327,6 +337,79 @@ function probeDevices(targets: Array<Record<string, unknown>>): Promise<unknown[
     });
 }
 
+/**
+ * A service check was saved, paused or removed (slice 58): reload now. Fire
+ * and forget, the credentials pattern - the collector's minute timer is what
+ * makes it reliable, this makes it prompt.
+ */
+function checksChanged(): void {
+    collector?.postMessage({ type: 'checks' });
+}
+
+/**
+ * One run of one check on the collector thread, for the add form's Test
+ * button - the thread that owns the network, through the probe plumbing.
+ */
+function testCheck(kind: CheckKind, def: CheckDef, deviceHost: string, rttMs: number | null): Promise<CheckResult> {
+    return new Promise((resolve, reject) => {
+        if (collector === null) {
+            reject(new Error('the collector worker is not running, so nothing can be checked (COLLECTOR_ENABLED=0)'));
+            return;
+        }
+        const id = crypto.randomUUID();
+        // The check's own timeout bounds the run; the margin is the hop
+        // across threads and a collector with other work in hand.
+        const timer = setTimeout(() => {
+            pendingProbes.delete(id);
+            reject(new Error('the test did not finish in time - the collector may be saturated'));
+        // A path test may wait its turn at the gate behind a throughput test
+        // (slice 61) before it runs at all.
+        }, (def.timeoutS + (isPathKind(kind) ? 120 : 0)) * 1000 + 15_000);
+        pendingProbes.set(id, { resolve: (r) => resolve(r[0] as CheckResult), reject, timer });
+        collector.postMessage({ type: 'check-test', id, check: { kind, def, deviceHost, rttMs } });
+    });
+}
+
+/**
+ * A check's last outcome in words, and whether that run is recent enough to
+ * stand - three of the check's own intervals, the scan's freshness rule, so
+ * neither the card nor the Dashboard can call a check healthy that the
+ * engine has frozen. One rule for both (slice 58; the Dashboard 2026-10-07).
+ */
+function checkState(r: { extra?: unknown; lv_ts?: unknown; lv_v5?: unknown }): {
+    outcome: string | null; text: string | null; fresh: boolean;
+} {
+    const iv = Number((r.extra as { intervalS?: unknown } | null | undefined)?.intervalS);
+    const intervalS = Number.isFinite(iv) && iv > 0 ? iv : 60;
+    const lv = r.lv_ts instanceof Date ? r.lv_ts.getTime() : r.lv_ts ? Date.parse(String(r.lv_ts)) : NaN;
+    const o = outcomeName(typeof r.lv_v5 === 'number' ? r.lv_v5 : null);
+    return {
+        outcome: o, text: o === null ? null : OUTCOME_TEXT[o],
+        fresh: Number.isFinite(lv) && Date.now() - lv < 3 * intervalS * 1000,
+    };
+}
+
+/** What a check points at, in one line, for the audit trail. */
+function checkTarget(kind: CheckKind, def: CheckDef): string {
+    if (kind === 'path-tput') {
+        const d = def as ThroughputCheckDef;
+        return `throughput ${d.host ?? 'device address'}:${d.port}, ${d.durationS} s each way, `
+            + (d.mode !== 'max' ? `capped at ${d.capMbps} Mbps`
+                : d.windowStart === 0 && d.windowEnd === 24 ? 'uncapped any hour'
+                : `uncapped ${d.windowStart}:00-${d.windowEnd}:00`);
+    }
+    if (kind === 'path-voice') {
+        const d = def as VoiceCheckDef;
+        return `voice ${d.host ?? 'device address'}:${d.port} for ${d.durationS} s, dscp ${d.dscp}`;
+    }
+    if (kind === 'svc-tcp') {
+        const d = def as TcpCheckDef;
+        return `tcp ${d.host ?? 'device address'}:${d.port}`;
+    }
+    const d = def as HttpCheckDef;
+    return `${d.method} ${d.url}${d.connect === 'pin' ? ' (pinned to the device)' : ''}`;
+}
+
 // --- helpers -----------------------------------------------------------------
 
 function parseWindow(params: URLSearchParams): { from: Date; to: Date } | { error: string } {
@@ -479,6 +562,9 @@ async function health(res: http.ServerResponse, deep: boolean): Promise<void> {
         // about a worker that is not running.
         ...(CONFIG.collectorEnabled
             ? [isPartitionHealthy(collectorStats?.partitions, 'collector')] : []),
+        // Polls that failed on the database are no longer written against the
+        // device (2026-10-06), so the refusal has to show here instead.
+        isPollRecording(collectorStats, CONFIG.collectorEnabled),
         isFrontierHealthy(jobsStats?.frontier, CONFIG.jobsEnabled),
         // A wedged RETENTION reaches the same disk exhaustion as a wedged
         // rollup, with the frontier current and healthy the whole way. Nothing
@@ -774,6 +860,7 @@ const STATIC_FILES: Record<string, { file: string; type: string }> = {
     '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
     '/dom.js': { file: 'dom.js', type: 'text/javascript; charset=utf-8' },
     '/parse.js': { file: 'parse.js', type: 'text/javascript; charset=utf-8' },
+    '/service-health.js': { file: 'service-health.js', type: 'text/javascript; charset=utf-8' },
     '/charts.js': { file: 'charts.js', type: 'text/javascript; charset=utf-8' },
     '/themes.js': { file: 'themes.js', type: 'text/javascript; charset=utf-8' },
     // Slice 32: the device-type artwork. Served like themes.js and for the
@@ -1234,7 +1321,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                 if (m !== null && m.ok) {
                     group = {
                         axis: gk.axis, value: gk.value, minDown: m.rows[0]?.min_down ?? null,
-                        members: m.rows.map((x) => ({ name: x.name, status: x.st })),
+                        members: m.rows.map((x) => ({ name: x.name, status: x.st, device: x.device })),
                     };
                 }
             }
@@ -1451,6 +1538,59 @@ const server = createWebServer(tlsPair, (req, res) => {
             });
             return;
         }
+        if (path === '/api/report/services' && method === 'GET') {
+            // The services report (SLICE-SERVICE-VIEWS-PLAN step 3): one kind of
+            // check per report, its days and a pooled total per check, from the
+            // hourly rollup - the interface report's shape and limits, with
+            // the arithmetic in src/reports/services.ts.
+            if (!enforce(res, principal, 'devices.read')) return;
+            const kind = parseReportKind(url.searchParams.get('kind'));
+            if (kind === null) { sendJson(res, 400, { ok: false, detail: 'kind is voice, bandwidth or web' }); return; }
+            const rawCodes = url.searchParams.get('codes');
+            const codes = rawCodes === null || rawCodes.trim() === '' ? null
+                : [...new Set(rawCodes.split(',').map((c) => c.trim()).filter((c) => c !== ''))];
+            if (codes !== null && (codes.length > REPORT_MAX_CHECKS || codes.some((c) => !/^[A-Za-z0-9_-]{1,64}$/.test(c)))) {
+                sendJson(res, 400, { ok: false, detail: `codes: up to ${REPORT_MAX_CHECKS} check codes, comma separated, or none for every check of the kind` });
+                return;
+            }
+            const fromDay = url.searchParams.get('from');
+            const toDay = url.searchParams.get('to');
+            if (!isDay(fromDay) || !isDay(toDay) || fromDay > toDay) {
+                sendJson(res, 400, { ok: false, detail: 'from and to must be dates (YYYY-MM-DD), from not after to' });
+                return;
+            }
+            if ((Date.parse(toDay) - Date.parse(fromDay)) / 86_400_000 > REPORT_MAX_DAYS) {
+                sendJson(res, 400, { ok: false, detail: `a report covers at most ${REPORT_MAX_DAYS} days` });
+                return;
+            }
+            const tz = url.searchParams.get('tz') ?? 'UTC';
+            if (!isTimeZone(tz)) { sendJson(res, 400, { ok: false, detail: 'tz must be a time zone name, e.g. America/Chicago' }); return; }
+            const f = await OPS.rollupFrontier();
+            if (!f.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${f.reason})` }); return; }
+            const frontier = f.rows[0]?.through_ts ?? null;
+            const r = frontier === null ? null
+                : await OPS.serviceReport([...REPORT_KINDS[kind]], codes, fromDay, toDay, tz, new Date(frontier));
+            if (r !== null && !r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            const lines = serviceLines(kind, r === null ? [] : r.rows);
+            if (url.searchParams.get('format') === 'csv') {
+                res.writeHead(200, {
+                    'content-type': 'text/csv; charset=utf-8',
+                    'content-disposition': `attachment; filename="rscanvas-${kind}-${fromDay}-to-${toDay}.csv"`,
+                    'cache-control': 'no-store',
+                });
+                res.end(serviceCsv(kind, lines));
+                return;
+            }
+            const found = new Set((r?.rows ?? []).map((x) => x.code));
+            sendJson(res, 200, {
+                ok: true, kind, from: fromDay, to: toDay, tz,
+                through: frontier === null ? null : new Date(frontier).toISOString(),
+                columns: SERVICE_COLUMNS[kind], lines,
+                // Codes that matched no check of this kind: said, not silently dropped.
+                missing: codes === null ? [] : codes.filter((c) => !found.has(c)),
+            });
+            return;
+        }
         // --- event alert rules (slice 10) ----------------------------------
         // --- group alerts (slice 55) ------------------------------------------
         //
@@ -1475,6 +1615,23 @@ const server = createWebServer(tlsPair, (req, res) => {
                     hasRule: r !== undefined,
                 });
             }
+            // OUTSIDE SERVICES (slice 59): one more row, over the service
+            // checks marked outside rather than a group's devices. Shown
+            // once there is an outside check or a rule, so a fleet with no
+            // checks is not offered a group with nothing in it.
+            const outsideKey = JSON.stringify(['outside', OUTSIDE_VALUE]);
+            const outsideRule = byKey.get(outsideKey);
+            byKey.delete(outsideKey);
+            const oc = await OPS.outsideCheckCounts();
+            const counts = oc.ok ? oc.rows[0] : undefined;
+            if (outsideRule !== undefined || (counts !== undefined && counts.up + counts.down + counts.other > 0)) {
+                out.push({
+                    axis: 'outside', value: OUTSIDE_VALUE,
+                    up: counts?.up ?? 0, down: counts?.down ?? 0, other: counts?.other ?? 0,
+                    enabled: outsideRule?.enabled ?? false, thresholdPct: outsideRule?.threshold_pct ?? 50,
+                    minDown: outsideRule?.min_down ?? 3, hasRule: outsideRule !== undefined,
+                });
+            }
             for (const r of byKey.values()) {
                 out.push({
                     axis: r.axis, value: r.value, up: 0, down: 0, other: 0,
@@ -1488,14 +1645,20 @@ const server = createWebServer(tlsPair, (req, res) => {
             if (!enforce(res, principal, 'alertrule.write')) return;
             const body = await readBodyOr400(req, res);
             if (body === null) return;
-            const axis = body.axis === 'location' || body.axis === 'application' ? body.axis : null;
+            const axis = body.axis === 'location' || body.axis === 'application' || body.axis === 'outside' ? body.axis : null;
             const value = typeof body.value === 'string' ? body.value.trim() : '';
             const pct = Number(body.thresholdPct);
             const minDown = Number(body.minDown);
-            if (axis === null) { sendJson(res, 400, { ok: false, detail: 'axis must be location or application' }); return; }
+            if (axis === null) { sendJson(res, 400, { ok: false, detail: 'axis must be location, application or outside' }); return; }
+            // The outside-services group has one value, not a name the
+            // operator chose (slice 59).
+            if (axis === 'outside' && value !== OUTSIDE_VALUE) {
+                sendJson(res, 400, { ok: false, detail: `the outside group's value is ${OUTSIDE_VALUE}` });
+                return;
+            }
             if (value === '' || value.length > 200) { sendJson(res, 400, { ok: false, detail: 'value must name a group (1 to 200 characters)' }); return; }
             if (!Number.isInteger(pct) || pct < 1 || pct > 100) { sendJson(res, 400, { ok: false, detail: 'thresholdPct must be a whole percent, 1 to 100' }); return; }
-            if (!Number.isInteger(minDown) || minDown < 1 || minDown > 100000) { sendJson(res, 400, { ok: false, detail: 'minDown must be a whole number of devices, at least 1' }); return; }
+            if (!Number.isInteger(minDown) || minDown < 1 || minDown > 100000) { sendJson(res, 400, { ok: false, detail: 'minDown must be a whole number, at least 1' }); return; }
             const enabled = body.enabled === true;
             const w = await OPS.setGroupAlertRule(axis, value, enabled, pct, minDown, principal.kind === 'user' ? principal.username : 'unknown');
             if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
@@ -1938,6 +2101,23 @@ const server = createWebServer(tlsPair, (req, res) => {
                         }
                         return differs ? { ...r, ifRules: rules } : r;
                     }
+                    // A SERVICE CHECK'S FOUR RULES (slice 58), shipped only
+                    // when one differs from the default - the interface
+                    // rows' quiet-norm rule - so a muted check says MUTED on
+                    // its card.
+                    if (r.source === 'probe') {
+                        const rules: Record<string, { source: string; muted: boolean; warn: number | null; crit: number | null }> = {};
+                        let differs = false;
+                        for (const k of r.kind === 'path-voice' ? PATH_RULE_KINDS : r.kind === 'path-tput' ? THROUGHPUT_RULE_KINDS : SERVICE_RULE_KINDS) {
+                            const info = resolveRuleInfo(idx, cfg, k, String(r.code), name);
+                            rules[k] = {
+                                source: info.source, muted: info.muted,
+                                warn: info.levels?.warn ?? null, crit: info.levels?.crit ?? null,
+                            };
+                            if (info.source !== 'default' && info.source !== 'none') differs = true;
+                        }
+                        return differs ? { ...r, checkRules: rules } : r;
+                    }
                     const info = resolveRuleInfo(idx, cfg, ek(String(r.kind)), String(r.code), name);
                     if (info.source === 'none') return r;
                     return {
@@ -1949,6 +2129,11 @@ const server = createWebServer(tlsPair, (req, res) => {
                     };
                 });
             } catch { /* annotation only - the entities still ship bare */ }
+            // SERVICE CHECKS (slice 58): the last outcome in words, and
+            // whether that run is recent enough to stand - three of the
+            // check's own intervals, the scan's freshness rule, so the card
+            // cannot call a check healthy that the engine has frozen.
+            entities = entities.map((r) => (r.source !== 'probe' ? r : { ...r, check: checkState(r) }));
             // SNMP round-trip over the last hour, in the same response so the
             // banner needs no second fetch. samples.rtt_ms has carried this per
             // row since slice 4; this is the first thing to read it back.
@@ -2539,10 +2724,153 @@ const server = createWebServer(tlsPair, (req, res) => {
                 changedRows.push(...t.rows);
             }
             const t = { rows: changedRows };
+            // Untracking a service check is PAUSING it (slice 58): the
+            // collector stops running it, so tell it now rather than at the
+            // next minute.
+            if (t.rows.some((x) => isCheckKind(x.kind))) checksChanged();
             await auth.audit(principal, 'device.track', name,
                 { changed: t.rows.map((x) => `${x.name}=${x.tracked ? 'tracked' : 'untracked'}`) },
                 inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, changed: t.rows.map((x) => ({ name: x.name, tracked: x.tracked })) });
+            return;
+        }
+        // --- service checks (slice 58) ---------------------------------------
+        //
+        // Add, edit and test share one parse: the device by name, the kind
+        // (from the body to add or test, from the stored row to edit - a
+        // check never changes kind), the definition through parseCheckDef,
+        // the name. What comes back from a test is outcome, timings and pass
+        // or fail; the response body never leaves the collector thread.
+        if ((path === '/api/checks' || path === '/api/checks/update' || path === '/api/checks/test')
+            && method === 'POST') {
+            if (!enforce(res, principal, 'check.write')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const deviceName = String(body.device ?? '');
+            const dev = await OPS.devicesByName([deviceName]);
+            if (!dev.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${dev.reason})` }); return; }
+            const d = dev.rows[0];
+            if (d === undefined) { sendJson(res, 404, { ok: false, detail: `no device named ${JSON.stringify(deviceName)}` }); return; }
+            const own = await OPS.deviceChecks(d.id);
+            if (!own.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${own.reason})` }); return; }
+            const editing = path === '/api/checks/update' ? String(body.code ?? '') : null;
+            let kind: CheckKind;
+            if (editing !== null) {
+                const row = own.rows.find((c) => c.code === editing);
+                if (row === undefined || !isCheckKind(row.kind)) {
+                    sendJson(res, 404, { ok: false, detail: `${deviceName} has no check ${JSON.stringify(editing)}` });
+                    return;
+                }
+                kind = row.kind;
+            } else {
+                if (!isCheckKind(body.kind)) { sendJson(res, 400, { ok: false, detail: 'kind is svc-http or svc-tcp' }); return; }
+                kind = body.kind;
+            }
+            const parsed = parseCheckDef(kind, body);
+            if (!parsed.ok) { sendJson(res, 400, { ok: false, detail: parsed.detail }); return; }
+            const nm = parseCheckName(body.name, defaultCheckName(kind, parsed.def));
+            if (!nm.ok) { sendJson(res, 400, { ok: false, detail: nm.detail }); return; }
+            const target = `${deviceName}/${nm.name}`;
+            const details = {
+                kind, target: checkTarget(kind, parsed.def), intervalS: parsed.def.intervalS,
+                ...(kind === 'svc-http' ? {
+                    verifyTls: (parsed.def as HttpCheckDef).verifyTls,
+                    assertion: (parsed.def as HttpCheckDef).assertion?.type ?? null,
+                } : {}),
+            };
+
+            if (path === '/api/checks/test') {
+                let r: CheckResult;
+                try {
+                    r = await testCheck(kind, parsed.def, d.host, d.ping_rtt_ms);
+                } catch (err) {
+                    sendJson(res, 503, { ok: false, detail: (err as Error).message });
+                    return;
+                }
+                // Audited: a test is RSCanvas fetching a URL on an admin's
+                // word, which is the act the trail exists to record, saved
+                // or not.
+                await auth.audit(principal, 'check.test', target, { ...details, outcome: r.outcome }, inetOrNull(clientIp(req)));
+                sendJson(res, 200, { ok: true, result: { ...r, outcomeText: OUTCOME_TEXT[r.outcome] } });
+                return;
+            }
+
+            // THROUGHPUT TESTS RUN ONE AT A TIME (slice 61), so a new or
+            // changed one is judged against all of them, fleet-wide, and a
+            // schedule that cannot fit is refused here with its numbers -
+            // never quietly stretched until hourly means every seventy minutes.
+            if (kind === 'path-tput') {
+                const all = await OPS.throughputChecks();
+                if (!all.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${all.reason})` }); return; }
+                const others = all.rows.filter((x) => x.code !== editing)
+                    .map((x) => storedDef('path-tput', x.extra)).filter((x): x is CheckDef => x !== null) as ThroughputCheckDef[];
+                const fit = throughputFits([...others, parsed.def as ThroughputCheckDef]);
+                if (!fit.ok) { sendJson(res, 409, { ok: false, detail: fit.detail }); return; }
+            }
+            if (own.rows.some((c) => c.name === nm.name && c.code !== editing)) {
+                sendJson(res, 409, { ok: false, detail: `${deviceName} already has a check named ${JSON.stringify(nm.name)}` });
+                return;
+            }
+            const extra = JSON.stringify(parsed.def);
+            if (editing !== null) {
+                const w = await OPS.updateCheck(d.id, editing, nm.name, extra);
+                if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+                if (w.rows.length === 0) { sendJson(res, 404, { ok: false, detail: 'that check is gone' }); return; }
+                await auth.audit(principal, 'check.update', target, { ...details, code: editing }, inetOrNull(clientIp(req)));
+                checksChanged();
+                sendJson(res, 200, { ok: true, code: editing, detail: `${nm.name} saved - the next run uses it` });
+                return;
+            }
+            const taken = await OPS.takenCodes();
+            if (!taken.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${taken.reason})` }); return; }
+            // The code is minted like any entity's, from the device and the
+            // check's name, and persisted - a board can bind to it like a
+            // sensor's.
+            const code = generateCode(deviceName, `check:${nm.name}`, new Set(taken.rows.map((t) => t.code)));
+            let w;
+            try {
+                w = await OPS.insertCheck(d.id, kind, nm.name, code, extra);
+            } catch (err) {
+                const e = err as { code?: string; message: string };
+                if (e.code === '23505') {
+                    sendJson(res, 409, { ok: false, detail: 'another entity took that code a moment ago - save again' });
+                    return;
+                }
+                throw err;
+            }
+            if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+            await auth.audit(principal, 'check.create', target, { ...details, code }, inetOrNull(clientIp(req)));
+            checksChanged();
+            sendJson(res, 200, { ok: true, code, detail: `${nm.name} added - its first run is within one interval` });
+            return;
+        }
+        if (path === '/api/checks/delete' && method === 'POST') {
+            if (!enforce(res, principal, 'check.write')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const deviceName = String(body.device ?? '');
+            const code = String(body.code ?? '');
+            const dev = await OPS.devicesByName([deviceName]);
+            if (!dev.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${dev.reason})` }); return; }
+            const d = dev.rows[0];
+            if (d === undefined) { sendJson(res, 404, { ok: false, detail: `no device named ${JSON.stringify(deviceName)}` }); return; }
+            const w = await OPS.deleteCheck(d.id, code);
+            if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+            const gone = w.rows[0];
+            if (gone === undefined) { sendJson(res, 404, { ok: false, detail: `${deviceName} has no check ${JSON.stringify(code)}` }); return; }
+            await auth.audit(principal, 'check.delete', `${deviceName}/${gone.name}`, { code, kind: gone.kind }, inetOrNull(clientIp(req)));
+            checksChanged();
+            sendJson(res, 200, { ok: true, detail: `${gone.name} removed - its history stays until raw retention ages it out` });
             return;
         }
         if (path === '/api/devices/scan' && method === 'POST') {
@@ -4098,6 +4426,19 @@ const server = createWebServer(tlsPair, (req, res) => {
             sendJson(res, 200, { ok: true, axis, groups: r.rows });
             return;
         }
+        if (path === '/api/dashboard/services' && method === 'GET') {
+            // The Dashboard's Service health (SLICE-SERVICE-VIEWS-PLAN part A):
+            // every check with its last run, the run before, and its 24 h -
+            // assembled into counts and the sites table by the page
+            // (public/service-health.js), coloured by the open alerts it
+            // already holds. Live, interactive lane, the 10 s refresh.
+            if (!enforce(res, principal, 'devices.read')) return;
+            const r = await OPS.serviceHealth();
+            if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            sendJson(res, 200, { ok: true, checks: r.rows.map((row) => ({ ...row, check: checkState(row) })) });
+            return;
+        }
+
         if (path === '/api/dashboard/groups' && method === 'GET') {
             // The Dashboard's health by location and application: live, on
             // the interactive lane, fetched with the page's 10 s refresh -

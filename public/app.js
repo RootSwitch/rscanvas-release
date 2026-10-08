@@ -8,6 +8,7 @@
 import { cell, pill, badge, dotCell, rowEl } from './dom.js';
 import { parseHosts, parseDeviceFilter, deviceMatches } from './parse.js';
 import * as Charts from './charts.js';
+import { alertsByCode, kindCounts, siteRows, serviceRows } from './service-health.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -165,6 +166,8 @@ function deliveryCell(a) {
     // Slice 55: held under its group's alert, which names it. Same marker
     // discipline - withheld must be visible, and say by what.
     if (a.in_group) return pill('held - group alert', 'badge policy');
+    // Slice 59: an outside check waiting to see whether it is alone.
+    if (a.settling) return pill('held - settling', 'badge policy');
     return a.notify_attempts > 0
         ? pill(`owed (${a.notify_attempts} failed)`, 'badge owed')
         : pill('owed', 'badge owed');
@@ -212,7 +215,7 @@ function renderAlerts(data) {
             deliveryCell(a),
         ]);
         row.className = 'clickable';
-        if (a.in_maintenance || a.under_policy || a.in_group) row.classList.add('maint-row');
+        if (a.in_maintenance || a.under_policy || a.in_group || a.settling) row.classList.add('maint-row');
         row.addEventListener('click', () => showAlert(a.id));
         tbody.appendChild(row);
     }
@@ -415,10 +418,23 @@ function renderAlertDetail(a, history) {
     }
     // Slice 55: a member held under its group's alert.
     if (a.in_group) {
-        const d = factLine('group',
-            'its location or application has an open group alert - this alert is recorded'
-            + ' and visible, and its email is held: the group\'s email names it. If it is'
-            + ' still down when the group alert clears, it is emailed then.');
+        const d = factLine('group', a.kind === 'svc-down'
+            ? 'the outside services group alert is open, or cleared moments ago - this is one'
+              + ' of the outside checks failing together. This alert is recorded and visible,'
+              + ' and its email is held: the group\'s email names it. If it is still down once'
+              + ' every outside check has run again after the group clears, it is emailed then.'
+            : 'its location or application has an open group alert - this alert is recorded'
+              + ' and visible, and its email is held: the group\'s email names it. If it is'
+              + ' still down when the group alert clears, it is emailed then.');
+        d.className = 'hint';
+        facts.appendChild(d);
+    } else if (a.settling) {
+        // Slice 59: the settling window, said where the operator asks why.
+        const d = factLine('settling',
+            'an outside check, with Outside services watched: its email waits until every'
+            + ' other outside check has run once since it failed. If enough fail with it,'
+            + ' the outside services alert holds it and names it; if not, it is emailed'
+            + ' on its own when the wait ends.');
         d.className = 'hint';
         facts.appendChild(d);
     }
@@ -428,18 +444,20 @@ function renderAlertDetail(a, history) {
         const members = a.group.members || [];
         const down = members.filter((m) => m.status === 'down');
         const known = members.filter((m) => m.status === 'up' || m.status === 'down').length;
-        facts.appendChild(factLine(a.group.axis,
-            `${a.group.value} - ${down.length} of ${known} down now; trips at ${a.threshold}%`
-            + ` and ${a.group.minDown ?? '?'} down`));
+        const outsideGroup = a.group.axis === 'outside';
+        facts.appendChild(factLine(outsideGroup ? 'outside services' : a.group.axis, outsideGroup
+            ? `${down.length} of ${known} outside checks failing now; trips at ${a.threshold}% and ${a.group.minDown ?? '?'} failing`
+            : `${a.group.value} - ${down.length} of ${known} down now; trips at ${a.threshold}%`
+              + ` and ${a.group.minDown ?? '?'} down`));
         if (down.length > 0) {
-            const line = factLine('down now', '');
+            const line = factLine(outsideGroup ? 'failing now' : 'down now', '');
             const v = line.lastChild;
             down.forEach((m, i) => {
                 if (i > 0) v.appendChild(document.createTextNode(', '));
                 const link = document.createElement('a');
                 link.href = '#';
                 link.textContent = m.name;
-                link.addEventListener('click', (ev) => { ev.preventDefault(); showSection('devices'); showDevice(m.name); });
+                link.addEventListener('click', (ev) => { ev.preventDefault(); showSection('devices'); showDevice(m.device || m.name); });
                 v.appendChild(link);
             });
             facts.appendChild(line);
@@ -1764,6 +1782,30 @@ function chartSpec(e) {
             unit: (e.extra && e.extra.unit) || '', series: [{ label: name, cls: 'a', i: 0 }],
         };
         case 'state': return { unit: '', yMax: 1, series: [{ label: name, cls: 'a', area: true, i: 0 }] };
+        // Service checks (slice 58): the response, the connect (with the TLS
+        // handshake) and the name lookup, all in ms. A run that got no
+        // answer has no response time, so an outage draws as a gap.
+        case 'svc-http': return {
+            unit: 'ms',
+            series: [
+                { label: 'response', cls: 'a', area: true, i: 0 },
+                { label: 'connect', cls: 'b', i: 1 },
+                { label: 'name lookup', cls: 'c', i: 4 },
+            ],
+        };
+        case 'svc-tcp': return { unit: 'ms', series: [{ label: 'connect', cls: 'a', area: true, i: 0 }] };
+        // A voice test (slice 60): loss each way, the burst the hourly
+        // maxima keep. Jitter and the MOS are on its card.
+        // A throughput test (slice 61): Mbps each way, the hourly maxima
+        // kept. Latency under load is on its card.
+        case 'path-tput': return {
+            unit: '',
+            series: [{ label: 'Mbps toward the site', cls: 'a', i: 0 }, { label: 'Mbps from it', cls: 'b', i: 1 }],
+        };
+        case 'path-voice': return {
+            unit: 'pct',
+            series: [{ label: 'lost toward the site', cls: 'a', i: 0 }, { label: 'lost from it', cls: 'b', i: 1 }],
+        };
         default: return {
             unit: 'bps',
             series: [{ label: 'in', cls: 'a', area: true, i: 0 }, { label: 'out', cls: 'b', area: true, i: 1 }],
@@ -1787,6 +1829,10 @@ async function openChart(entity) {
     $('chart-wrap').classList.remove('hidden');
     $('chart-title').textContent = entity.name || entity.code;
     $('chart-sub').textContent = 'loading...';
+    // A service check's card is cut to its edge; here it is said in full.
+    const detail = entity.source === 'probe' ? svcDetail(entity) : null;
+    $('chart-detail').textContent = detail ? detail.join('\n') : '';
+    $('chart-detail').classList.toggle('hidden', detail === null);
     const r = await api(`/api/entity/history?code=${encodeURIComponent(entity.code)}&hours=${hours}`);
     // A late reply for a chart the operator has already navigated away from
     // must not overwrite the one they are looking at - and a late reply for
@@ -1915,6 +1961,7 @@ async function openRttChart(name) {
     chartGen += 1;
     const hours = Number($('chart-range').value) || 24;
     $('chart-wrap').classList.remove('hidden');
+    $('chart-detail').classList.add('hidden');
     // Named after the fetch, once it is known which instruments answered -
     // "SNMP round-trip" on a ping-only device was a heading describing a
     // series that is not on the chart.
@@ -1980,6 +2027,7 @@ function closeChart() {
     chartEntity = null;
     chartGen += 1;
     $('chart-wrap').classList.add('hidden');
+    $('chart-detail').classList.add('hidden');
 }
 
 $('chart-close').addEventListener('click', closeChart);
@@ -2217,6 +2265,447 @@ async function setTracked(e, tracked) {
 
 // The button lives inside a clickable row/card, so it must not also open the
 // chart - hence stopPropagation, same as the threshold gear.
+// --- service checks (slice 58) ------------------------------------------------
+//
+// A check's card says its last outcome in words, what it points at, which
+// address answered and how long its certificate has. Clicking opens the
+// response-time chart. Pausing is untracking (operator and up); adding,
+// editing and removing are check.write (admin - a check fetches what its
+// author chose, from inside the network). The Test button runs the check
+// once on the server and shows outcome and timings - never the body, which
+// does not leave the collector.
+
+const SVC_DOWN = new Set(['timeout', 'refused', 'unreachable', 'dns', 'tls-expired', 'tls-name', 'tls-untrusted',
+    'tls-error', 'wrong-status', 'other-host-redirect', 'address-refused', 'reset', 'error']);
+const SVC_RULE_LABEL = new Map([['svc-down', 'down'], ['svc-content', 'content'], ['svc-ms', 'response time'], ['svc-cert', 'certificate'],
+    ['path-down', 'no answer'], ['path-loss', 'loss'], ['path-jitter', 'jitter'], ['path-mos', 'MOS'], ['path-tput', 'throughput']]);
+
+function svcTarget(e) {
+    const x = e.extra || {};
+    if (e.kind === 'path-tput') {
+        return `throughput to ${x.host || 'this device'}:${x.port}, ${x.durationS} s each way, `
+            + (x.mode !== 'max' ? `capped at ${x.capMbps} Mbps`
+                : x.windowStart === 0 && x.windowEnd === 24 ? 'uncapped, any hour'
+                : `uncapped, only ${x.windowStart}:00 to ${x.windowEnd}:00`);
+    }
+    if (e.kind === 'path-voice') {
+        return `voice to ${x.host || 'this device'}:${x.port}, ${x.durationS} s calls${Number(x.dscp) === 46 ? ' marked EF' : ` dscp ${x.dscp}`}`;
+    }
+    if (e.kind === 'svc-tcp') return `tcp ${x.host || 'this device'}:${x.port}`;
+    return `${x.method === 'HEAD' ? 'HEAD ' : ''}${x.url || ''}`;
+}
+
+/** A number for a card's short line: whole above 100 (with separators),
+ *  one decimal from 1, two below - "2,475", "18.4", "0.15". */
+function svcNum(v) {
+    if (v === null || v === undefined || !Number.isFinite(Number(v))) return '-';
+    const n = Number(v);
+    if (n === 0) return '0';
+    if (Math.abs(n) >= 100) return Math.round(n).toLocaleString();
+    if (Math.abs(n) >= 1) return n.toFixed(1);
+    return n.toFixed(2);
+}
+
+/** How often, in words: "every 30 s", "every 5 min", "every 1 h". */
+function svcEvery(s) {
+    const n = Number(s);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    if (n < 120) return `every ${n} s`;
+    if (n < 7200) return `every ${Math.round(n / 60)} min`;
+    return `every ${Math.round(n / 3600)} h`;
+}
+
+/** An uncapped throughput test's hours, short: "any hour" or "1-5 h". */
+function svcHours(x) {
+    return x.windowStart === 0 && x.windowEnd === 24 ? 'any hour' : `${x.windowStart}-${x.windowEnd} h`;
+}
+
+/**
+ * THE CARD'S SHORT LINES (2026-10-07, operator: the cards were "really
+ * dense"). Each is one line, cut at the card's edge; svcDetail below holds
+ * the whole story, for the card's tooltip and for the line under its chart
+ * - which is how a touch screen, with no tooltip, reads what was cut. Two
+ * directions are written "toward / from" the site, always in that order.
+ */
+function svcLines(e) {
+    const x = e.extra || {};
+    const ok = e.tracked && e.check?.outcome === 'ok';
+    if (e.kind === 'path-tput') {
+        const how = x.mode === 'max' ? `max, ${svcHours(x)}` : `capped ${x.capMbps} Mbps`;
+        if (!ok) return [`throughput, ${how}`];
+        return [`to / from the site · ${how}`,
+            `ms: ${svcNum(e.lv_v4)} idle · ${svcNum(e.lv_v2)} loaded · ${svcNum(e.lv_v3)} EF`];
+    }
+    if (e.kind === 'path-voice') {
+        const call = `${x.durationS} s calls${Number(x.dscp) === 46 ? ', EF' : `, dscp ${x.dscp}`}`;
+        if (!ok || e.lv_v0 === null || e.lv_v0 === undefined) return [`voice, ${call}`];
+        return [`loss ${svcNum(e.lv_v0)} / ${svcNum(e.lv_v1)} % · jitter ${svcNum(e.lv_v2)} / ${svcNum(e.lv_v3)} ms`,
+            `to / from the site · ${call}`];
+    }
+    const flags = [];
+    if (e.kind === 'svc-http' && e.lv_v2 !== null && e.lv_v2 !== undefined) {
+        const d = Number(e.lv_v2);
+        flags.push(d < 0 ? `cert EXPIRED ${Math.round(-d)} d ago` : `cert ${Math.floor(d)} d`);
+    }
+    if (e.outside === true) flags.push('outside');
+    const what = e.kind === 'svc-tcp' ? `tcp ${x.host || 'this device'}:${x.port}`
+        : `${x.method === 'HEAD' ? 'HEAD ' : ''}${String(x.url || '').replace(/^https?:\/\//, '')}`;
+    return flags.length > 0 ? [what, flags.join(' · ')] : [what];
+}
+
+/** Everything a card cut short, in full, one fact a line. */
+function svcDetail(e) {
+    const x = e.extra || {};
+    const lines = [svcTarget(e)];
+    const when = [svcEvery(x.intervalS)];
+    if (e.lv_ts) when.push(`last run ${fmtAgo(e.lv_ts)}`);
+    if (e.lv_peer) when.push(`via ${e.lv_peer}`);
+    lines.push(when.filter(Boolean).join(', '));
+    const ok = e.check?.outcome === 'ok';
+    if (!e.tracked) lines.push('paused - not running');
+    else if (e.check && !ok) lines.push(`last outcome: ${e.check.text}`);
+    if (e.kind === 'path-voice' && ok && e.lv_v0 !== null && e.lv_v0 !== undefined) {
+        const dir = (loss, jit) => `${svcNum(loss)}% lost, ${svcNum(jit)} ms jitter`;
+        lines.push(`toward the site ${dir(e.lv_v0, e.lv_v2)}; from it ${dir(e.lv_v1, e.lv_v3)}`);
+        if (e.lv_v4 !== null && e.lv_v4 !== undefined) lines.push(`MOS ${Number(e.lv_v4).toFixed(2)} (the worse direction)`);
+    }
+    if (e.kind === 'path-tput' && ok) {
+        lines.push(`${svcNum(e.lv_v0)} Mbps toward the site, ${svcNum(e.lv_v1)} Mbps from it`);
+        const ms = (v) => (v === null || v === undefined ? '-' : `${svcNum(v)} ms`);
+        lines.push(`latency ${ms(e.lv_v4)} idle, ${ms(e.lv_v2)} under load, ${ms(e.lv_v3)} under load marked EF`);
+    }
+    if (e.kind === 'svc-http' && e.lv_v2 !== null && e.lv_v2 !== undefined) {
+        const d = Number(e.lv_v2);
+        lines.push(d < 0 ? `certificate expired ${Math.round(-d)} days ago` : `certificate valid ${Math.floor(d)} more days`);
+    }
+    if (e.outside === true) lines.push('an outside service - counts toward the outside services alert');
+    if (e.checkRules) {
+        const muted = Object.entries(e.checkRules).filter(([, r]) => r.muted).map(([k]) => SVC_RULE_LABEL.get(k) || k);
+        if (muted.length > 0) lines.push(`alerts MUTED: ${muted.join(', ')}`);
+    }
+    return lines;
+}
+
+function svcPresentation(e) {
+    if (!e.tracked) return { cls: 'untracked', value: 'paused' };
+    const c = e.check || {};
+    if (e.lv_ts === null || e.lv_ts === undefined) return { cls: 'svc-stale', value: 'not run yet' };
+    if (!c.fresh) return { cls: 'svc-stale', value: `no run since ${fmtAgo(e.lv_ts)}` };
+    if (e.kind === 'path-tput') {
+        // Both directions in the headline: which way is short is the
+        // question a throughput test answers.
+        if (c.outcome === 'ok') return { cls: '', value: `${svcNum(e.lv_v0)} / ${svcNum(e.lv_v1)} Mbps` };
+        if (c.outcome === 'busy') return { cls: 'svc-stale', value: 'responder busy' };
+        return { cls: 'svc-warn', value: c.text || 'no verdict' };
+    }
+    if (e.kind === 'path-voice') {
+        // The headline is the MOS when there is one (it folds loss, jitter
+        // and delay into the number people know), else the worse loss. A
+        // responder that does not answer is amber - path-down warns - and
+        // a busy one is grey, since busy is a gap, not a fault.
+        if (c.outcome === 'ok') {
+            return { cls: '', value: e.lv_v4 !== null && e.lv_v4 !== undefined
+                ? `MOS ${Number(e.lv_v4).toFixed(2)}` : `${svcNum(Math.max(e.lv_v0, e.lv_v1))}% lost` };
+        }
+        if (c.outcome === 'busy') return { cls: 'svc-stale', value: 'responder busy' };
+        return { cls: 'svc-warn', value: c.text || 'no verdict' };
+    }
+    const ms = e.lv_v0 === null || e.lv_v0 === undefined ? null : Math.round(e.lv_v0);
+    if (c.outcome === 'ok') {
+        return { cls: '', value: e.kind === 'svc-tcp' ? `open in ${ms} ms` : `${e.lv_status} in ${ms} ms` };
+    }
+    if (c.outcome === 'wrong-content' || c.outcome === 'too-large') return { cls: 'svc-warn', value: c.text };
+    if (c.outcome === 'wrong-status') return { cls: 'alarm', value: `${e.lv_status}, not expected` };
+    if (SVC_DOWN.has(c.outcome)) return { cls: 'alarm', value: c.text };
+    return { cls: 'svc-stale', value: c.text || 'no verdict' };
+}
+
+/** Which card's actions are open, by code - kept across the page's
+ *  10-second re-render, which rebuilds every card. */
+let svcActionsOpen = null;
+
+function renderServiceCards(services) {
+    const box = $('services');
+    if (svcFormDevice !== null && svcFormDevice !== currentDevice) svcFormHide();
+    box.classList.toggle('hidden', services.length === 0 && !can('check.write'));
+    const wrap = $('service-cards');
+    wrap.replaceChildren();
+    wrap.classList.toggle('hidden', services.length === 0);
+    if (!services.some((e) => e.code === svcActionsOpen)) svcActionsOpen = null;
+    for (const e of [...services].sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
+        const p = svcPresentation(e);
+        const card = document.createElement('div');
+        card.className = `card clickable${p.cls ? ` ${p.cls}` : ''}`;
+        // The whole story on hover; a click opens the chart, whose detail
+        // line says the same for a screen with no hover.
+        card.title = `${e.name}\n${svcDetail(e).join('\n')}\n\n`
+            + (e.tracked ? 'click for its history' : 'paused - click for what was recorded while it ran');
+        card.addEventListener('click', () => openChart(e));
+        const head = document.createElement('div');
+        head.className = 'card-head';
+        const nm = document.createElement('span');
+        nm.className = 'card-name';
+        nm.textContent = e.name;
+        head.appendChild(nm);
+        // ONE BUTTON for the actions, not three: pause, edit and remove took
+        // most of a card's head, and the name was what got cut.
+        const actions = [];
+        if (can('device.track')) {
+            actions.push([e.tracked ? 'pause' : 'resume',
+                e.tracked ? 'stop running this check - an open alert for it clears as source-removed' : 'run this check again',
+                () => setTracked(e, !e.tracked)]);
+        }
+        if (can('check.write')) {
+            actions.push(['edit', 'change what this check does', () => svcFormShow(e)]);
+            actions.push(['remove', 'remove this check - its history stays until raw retention ages it out', () => svcRemove(e)]);
+        }
+        let row = null;
+        if (actions.length > 0) {
+            const open = svcActionsOpen === e.code;
+            const more = document.createElement('button');
+            more.type = 'button';
+            more.className = 'btn-track card-more';
+            more.textContent = '⋯';
+            more.title = actions.map(([label]) => label).join(', ');
+            more.setAttribute('aria-expanded', String(open));
+            head.appendChild(more);
+            row = document.createElement('div');
+            row.className = `card-actions${open ? '' : ' hidden'}`;
+            for (const [label, title, fn] of actions) {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'btn-track';
+                b.textContent = label;
+                b.title = title;
+                b.addEventListener('click', (ev) => { ev.stopPropagation(); svcActionsOpen = null; fn(); });
+                row.appendChild(b);
+            }
+            more.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                svcActionsOpen = svcActionsOpen === e.code ? null : e.code;
+                const nowOpen = svcActionsOpen === e.code;
+                row.classList.toggle('hidden', !nowOpen);
+                more.setAttribute('aria-expanded', String(nowOpen));
+            });
+        }
+        const val = document.createElement('div');
+        val.className = 'card-value card-clip';
+        val.textContent = p.value;
+        card.append(head);
+        if (row) card.append(row);
+        card.append(val);
+        for (const text of svcLines(e)) {
+            const line = document.createElement('div');
+            line.className = 'card-sub card-clip';
+            line.textContent = text;
+            card.appendChild(line);
+        }
+        if (e.checkRules && Object.values(e.checkRules).some((r) => r.muted)) {
+            const th = document.createElement('div');
+            th.className = 'muted small card-clip';
+            th.textContent = 'alerts muted';
+            card.appendChild(th);
+        }
+        wrap.appendChild(card);
+    }
+}
+
+let svcEditing = null;
+let svcFormDevice = null;
+
+function svcFormKind() {
+    const kind = $('svc-kind').value;
+    const show = (cls, on) => { for (const el of document.querySelectorAll(`#svc-form .${cls}`)) el.classList.toggle('hidden', !on); };
+    const path = kind === 'path-voice' || kind === 'path-tput';
+    show('svc-http', kind === 'svc-http');
+    show('svc-target', kind === 'svc-tcp' || path);
+    // A path test (slices 60, 61) has no timeout of the operator's (its
+    // calls set it) and is never an outside service.
+    show('svc-service', !path);
+    show('svc-path', path);
+    show('svc-voice', kind === 'path-voice');
+    show('svc-tput', kind === 'path-tput');
+    const max = $('svc-mode').value === 'max';
+    show('svc-headroom', kind === 'path-tput' && !max);
+    show('svc-max', kind === 'path-tput' && max);
+    show('svc-window', $('svc-hours').value === 'window');
+    $('svc-port').placeholder = path ? '5201' : '';
+    $('svc-interval-hint').textContent = kind === 'path-tput' ? 'seconds (at least 300; tests run one at a time)'
+        : 'seconds (at least 60)';
+    const t = $('svc-assert-type').value;
+    for (const el of document.querySelectorAll('#svc-form .svc-assert-kw')) el.classList.toggle('hidden', t !== 'contains' && t !== 'absent');
+    for (const el of document.querySelectorAll('#svc-form .svc-assert-json')) el.classList.toggle('hidden', t !== 'json');
+}
+
+/** Open the form empty to add, or filled from a check to edit it. */
+function svcFormShow(e) {
+    const x = (e && e.extra) || {};
+    const a = x.assertion || null;
+    svcEditing = e ? e.code : null;
+    svcFormDevice = currentDevice;
+    $('svc-kind').value = e ? e.kind : 'svc-http';
+    // A check never changes kind: remove it and add another.
+    $('svc-kind').disabled = e !== null;
+    $('svc-name').value = e ? e.name : '';
+    $('svc-url').value = x.url || '';
+    $('svc-method').value = x.method || 'GET';
+    $('svc-expect').value = x.expect && x.expect !== '200-299' ? x.expect : '';
+    $('svc-connect').value = x.connect || 'resolve';
+    $('svc-verify').checked = x.verifyTls !== false;
+    $('svc-assert-type').value = a ? a.type : 'none';
+    $('svc-assert-text').value = a && a.text ? a.text : '';
+    $('svc-assert-path').value = a && a.path ? a.path : '';
+    $('svc-assert-op').value = a && a.op ? a.op : 'equals';
+    $('svc-assert-values').value = a && a.values ? a.values.join(', ') : '';
+    $('svc-host').value = x.host || '';
+    $('svc-port').value = x.port ? String(x.port) : '';
+    $('svc-outside').value = x.outside || 'auto';
+    $('svc-duration').value = String(x.durationS || 10);
+    $('svc-dscp').value = String(x.dscp ?? 46);
+    $('svc-mode').value = x.mode || 'headroom';
+    $('svc-cap').value = x.capMbps ? String(x.capMbps) : '';
+    // 0 to 24 is "any hour"; anything else is a window, its hours shown.
+    const anyHour = x.windowStart === 0 && x.windowEnd === 24;
+    $('svc-hours').value = anyHour ? 'any' : 'window';
+    $('svc-wstart').value = anyHour ? '1' : String(x.windowStart ?? 1);
+    $('svc-wend').value = anyHour ? '5' : String(x.windowEnd ?? 5);
+    $('svc-interval').value = String(x.intervalS || 60);
+    $('svc-timeout').value = String(x.timeoutS || 10);
+    $('svc-msg').textContent = '';
+    $('svc-msg').className = 'muted small';
+    $('svc-save').textContent = e ? 'Save changes' : 'Save';
+    svcFormKind();
+    $('svc-form').classList.remove('hidden');
+    $(e ? 'svc-name' : 'svc-url').focus();
+}
+
+function svcFormHide() {
+    $('svc-form').classList.add('hidden');
+    svcEditing = null;
+    svcFormDevice = null;
+}
+
+function svcFormBody() {
+    const kind = $('svc-kind').value;
+    const b = {
+        device: svcFormDevice, kind, name: $('svc-name').value.trim(),
+        intervalS: $('svc-interval').value.trim(), timeoutS: $('svc-timeout').value.trim(),
+        outside: $('svc-outside').value,
+    };
+    if (svcEditing !== null) b.code = svcEditing;
+    if (kind === 'path-tput') {
+        b.host = $('svc-host').value.trim();
+        b.port = $('svc-port').value.trim();
+        b.durationS = $('svc-duration').value.trim();
+        b.mode = $('svc-mode').value;
+        if (b.mode === 'headroom') b.capMbps = $('svc-cap').value.trim();
+        const anyHour = $('svc-hours').value === 'any';
+        b.windowStart = anyHour ? '0' : $('svc-wstart').value.trim();
+        b.windowEnd = anyHour ? '24' : $('svc-wend').value.trim();
+        delete b.timeoutS;
+        delete b.outside;
+        return b;
+    }
+    if (kind === 'path-voice') {
+        b.host = $('svc-host').value.trim();
+        b.port = $('svc-port').value.trim();
+        b.durationS = $('svc-duration').value.trim();
+        b.dscp = $('svc-dscp').value;
+        delete b.timeoutS;
+        delete b.outside;
+        return b;
+    }
+    if (kind === 'svc-tcp') {
+        b.host = $('svc-host').value.trim();
+        b.port = $('svc-port').value.trim();
+        return b;
+    }
+    b.url = $('svc-url').value.trim();
+    b.method = $('svc-method').value;
+    b.expect = $('svc-expect').value.trim();
+    b.connect = $('svc-connect').value;
+    b.verifyTls = $('svc-verify').checked;
+    const t = $('svc-assert-type').value;
+    if (t === 'contains' || t === 'absent') b.assertion = { type: t, text: $('svc-assert-text').value };
+    else if (t === 'json') {
+        const op = $('svc-assert-op').value;
+        const raw = $('svc-assert-values').value;
+        b.assertion = {
+            type: 'json', path: $('svc-assert-path').value.trim(), op,
+            values: op === 'one-of' ? raw.split(',').map((v) => v.trim()).filter((v) => v !== '') : [raw.trim()],
+        };
+    } else b.assertion = null;
+    return b;
+}
+
+function svcSay(text, good) {
+    $('svc-msg').textContent = text;
+    $('svc-msg').className = good === null ? 'muted small' : `small ${good ? 'svc-result-ok' : 'svc-result-bad'}`;
+}
+
+async function svcTest() {
+    svcSay('testing...', null);
+    $('svc-test').disabled = true;
+    try {
+        const r = await api('/api/checks/test', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(svcFormBody()),
+        });
+        if (r.status === 401) { showLogin(); return; }
+        if (!r.ok) { svcSay(r.detail || `test refused (${r.status})`, false); return; }
+        const x = r.result;
+        const parts = [x.outcome === 'ok' ? 'OK' : x.outcomeText, x.detail];
+        if (x.peer) parts.push(`via ${x.peer}`);
+        if (x.dnsMs !== null) parts.push(`lookup ${Math.round(x.dnsMs)} ms`);
+        if (x.certDays !== null) parts.push(x.certDays < 0 ? 'certificate EXPIRED' : `certificate ${Math.floor(x.certDays)} days left`);
+        svcSay(parts.join(' - '), x.outcome === 'ok');
+    } finally {
+        $('svc-test').disabled = false;
+    }
+}
+
+async function svcSave() {
+    svcSay('saving...', null);
+    const r = await api(svcEditing === null ? '/api/checks' : '/api/checks/update', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(svcFormBody()),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { svcSay(r.detail || `save refused (${r.status})`, false); return; }
+    svcFormHide();
+    if (currentDevice) await showDevice(currentDevice);
+    $('device-sub').textContent = r.detail || 'saved';
+}
+
+async function svcRemove(e) {
+    if (!window.confirm(`Remove the check ${oneLine(e.name)}? Its history stays until raw retention ages it out, and an open alert for it clears as source-removed.`)) return;
+    const r = await api('/api/checks/delete', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ device: currentDevice, code: e.code }),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('device-sub').textContent = r.detail || `remove refused (${r.status})`; return; }
+    if (svcEditing === e.code) svcFormHide();
+    if (currentDevice) await showDevice(currentDevice);
+    $('device-sub').textContent = r.detail || 'removed';
+}
+
+$('svc-add').addEventListener('click', () => svcFormShow(null));
+$('svc-kind').addEventListener('change', () => {
+    // A new check's interval follows its kind: a minute for a service,
+    // five for a voice call (slice 60, the plan's cadence).
+    if (svcEditing === null) {
+        const k = $('svc-kind').value;
+        // Hourly for throughput (slice 61, the operator's practice).
+        $('svc-interval').value = k === 'path-tput' ? '3600' : k === 'path-voice' ? '300' : '60';
+    }
+    svcFormKind();
+});
+$('svc-assert-type').addEventListener('change', svcFormKind);
+$('svc-mode').addEventListener('change', svcFormKind);
+$('svc-hours').addEventListener('change', svcFormKind);
+$('svc-test').addEventListener('click', () => { svcTest().catch((err) => svcSay(String(err), false)); });
+$('svc-save').addEventListener('click', () => { svcSave().catch((err) => svcSay(String(err), false)); });
+$('svc-cancel').addEventListener('click', svcFormHide);
+
 function trackButton(e) {
     const b = document.createElement('button');
     b.type = 'button';
@@ -2545,7 +3034,11 @@ function renderEntities(data) {
     // arriving in this payload and rendering as nonsense interface rows -
     // this split is the fix as much as the feature. The filter box stays an
     // interface filter, exactly as its placeholder says.
-    renderSensorCards(lastEntities.filter((e) => e.kind && e.kind !== 'if'));
+    // Service checks (slice 58) are entities too, but RSCanvas's own
+    // measurements rather than an agent's readings: their own cards, above
+    // the sensors, and never in the sensor grid.
+    renderSensorCards(lastEntities.filter((e) => e.kind && e.kind !== 'if' && e.source !== 'probe'));
+    renderServiceCards(lastEntities.filter((e) => e.source === 'probe'));
 
     const canTrack = can('device.track');
     const q = $('entity-filter').value.trim().toLowerCase();
@@ -4429,6 +4922,7 @@ function showSection(name) {
     if (name === 'dashboard') {
         renderDashAlerts();
         loadDashGroups();
+        loadDashServices();
         fillReportDevices();
         syncReportControls();
         if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
@@ -4665,7 +5159,7 @@ function renderDashAlerts() {
             cell(a.raised_ts ? fmtAgo(a.raised_ts) : `breach ${fmtAgo(a.first_breach_ts)}`),
         ]);
         tr.className = 'clickable';
-        if (a.in_maintenance || a.under_policy || a.in_group) tr.classList.add('maint-row');
+        if (a.in_maintenance || a.under_policy || a.in_group || a.settling) tr.classList.add('maint-row');
         tr.addEventListener('click', () => { showSection('alerts'); showAlert(a.id); });
         tbody.appendChild(tr);
     }
@@ -4760,6 +5254,137 @@ async function loadDashGroups() {
         : `${up} up, ${down} down${other > 0 ? `, ${other} pending/unknown` : ''} - transient devices not counted`;
 }
 
+// --- service health (2026-10-07, SLICE-SERVICE-VIEWS-PLAN part A) ----------------
+//
+// Below Device health: the checks counted by kind, the sites table (one row
+// per site, voice and bandwidth side by side, against the run before and
+// the day's low - the operator's rulings), and web and TCP checks in their
+// own table. What is decided lives in service-health.js, tested offline;
+// this draws it. Fetched with Device health, on arrival and with the 10 s
+// refresh, after the alerts it is coloured by.
+
+let dashSvcGen = 0;
+const SVC_DOT = { ok: 'ok', warn: 'warn', fail: 'bad', idle: 'off' };
+const SVC_CELL = { ok: '', warn: 'cell-warn', fail: 'cell-crit', idle: 'muted' };
+
+function openDeviceFrom(name) {
+    showSection('devices');
+    showDevice(name);
+}
+
+function svcDeltaMos(d) {
+    if (d === null) return '';
+    return Math.abs(d) < 0.005 ? 'same' : `${d > 0 ? '+' : ''}${d.toFixed(2)}`;
+}
+
+function renderDashServices(checks) {
+    dashSvcChecks = checks;
+    renderSvcReportPick();
+    syncSvcReportControls();
+    const alerts = alertsByCode(alertData.open);
+    const counts = kindCounts(checks, alerts);
+    const kinds = $('dash-svc-kinds').querySelector('tbody');
+    kinds.replaceChildren();
+    if (checks.length === 0) {
+        const tr = rowEl([cell('no service checks yet - add one from a device\'s page, under Services', 'muted small')]);
+        tr.firstChild.colSpan = 5;
+        kinds.appendChild(tr);
+    }
+    for (const k of counts) {
+        const n = (v, cls) => cell(String(v), v > 0 ? `num ${cls}` : 'num muted');
+        const tr = rowEl([cell(k.label), n(k.ok, 'cell-ok'), n(k.warn, 'cell-warn'), n(k.fail, 'cell-crit'), n(k.idle, '')]);
+        const target = k.kind === 'path-voice' || k.kind === 'path-tput' ? 'dash-sites-wrap' : 'dash-svcs-wrap';
+        tr.className = 'clickable';
+        tr.title = `show the ${k.label.toLowerCase()} checks below`;
+        tr.addEventListener('click', () => $(target).scrollIntoView({ behavior: 'smooth', block: 'start' }));
+        kinds.appendChild(tr);
+    }
+    const total = counts.reduce((t, k) => ({
+        ok: t.ok + k.ok, warn: t.warn + k.warn, fail: t.fail + k.fail, idle: t.idle + k.idle,
+    }), { ok: 0, warn: 0, fail: 0, idle: 0 });
+    $('dash-svc-sub').textContent = checks.length === 0 ? ''
+        : `${checks.length} check${checks.length === 1 ? '' : 's'}: ${total.ok} ok`
+            + (total.warn > 0 ? `, ${total.warn} warning` : '') + (total.fail > 0 ? `, ${total.fail} failing` : '')
+            + (total.idle > 0 ? `, ${total.idle} idle` : '');
+
+    // THE SITES TABLE.
+    const sites = siteRows(checks, alerts);
+    $('dash-sites-wrap').classList.toggle('hidden', sites.length === 0);
+    const sb = $('dash-sites').querySelector('tbody');
+    sb.replaceChildren();
+    for (const s of sites) {
+        const v = s.voice, t = s.tput;
+        const more = (n) => (n > 0 ? ` +${n}` : '');
+        const mos = !v ? cell('-', 'num muted')
+            : cell(`${v.mos !== null ? v.mos.toFixed(2) : v.why}${more(s.voiceMore)}`, `num ${SVC_CELL[v.state]}`);
+        if (v) {
+            mos.title = `${v.name}${s.voiceMore > 0 ? ` - the worst of ${s.voiceMore + 1} voice tests; the device page has them all` : ''}`
+                + (v.state !== 'ok' && v.mos !== null ? ` - ${v.why}` : '');
+        }
+        const dMos = cell(v ? svcDeltaMos(v.mosDelta) : '', 'num muted small');
+        if (v && v.mosPrev !== null) dMos.title = `the run before: MOS ${v.mosPrev.toFixed(2)}`;
+        const low = !v || v.low24 === null ? cell('', 'num muted')
+            : cell(v.low24.toFixed(2), `num ${v.low24 < 3.1 ? 'cell-crit' : v.low24 < 3.6 ? 'cell-warn' : ''}`);
+        low.title = 'the lowest MOS in the last 24 hours - amber under 3.6, red under 3.1, the ITU-T G.109 bands';
+        const lj = !v || v.loss === null ? cell('', 'num muted')
+            : cell(`${svcNum(v.loss)} % / ${svcNum(v.jitter)} ms`,
+                `num ${v.alertKinds.has('path-loss') || v.alertKinds.has('path-jitter') ? SVC_CELL[v.state] : ''}`);
+        if (v && v.loss !== null) lj.title = `loss worse ${v.lossDir === 'from' ? 'from' : 'toward'} the site, jitter worse ${v.jitterDir === 'from' ? 'from' : 'toward'} it`;
+        const mbps = !t ? cell('-', 'num muted')
+            : cell(`${t.to !== null ? `${svcNum(t.to)} / ${svcNum(t.from)}` : t.why}${more(s.tputMore)}`, `num ${SVC_CELL[t.state]}`);
+        if (t) mbps.title = `${t.name}${s.tputMore > 0 ? ` - the slowest of ${s.tputMore + 1} throughput tests` : ''}`;
+        const dT = cell(!t || t.delta === null ? ''
+            : Math.round(t.delta) === 0 ? 'same' : `${t.delta > 0 ? '▲' : '▼'} ${Math.abs(Math.round(t.delta))}% ${t.deltaDir}`, 'num muted small');
+        if (t && t.delta !== null) dT.title = `against the throughput test before it, ${t.deltaDir === 'to' ? 'toward' : 'from'} the site`;
+        const loaded = cell(t && t.loadedMs !== null ? svcNum(t.loadedMs) : '', 'num');
+        if (t && t.loadedMs !== null) {
+            loaded.title = `idle ${svcNum(t.idleMs)} ms, under load ${svcNum(t.loadedMs)} ms, under load marked EF ${svcNum(t.efMs)} ms`;
+        }
+        const tr = rowEl([
+            dotCell(s.device, SVC_DOT[s.state]), s.location ? cell(s.location) : cell('-', 'muted'),
+            mos, dMos, low, lj, mbps, dT, loaded, cell(s.lastTs ? fmtAgo(s.lastTs) : '-', 'num muted small'),
+        ]);
+        tr.className = 'clickable';
+        tr.title = `open ${s.device}`;
+        tr.addEventListener('click', () => openDeviceFrom(s.device));
+        sb.appendChild(tr);
+    }
+
+    // WEB AND TCP.
+    const svcs = serviceRows(checks, alerts);
+    $('dash-svcs-wrap').classList.toggle('hidden', svcs.length === 0);
+    const vb = $('dash-svcs').querySelector('tbody');
+    vb.replaceChildren();
+    for (const r of svcs) {
+        const result = r.state === 'ok' || (r.state === 'warn' && r.ms !== null)
+            ? (r.kind === 'svc-tcp' ? `open in ${Math.round(r.ms)} ms` : `${r.status ?? ''} in ${Math.round(r.ms)} ms`)
+            : r.why;
+        const avail = r.availability === null ? cell('', 'num muted')
+            : cell(r.availability >= 99.95 ? '100%' : `${r.availability.toFixed(1)}%`, 'num');
+        if (r.availability !== null) avail.title = `${r.runs} runs in the last 24 hours`;
+        const cert = r.certDays === null ? cell('', 'num muted')
+            : cell(r.certDays < 0 ? 'EXPIRED' : `${Math.floor(r.certDays)} d`, `num ${r.certDays < 0 ? 'cell-crit' : ''}`);
+        const tr = rowEl([
+            dotCell(r.name, SVC_DOT[r.state]), cell(r.device), cell(result, SVC_CELL[r.state]), avail, cert,
+            cell(r.lastTs ? fmtAgo(r.lastTs) : '-', 'num muted small'),
+        ]);
+        tr.className = 'clickable';
+        tr.title = `open ${r.device}`;
+        tr.addEventListener('click', () => openDeviceFrom(r.device));
+        vb.appendChild(tr);
+    }
+}
+
+async function loadDashServices() {
+    const gen = ++dashSvcGen;
+    const r = await api('/api/dashboard/services');
+    if (gen !== dashSvcGen) return;
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('dash-svc-msg').textContent = r.detail || `could not load (${r.status})`; return; }
+    $('dash-svc-msg').textContent = '';
+    renderDashServices(r.checks || []);
+}
+
 // --- group alerts (slice 55, 2026-09-29) ------------------------------------------
 //
 // Every location and application, a box to watch it, and its rule: the
@@ -4827,11 +5452,16 @@ function renderGroupAlerts(groups) {
         pct.addEventListener('change', save);
         min.addEventListener('change', save);
 
-        const name = cell(g.value);
+        // The outside-services row (slice 59) is not a place the operator
+        // named: its members are the service checks marked outside, "up"
+        // answering and "down" failing.
+        const outside = g.axis === 'outside';
+        const name = cell(outside ? 'Outside services' : g.value);
         const axis = document.createElement('span');
         axis.className = 'muted small';
-        axis.textContent = ` ${g.axis}`;
+        axis.textContent = outside ? ' checks from RSCanvas - up is answering, down is failing' : ` ${g.axis}`;
         name.appendChild(axis);
+        if (outside) box.title = 'watch the outside checks: one alert when enough fail at once';
         if (g.gone) {
             name.append(document.createTextNode(' '), badge('no devices now', 'badge'));
         }
@@ -4869,20 +5499,27 @@ function localDay(d) {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-/** The period as [from, to] local dates, or null when a custom one is incomplete. */
-function reportRange() {
+/** A period select's [from, to] local dates, or null when a custom one is
+ *  incomplete - the interface report's and the services report's alike. */
+function periodRange(periodId, fromId, toId) {
     const now = new Date();
     const y = now.getFullYear(), m = now.getMonth();
-    switch ($('report-period').value) {
+    switch ($(periodId).value) {
         case 'this-month': return [localDay(new Date(y, m, 1)), localDay(now)];
         case 'last-month': return [localDay(new Date(y, m - 1, 1)), localDay(new Date(y, m, 0))];
         case 'last-7': return [localDay(new Date(y, m, now.getDate() - 6)), localDay(now)];
+        case 'last-14': return [localDay(new Date(y, m, now.getDate() - 13)), localDay(now)];
         case 'last-30': return [localDay(new Date(y, m, now.getDate() - 29)), localDay(now)];
         default: {
-            const f = $('report-from').value, t = $('report-to').value;
+            const f = $(fromId).value, t = $(toId).value;
             return f && t ? [f, t] : null;
         }
     }
+}
+
+/** The interface report's period. */
+function reportRange() {
+    return periodRange('report-period', 'report-from', 'report-to');
 }
 
 function reportQuery(format) {
@@ -5011,6 +5648,131 @@ $('report-run').addEventListener('click', async () => {
     msg.textContent = (r.lines || []).length === 0 ? 'nothing recorded for these interfaces in this period'
         : `${r.from} to ${r.to} (${r.tz})${through ? `, complete hours through ${through}` : ''}`
             + `${(r.missing || []).length ? ` - ${r.missing.length} interface(s) had nothing in range` : ''}`;
+});
+
+// --- the services report (2026-10-07, SLICE-SERVICE-VIEWS-PLAN step 3) -----------
+//
+// One kind of check at a time, every check of it unless some are picked;
+// the period as the interface report has it, the last 14 days first (the
+// operator: "a 2-week report for some of this stuff is plenty"). The checks
+// to pick from are the Service health section's, already in hand.
+
+const SVC_REPORT_KINDS = { voice: ['path-voice'], bandwidth: ['path-tput'], web: ['svc-http', 'svc-tcp'] };
+let dashSvcChecks = [];
+const svcReportChosen = new Set();
+
+function svcReportRange() {
+    return periodRange('svc-report-period', 'svc-report-from', 'svc-report-to');
+}
+
+function svcReportQuery(format) {
+    const range = svcReportRange();
+    if (range === null) return null;
+    const all = $('svc-report-all').checked;
+    if (!all && svcReportChosen.size === 0) return null;
+    const q = new URLSearchParams({
+        kind: $('svc-report-kind').value, from: range[0], to: range[1],
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    });
+    if (!all) q.set('codes', [...svcReportChosen].join(','));
+    if (format) q.set('format', format);
+    return q.toString();
+}
+
+function renderSvcReportPick() {
+    const kinds = SVC_REPORT_KINDS[$('svc-report-kind').value] || [];
+    const of = dashSvcChecks.filter((c) => kinds.includes(c.kind));
+    // A pick from another kind does not ride along into this one's report.
+    for (const code of [...svcReportChosen]) if (!of.some((c) => c.code === code)) svcReportChosen.delete(code);
+    const all = $('svc-report-all').checked;
+    $('svc-report-pick-msg').textContent = of.length === 0 ? 'none of this kind yet'
+        : all ? `${of.length} check${of.length === 1 ? '' : 's'}` : `${svcReportChosen.size} of ${of.length} picked`;
+    const box = $('svc-report-pick');
+    box.classList.toggle('hidden', all || of.length === 0);
+    if (all) return;
+    box.replaceChildren();
+    for (const c of of) {
+        const label = document.createElement('label');
+        label.className = 'small';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = svcReportChosen.has(c.code);
+        cb.addEventListener('change', () => {
+            if (cb.checked) svcReportChosen.add(c.code); else svcReportChosen.delete(c.code);
+            syncSvcReportControls();
+            renderSvcReportPick();
+        });
+        label.append(cb, document.createTextNode(` ${c.device} - ${c.name}`));
+        box.appendChild(label);
+    }
+}
+
+function syncSvcReportControls() {
+    const custom = $('svc-report-period').value === 'custom';
+    $('svc-report-from').classList.toggle('hidden', !custom);
+    $('svc-report-to').classList.toggle('hidden', !custom);
+    const q = svcReportQuery('csv');
+    const link = $('svc-report-csv');
+    link.classList.toggle('hidden', q === null);
+    if (q !== null) {
+        link.href = `/api/report/services?${q}`;
+        const range = svcReportRange();
+        link.download = `rscanvas-${$('svc-report-kind').value}-${range[0]}-to-${range[1]}.csv`;
+    }
+}
+
+for (const id of ['svc-report-kind', 'svc-report-all']) {
+    $(id).addEventListener('change', () => { renderSvcReportPick(); syncSvcReportControls(); });
+}
+for (const id of ['svc-report-period', 'svc-report-from', 'svc-report-to']) {
+    $(id).addEventListener('change', syncSvcReportControls);
+}
+
+$('svc-report-run').addEventListener('click', async () => {
+    const q = svcReportQuery(null);
+    const msg = $('svc-report-msg');
+    if (q === null) {
+        msg.textContent = svcReportRange() === null ? 'choose both dates' : 'pick at least one check, or tick all of them';
+        return;
+    }
+    msg.textContent = 'running...';
+    const r = await api(`/api/report/services?${q}`);
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { msg.textContent = r.detail || `refused (${r.status})`; return; }
+    const cols = r.columns || [];
+    const head = $('svc-report-table').querySelector('thead tr');
+    head.replaceChildren();
+    for (const [label, num] of [['date', false], ['device', false], ['check', false], ...cols.map((c) => [c.label, true])]) {
+        const th = document.createElement('th');
+        th.textContent = label;
+        if (num) th.className = 'num';
+        head.appendChild(th);
+    }
+    const tbody = $('svc-report-table').querySelector('tbody');
+    tbody.replaceChildren();
+    for (const l of r.lines || []) {
+        const isTotal = l.day.startsWith('total');
+        const dayCell = cell(isTotal ? 'total' : l.day);
+        if (isTotal) dayCell.title = l.day;
+        const cells = [dayCell, cell(l.device), cell(l.check)];
+        for (const c of cols) {
+            const v = l.values[c.id];
+            let cls = 'num';
+            // The day's lowest MOS against the G.109 bands, as the
+            // Dashboard's 24 h low is coloured.
+            if (c.id === 'mos_min' && v !== null) cls += v < 3.1 ? ' cell-crit' : v < 3.6 ? ' cell-warn' : '';
+            if ((c.id === 'runs_under_3_6' || c.id === 'runs_under_3_1') && v > 0) cls += ' cell-warn';
+            cells.push(cell(v === null || v === undefined ? '' : v.toLocaleString(undefined, { maximumFractionDigits: c.dp }), cls));
+        }
+        const tr = rowEl(cells);
+        if (isTotal) tr.className = 'total-row';
+        tbody.appendChild(tr);
+    }
+    $('svc-report-table').classList.toggle('hidden', (r.lines || []).length === 0);
+    const through = r.through ? new Date(r.through).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+    msg.textContent = (r.lines || []).length === 0 ? 'nothing recorded for these checks in this period'
+        : `${r.from} to ${r.to} (${r.tz})${through ? `, complete hours through ${through}` : ''}`
+            + `${(r.missing || []).length ? ` - ${r.missing.length} check(s) had nothing in range` : ''}`;
 });
 
 function fillReportDevices() {
@@ -5375,7 +6137,7 @@ function renderBoards(boards, gridFields, gridDefaults, manual) {
         viewBtn.textContent = 'View';
         viewBtn.title = 'Open this board as a wall in a new tab, signed in as you - no token needed';
         viewBtn.addEventListener('click', () => {
-            window.open(`/wall.html?board=${encodeURIComponent(b.id)}`, '_blank', 'noopener');
+            window.open(`wall.html?board=${encodeURIComponent(b.id)}`, '_blank', 'noopener');
         });
         actCell.appendChild(viewBtn);
         const manage = document.createElement('button');
@@ -6359,6 +7121,7 @@ async function refreshRound(opts) {
     if (section === 'dashboard') {
         renderDashAlerts();
         loadDashGroups();
+        loadDashServices();
         if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
     }
     if (devices?.ok) { devicesFetchedAt = now; renderDevices(devices); }

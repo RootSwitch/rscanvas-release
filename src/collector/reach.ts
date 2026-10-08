@@ -107,6 +107,35 @@ export function parseFpingLine(line: string): { host: string; reading: ProbeRead
     return { host, reading: null };
 }
 
+/**
+ * One fping run's readings, from how it ended and what it printed - or NULL
+ * when a signal ended it, which tells the caller to apply NOTHING.
+ *
+ * A SWEEP FPING DID NOT FINISH SAYS NOTHING (2026-10-08). fping -C prints its
+ * per-host lines as it exits, so one ended by a signal leaves none - and a
+ * map with no lines reads as every host unknown (hosts absent from it fall
+ * through to `unknown` in applySweep). systemd's stop signals every process
+ * in the service's cgroup at once, fping included, so a sweep in flight at a
+ * restart turned the whole fleet unknown with a recorded transition each:
+ * 41 devices at the SIGTERM's millisecond on the alpha.7 upgrade drill, and
+ * the operator's whole ping fleet at five restarts in two weeks. The lab's
+ * 30k box never showed it - its fleet is one address that answers in
+ * microseconds, so a sweep is almost never in flight. A partial print is
+ * no better than none: the hosts it lacks would still read unknown. The next
+ * sweep decides.
+ */
+export function sweepReadings(
+    signal: string | null, stderr: string,
+): Map<string, ProbeReading | null> | null {
+    if (signal !== null) return null;
+    const readings = new Map<string, ProbeReading | null>();
+    for (const line of stderr.split('\n')) {
+        const parsed = parseFpingLine(line);
+        if (parsed !== null) readings.set(parsed.host, parsed.reading);
+    }
+    return readings;
+}
+
 export interface ReachDevice {
     id: string;
     host: string;

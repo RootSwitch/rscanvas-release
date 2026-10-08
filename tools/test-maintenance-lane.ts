@@ -9,7 +9,7 @@
 // when the password carries URL-significant characters, and loud when the base
 // cannot be parsed.
 
-import { maintenanceConnectionString } from '../src/store/pool.ts';
+import { connectByAddress, maintenanceConnectionString } from '../src/store/pool.ts';
 
 let pass = 0, fail = 0;
 const eq = (l: string, got: unknown, want: unknown): void => {
@@ -38,6 +38,20 @@ eq('the database and host survive the substitution',
 eq('a socket-style base (no host) with no password stays as given',
     maintenanceConnectionString('postgresql:///rscanvas_demo?host=/var/run/postgresql', 'rscanvas_admin', ''),
     'postgresql:///rscanvas_demo?host=/var/run/postgresql');
+
+console.log('\nlocalhost is connected to by address (2026-10-06):');
+eq('localhost becomes 127.0.0.1, nothing else changes',
+    connectByAddress('postgres://rscanvas:p%40ss%2Fw0rd@localhost:5432/rscanvas?sslmode=disable'),
+    'postgres://rscanvas:p%40ss%2Fw0rd@127.0.0.1:5432/rscanvas?sslmode=disable');
+eq('  in any case', connectByAddress('postgres://u:pw@LocalHost:5432/db'), 'postgres://u:pw@127.0.0.1:5432/db');
+eq('  and after the maintenance credential is substituted',
+    decodeURIComponent(new URL(connectByAddress(
+        maintenanceConnectionString('postgres://rscanvas:x@localhost:5432/db', 'rscanvas_admin', 'p@ss:w/rd?x#y'))).password),
+    'p@ss:w/rd?x#y');
+for (const other of ['postgres://u:pw@db.example:5432/db', 'postgres://u:pw@[::1]:5432/db', 'postgres://u:pw@127.0.0.1/db',
+    'postgresql:///rscanvas_demo?host=/var/run/postgresql', 'not a url']) {
+    eq(`any other host is left exactly as given: ${other}`, connectByAddress(other), other);
+}
 
 console.log('\nrefusals:');
 throws('a base that is not a URL throws rather than half-substituting',

@@ -140,6 +140,67 @@ console.log('\n11. the rollup writes whole hours, and averages over hours are we
     eq('A\'s two thin hours count as the fraction of each they covered', near(A?.cov_h, (10 + 2) * 30 / 3600), true);
 }
 
+console.log('\n12. the checks\' extremes and spread, for checks only (2026-10-07):');
+{
+    // Device 990001 is 11's. A voice test and a web check beside 11's CPU,
+    // all in one hour ten hours back.
+    await q(`INSERT INTO entities (id, device_id, kind, name, code, tracked, source) VALUES
+             (990021, 990001, 'path-voice', 'Voice X', 'SCRV', true, 'probe'),
+             (990022, 990001, 'svc-http', 'Web X', 'SCRW', true, 'probe')`);
+    const H2 = (await q<{ h: Date }>(`SELECT date_trunc('hour', now()) - interval '10 hours' AS h`))[0]!.h;
+    const t = (min: number): string => new Date(H2.getTime() + min * 60_000).toISOString();
+    // Voice: four ok runs (MOS 4.4, 3.5, 3.0, 4.2; loss 0, 1, 2, 0) and one
+    // that failed (outcome 2, no readings). Web: two ok (100, 300 ms; DNS 2
+    // and 4 ms in v4 - under 3.6, which must not count as a MOS) and one
+    // failed. CPU: two readings.
+    await q(`INSERT INTO samples (entity_id, ts, v0, v4, v5) VALUES
+             (990021, $1, 0, 4.4, 0), (990021, $2, 1, 3.5, 0), (990021, $3, 2, 3.0, 0), (990021, $4, 0, 4.2, 0),
+             (990021, $5, NULL, NULL, 2),
+             (990022, $1, 100, 2, 0), (990022, $2, 300, 4, 0), (990022, $3, NULL, NULL, 1),
+             (990011, $1, 50, NULL, NULL), (990011, $2, 70, NULL, NULL)`,
+        [t(1), t(11), t(21), t(31), t(41)]);
+    await q(`SELECT * FROM roll_up_samples($1::timestamptz, $2::timestamptz)`, [t(0), t(60)]);
+    type HRow = { entity_id: number; a4: number | null; n4: number | null; lo0: number | null; lo4: number | null;
+        m4: number | null; q0: number | null; q4: number | null; nok: number | null; mos36: number | null; mos31: number | null };
+    const hour = async (): Promise<Map<number, HRow>> => new Map((await q<HRow>(`
+        SELECT entity_id, a4, n4, lo0, lo4, m4, q0, q4, nok, mos36, mos31 FROM samples_hourly
+         WHERE entity_id IN (990011, 990021, 990022) AND hour_ts = $1`, [t(0)])).map((r) => [r.entity_id, r]));
+    let h = await hour();
+    const v = h.get(990021), w = h.get(990022), c = h.get(990011);
+    eq('voice: the lowest and highest MOS, the lowest loss', v && [v.lo4, v.m4, v.lo0], [3.0, 4.4, 0]);
+    eq('voice: four of five runs ok, two under 3.6, one under 3.1', v && [v.nok, v.mos36, v.mos31], [4, 2, 1]);
+    const sd = (await q<{ sd: number }>(`SELECT stddev_samp(v4) AS sd FROM samples WHERE entity_id = 990021`))[0]!.sd;
+    const fromCols = v && v.q4 !== null && v.a4 !== null && v.n4 !== null
+        ? Math.sqrt((v.q4 - v.n4 * v.a4 * v.a4) / (v.n4 - 1)) : null;
+    eq(`the standard deviation from the sum of squares is PostgreSQL's own (${sd.toFixed(4)})`, near(fromCols ?? NaN, sd), true);
+    eq('web: two of three ok, its fastest and the sum of squares', w && [w.nok, w.lo0, w.q0], [2, 100, 100 * 100 + 300 * 300]);
+    eq('web: a v4 under 3.6 is not a MOS - no band counts for anything but voice', w && [w.mos36, w.mos31], [null, null]);
+    eq('the CPU beside them: none of the new columns, for anything that is not a check',
+        c && [c.lo0, c.q0, c.m4, c.nok, c.mos36], [null, null, null, null, null]);
+
+    // probes_only: the checks' new columns, and nothing else.
+    await q(`UPDATE samples_hourly SET a4 = -1, lo4 = NULL, mos36 = NULL WHERE entity_id = 990021 AND hour_ts = $1`, [t(0)]);
+    await q(`SELECT * FROM roll_up_samples($1::timestamptz, $2::timestamptz, true)`, [t(0), t(60)]);
+    h = await hour();
+    eq('probes_only refills a check\'s extremes and leaves its averages alone',
+        [h.get(990021)?.lo4, h.get(990021)?.mos36, h.get(990021)?.a4], [3.0, 2, -1]);
+    eq('...and does not touch anything else', h.get(990011)?.q0, null);
+
+    // The back-fill: from the oldest sample any check has, to the frontier.
+    await q(`UPDATE samples_hourly SET lo4 = NULL, nok = NULL WHERE entity_id IN (990021, 990022) AND hour_ts = $1`, [t(0)]);
+    await q(`INSERT INTO job_state (job, through_ts) VALUES ('rollup', $1)
+             ON CONFLICT (job) DO UPDATE SET through_ts = excluded.through_ts`, [t(120)]);
+    await q(`DELETE FROM job_state WHERE job = 'rollup:checks-backfill'`);
+    type B = { hours_written: string; done: boolean; through: Date; until: Date; locked: boolean };
+    const b1 = (await q<B>(`SELECT * FROM roll_up_checks_backfill(168)`))[0]!;
+    eq('the back-fill covers the checks\' hours up to the frontier, in one step here',
+        [b1.done, b1.locked, b1.through.toISOString(), b1.until.toISOString()], [true, false, t(120), t(120)]);
+    h = await hour();
+    eq('  and the hour has its figures again', [h.get(990021)?.lo4, h.get(990022)?.nok], [3.0, 2]);
+    const b2 = (await q<B>(`SELECT * FROM roll_up_checks_backfill(168)`))[0]!;
+    eq('once done, another call writes nothing and says done', [Number(b2.hours_written), b2.done], [0, true]);
+}
+
 // --- 10. event-alert upserts -------------------------------------------------
 console.log('\n10. event alerts: one open row per key, folding, sticky severity, rebirth:');
 {

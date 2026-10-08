@@ -19,7 +19,7 @@
 // argv has a limit somewhere between here and there. Stdin does not.
 
 import { spawn } from 'node:child_process';
-import { parseFpingLine, type ProbeReading } from './reach.ts';
+import { sweepReadings, type ProbeReading } from './reach.ts';
 
 /**
  * Is fping present at all? Checked ONCE at worker startup, loudly - the plan
@@ -44,14 +44,15 @@ export function fpingAvailable(): Promise<boolean> {
  *
  * Never rejects on fping's exit code: fping exits 1 when any host was
  * unreachable and 2 on other errors, and an unreachable host is a RESULT.
- * The only failure this propagates is failing to spawn at all.
+ * The only failure this propagates is failing to spawn at all. Resolves NULL
+ * when a signal ended fping before it could print - a restart's stop reaches
+ * it too - and the caller then applies nothing (reach.ts, sweepReadings).
  */
 export function runFpingSweep(
     hosts: string[], timeoutMs: number,
-): Promise<Map<string, ProbeReading | null>> {
+): Promise<Map<string, ProbeReading | null> | null> {
     return new Promise((resolve, reject) => {
-        const readings = new Map<string, ProbeReading | null>();
-        if (hosts.length === 0) { resolve(readings); return; }
+        if (hosts.length === 0) { resolve(new Map()); return; }
 
         const p = spawn(
             'fping',
@@ -61,13 +62,7 @@ export function runFpingSweep(
         let stderr = '';
         p.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
         p.on('error', (err) => reject(err));
-        p.on('exit', () => {
-            for (const line of stderr.split('\n')) {
-                const parsed = parseFpingLine(line);
-                if (parsed !== null) readings.set(parsed.host, parsed.reading);
-            }
-            resolve(readings);
-        });
+        p.on('exit', (_code, signal) => resolve(sweepReadings(signal, stderr)));
         p.stdin.on('error', () => { /* fping exited early; exit handler owns the outcome */ });
         p.stdin.write(hosts.join('\n') + '\n');
         p.stdin.end();

@@ -23,7 +23,7 @@
 // "fping", because the original regex made the pre-colon whitespace optional.
 
 import {
-    step, parseFpingLine, applySweep, validatePingInterval,
+    step, parseFpingLine, sweepReadings, applySweep, validatePingInterval,
     partitionChecks, SUPPORTED_CHECKS, tcpKey,
     PING_FLOOR_S, DEGRADED_EXIT_RATIO,
     type ReachState, type ProbeReading,
@@ -97,6 +97,15 @@ function main(): void {
     eq('blank lines are not results', parseFpingLine('   '), null);
     eq('garbage without a colon is not a result', parseFpingLine('fping: usage'), null);
     eq('an IPv6 target parses', parseFpingLine('2001:db8::1 : 12.0')?.host, '2001:db8::1');
+
+    console.log('\na sweep fping did not finish (2026-10-08: a restart turned the fleet unknown)');
+    const printed = '10.0.0.1  : 5.42\n192.0.2.7 : -\n';
+    const done = sweepReadings(null, printed);
+    eq('a sweep that ran to its end gives every line it printed', done === null ? null : [...done.keys()], ['10.0.0.1', '192.0.2.7']);
+    eq('...a no-answer among them, which is a result', done?.get('192.0.2.7'), { alive: false, rttMs: null });
+    eq('a sweep ended by a signal before printing says NOTHING - null, not an empty map', sweepReadings('SIGTERM', ''), null);
+    eq('nor does one that printed part of its lines: the rest would read unknown', sweepReadings('SIGKILL', '10.0.0.1  : 5.42\n'), null);
+    eq('a finished run that printed nothing is still a result (its hosts read unknown, as before)', sweepReadings(null, '')?.size, 0);
 
     console.log('\nsweep aggregation');
     {

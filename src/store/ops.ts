@@ -19,6 +19,43 @@ import { laneQuery, onLane, type Outcome } from './pool.ts';
 import { copyChunks, copyLine, stripNul } from './copy.ts';
 import { measurement, smallint, int4, int8, boundedJson } from './bounds.ts';
 import type { Clause } from '../search/grammar.ts';
+import { DOWN_OUTCOMES, OUTCOME, type OutcomeName } from '../checks/model.ts';
+
+// --- service checks in SQL (slices 58, 59) ------------------------------------
+//
+// The outcome codes as SQL lists, BUILT from src/checks/model.ts rather than
+// typed again here: a second copy of "which outcomes are down" in SQL is the
+// two-definitions class this project keeps meeting, and the hold predicate,
+// the scan's counts and the alert page must agree with the engine exactly.
+
+/** Outcomes that are the service not serving. */
+const SVC_DOWN_CODES = [...DOWN_OUTCOMES].map((n) => OUTCOME[n]).join(', ');
+/** Outcomes that are evidence either way - everything but the prober's own failure. */
+const SVC_KNOWN_CODES = (Object.keys(OUTCOME) as OutcomeName[])
+    .filter((n) => n !== 'ours').map((n) => OUTCOME[n]).join(', ');
+
+/** A check's last run is recent enough to stand: three of its OWN intervals.
+ *  Guarded, because a hand-edited definition must cost that one check its
+ *  freshness, never the statement. */
+const probeFresh = (e: string): string => `(${e}.lv_ts IS NOT NULL AND ${e}.lv_ts > now() - make_interval(secs =>
+        3 * CASE WHEN ${e}.extra->>'intervalS' ~ '^[0-9]{1,6}$' THEN (${e}.extra->>'intervalS')::int ELSE 60 END))`;
+
+/** One check's state as the outside-services group counts it: 'down' (not
+ *  serving), 'up' (answered - even with the wrong content, which still
+ *  proves the path), or 'unknown' (no recent run, or the prober failed). */
+const probeGroupState = (e: string): string => `(CASE
+        WHEN NOT ${probeFresh(e)} OR ${e}.lv_v5 IS NULL THEN 'unknown'
+        WHEN ${e}.lv_v5 IN (${SVC_DOWN_CODES}) THEN 'down'
+        WHEN ${e}.lv_v5 IN (${SVC_KNOWN_CODES}) THEN 'up'
+        ELSE 'unknown' END)`;
+
+/** The checks the outside-services group counts: tracked, outside, on an
+ *  enabled device. A muted device's checks still count - muting is about
+ *  that device's alerts, and its checks are still evidence about the
+ *  internet RSCanvas reaches it through. */
+const OUTSIDE_CHECKS = `entities e JOIN devices d ON d.id = e.device_id
+         WHERE e.source = 'probe' AND e.tracked = true AND e.outside = true AND e.code IS NOT NULL
+           AND d.enabled = true`;
 
 /**
  * A read on the interactive lane, returned untyped.
@@ -889,6 +926,13 @@ export const GRID_FIELDS: ReadonlyArray<{ key: string; label: string; identity: 
     { key: 'snmp', label: 'SNMP rtt', identity: false },
     { key: 'batt', label: 'battery %', identity: false },
     { key: 'runtime', label: 'battery runtime', identity: false },
+    // SERVICE CHECKS (2026-10-07, SLICE-SERVICE-VIEWS-PLAN step 4): what the
+    // device's checks found, as values - never a check's name, which is an
+    // internal service's name (the operator's ruling). Several tests of one
+    // kind fold into the worst; web and TCP checks are a count.
+    { key: 'mos', label: 'voice MOS (worst of its tests)', identity: false },
+    { key: 'bw', label: 'bandwidth Mbps (slower direction)', identity: false },
+    { key: 'svc', label: 'web and TCP checks ok', identity: false },
     // IDENTITY FIELDS LAST, grouped so the split the panel labels is visible
     // in the list itself rather than only in the tags.
     // Slice 32: the icon is identity, and the call is deliberate - it names
@@ -1314,6 +1358,21 @@ export const OPS = {
             measurement(snmpRttMs), stencil, pollAnchor]),
 
     /**
+     * A poll that could not be RECORDED (2026-10-06): it failed on the
+     * store, not on the device, so nothing about the device is written -
+     * not status, not consecutive_failures, not last_seen_ts, and not
+     * last_poll_ts either, which is what the wall and the roster read as
+     * "somebody looked lately": a device whose polls keep failing to record
+     * goes stale after three intervals, as it should, rather than looking
+     * fresh with nothing behind it. Only the schedule moves on, so the
+     * device is not due again at once - re-polling it in a loop against a
+     * database that is refusing would only add to the load. A device never
+     * polled (last_poll_ts NULL) stays due, as duePollTargets says.
+     */
+    advancePollAnchor: (id: string, pollAnchor: Date) => laneQuery('collector',
+        'UPDATE devices SET poll_anchor_ts = $2 WHERE id = $1::bigint', [id, pollAnchor]),
+
+    /**
      * Create a PING-ONLY device (slice 35).
      *
      * Deliberately NOT the probe path: there is nothing to probe. The whole
@@ -1673,11 +1732,98 @@ export const OPS = {
         RETURNING id::text AS id, code`,
         [deviceId, kind, snmpIndex, name, descr, alias, int8(speedBps), code, extra, tracked]),
 
+    /**
+     * The service checks the collector runs (slice 58): tracked probe
+     * entities on enabled devices, with the device's address for a pinned or
+     * host-less check. Loaded every minute and on a reload message, so an
+     * added check is live within a second of its save.
+     */
+    probeChecks: () => laneQuery<{
+        id: string; code: string; kind: string; name: string; extra: unknown;
+        device_host: string; device_name: string; device_rtt_ms: number | null;
+    }>('collector', `
+        SELECT e.id::text AS id, e.code, e.kind, e.name, e.extra,
+               host(d.host) AS device_host, d.name AS device_name,
+               -- Slice 60: a voice test's MOS takes its delay from the
+               -- device's live ping round trip, refreshed with this load.
+               d.ping_rtt_ms AS device_rtt_ms
+          FROM entities e
+          JOIN devices d ON d.id = e.device_id
+         WHERE e.source = 'probe' AND e.tracked = true AND e.code IS NOT NULL
+           AND d.enabled = true`),
+
+    /**
+     * The service checks' last values, one statement for every result since
+     * the last write. Unlike updateLastValuesBatch every row carries its OWN
+     * time: checks finish whenever they finish, and a batch-wide stamp
+     * would move a reading by up to the flush interval.
+     */
+    updateProbeLastValues: (
+        ids: string[], tss: Date[], statuses: Array<number | null>, rtts: Array<number | null>,
+        v0: Array<number | null>, v1: Array<number | null>, v2: Array<number | null>,
+        v3: Array<number | null>, v4: Array<number | null>, v5: Array<number | null>,
+        peers: Array<string | null>, outsides: Array<boolean | null>,
+    ) => laneQuery('collector', `
+        UPDATE entities e
+           SET lv_ts = u.ts, lv_status = u.status, lv_rtt_ms = u.rtt,
+               lv_v0 = u.a0, lv_v1 = u.a1, lv_v2 = u.a2,
+               lv_v3 = u.a3, lv_v4 = u.a4, lv_v5 = u.a5,
+               lv_peer = u.peer, lv_stale_since = NULL,
+               -- Slice 59: a run that cannot say keeps the last verdict.
+               outside = coalesce(u.outside, e.outside)
+          FROM (
+            SELECT * FROM unnest(
+                $1::bigint[], $2::timestamptz[], $3::smallint[], $4::real[],
+                $5::float8[], $6::float8[], $7::float8[],
+                $8::float8[], $9::float8[], $10::float8[], $11::text[], $12::boolean[]
+            ) AS t(id, ts, status, rtt, a0, a1, a2, a3, a4, a5, peer, outside)
+          ) u
+         WHERE e.id = u.id AND e.source = 'probe'`,
+        [ids, tss, statuses, rtts, v0, v1, v2, v3, v4, v5, peers, outsides]),
+
+    /** Every tracked throughput test's code and definition, fleet-wide, for
+     *  the add route's fit check: they run one at a time, so a new one is
+     *  judged against all of them (slice 61). */
+    throughputChecks: () => laneQuery<{ code: string; extra: unknown }>('interactive', `
+        SELECT code, extra FROM entities
+         WHERE source = 'probe' AND kind = 'path-tput' AND tracked = true`),
+
+    /** A device's service checks, for the add route's name check. */
+    deviceChecks: (deviceId: string) => laneQuery<{ code: string; name: string; kind: string }>('interactive', `
+        SELECT code, name, kind FROM entities
+         WHERE device_id = $1::bigint AND source = 'probe'`, [deviceId]),
+
+    /** Add a service check: a probe entity, tracked, its definition in extra. */
+    insertCheck: (deviceId: string, kind: string, name: string, code: string, extra: string) =>
+        laneQuery<{ id: string; code: string }>('interactive', `
+        INSERT INTO entities (device_id, kind, name, code, extra, tracked, source)
+        VALUES ($1::bigint, $2, $3, $4, $5::jsonb, true, 'probe')
+        RETURNING id::text AS id, code`, [deviceId, kind, name, code, extra]),
+
+    /** Replace a check's name and definition. The kind and the code never change. */
+    updateCheck: (deviceId: string, code: string, name: string, extra: string) =>
+        laneQuery<{ code: string; kind: string }>('interactive', `
+        UPDATE entities SET name = $3, extra = $4::jsonb
+         WHERE device_id = $1::bigint AND code = $2 AND source = 'probe'
+        RETURNING code, kind`, [deviceId, code, name, extra]),
+
+    /**
+     * Remove a check. Its samples stay and age out under raw retention, as a
+     * removed device's do (samples.entity_id carries no FK), and an open
+     * alert goes missing and retires as source-removed.
+     */
+    deleteCheck: (deviceId: string, code: string) => laneQuery<{ name: string; kind: string }>('interactive', `
+        DELETE FROM entities
+         WHERE device_id = $1::bigint AND code = $2 AND source = 'probe'
+        RETURNING name, kind`, [deviceId, code]),
+
     /** Does this device have ANY sensor entities yet? One count, asked at
-     *  the inventory cadence, never per poll - it gates the backfill. */
+     *  the inventory cadence, never per poll - it gates the backfill.
+     *  SNMP sensors only (slice 57): a service check on the device is not
+     *  inventory, and counting it would skip a backfill the device needs. */
     sensorCountForDevice: (deviceId: string) => laneQuery<{ n: number }>('collector', `
         SELECT count(*)::int AS n FROM entities
-         WHERE device_id = $1::bigint AND kind <> 'if'`, [deviceId]),
+         WHERE device_id = $1::bigint AND kind <> 'if' AND source = 'snmp'`, [deviceId]),
 
     /**
      * The sensors this device polls: TRACKED only, unlike the interface
@@ -1687,13 +1833,17 @@ export const OPS = {
      * plausibleC, stopped fans) exist precisely so junk never reaches the
      * samples table - polling an untracked sensor would write history for a
      * reading the discovery already judged implausible.
+     *
+     * `source = 'snmp'` (slice 57) because `extra` is an SNMP instruction
+     * only on SNMP rows: a probe entity keeps its own definition there, and
+     * without the filter this poller would walk it as an OID.
      */
     sensorsForDevice: (deviceId: string) => laneQuery<{
         id: string; kind: string; name: string; extra: import('../collector/sensors.ts').SensorExtra;
     }>('collector', `
         SELECT id::text AS id, kind, name, extra
           FROM entities
-         WHERE device_id = $1::bigint AND kind <> 'if'
+         WHERE device_id = $1::bigint AND kind <> 'if' AND source = 'snmp'
            AND tracked = true AND extra IS NOT NULL`, [deviceId]),
 
     /**
@@ -1707,7 +1857,7 @@ export const OPS = {
     }>('collector', `
         SELECT id::text AS id, kind, snmp_index, name, extra
           FROM entities
-         WHERE device_id = $1::bigint AND kind <> 'if'
+         WHERE device_id = $1::bigint AND kind <> 'if' AND source = 'snmp'
            AND extra IS NOT NULL`, [deviceId]),
 
     /**
@@ -2366,6 +2516,12 @@ export const OPS = {
         caught_up: boolean; locked: boolean;
     }>('jobs', 'SELECT * FROM roll_up_chunk($1::int, $2::int)', [maxHours, settleMinutes]),
 
+    /** The checks' one-off back-fill of the hourly extremes and spread
+     *  (sql/slice5.sql roll_up_checks_backfill): one bounded, resumable step. */
+    rollUpChecksBackfill: (maxHours: number) => laneQuery<{
+        hours_written: string; done: boolean; through: Date | null; until: Date | null; locked: boolean;
+    }>('jobs', 'SELECT * FROM roll_up_checks_backfill($1::int)', [maxHours]),
+
     /** The rollup frontier and job bookkeeping, for /api/health. */
     /** How many devices there are and when the first was added: the young-
      *  database signal for isFrontierHealthy. A two-row-scan-cheap stand-in
@@ -2543,9 +2699,9 @@ export const OPS = {
      */
     devicesByName: (names: string[]) => laneQuery<{
         id: string; name: string; host: string; snmp_port: number;
-        snmp_version: string; credential_ref: string;
+        snmp_version: string; credential_ref: string; ping_rtt_ms: number | null;
     }>('interactive', `
-        SELECT id::text AS id, name, host(host) AS host, snmp_port, snmp_version, credential_ref
+        SELECT id::text AS id, name, host(host) AS host, snmp_port, snmp_version, credential_ref, ping_rtt_ms
           FROM devices WHERE name = ANY($1::text[]) ORDER BY name`, [names]),
 
     /**
@@ -2572,14 +2728,16 @@ export const OPS = {
      */
     /** A device's sensors as Rediscover judges them gone or not
      *  (onboard.ts goneSensors): identity, tracked, and whether the poll
-     *  has a reading now. */
+     *  has a reading now. SNMP sensors only: the agent's walk is the only
+     *  witness Rediscover has, and it can say nothing about a probe. */
     deviceSensorsForRediscover: (deviceId: string) => laneQuery<{
         code: string; name: string; kind: string; snmp_index: string | null;
         tracked: boolean; lv_v0: number | null;
     }>('collector', `
         SELECT code, name, kind, snmp_index, tracked, lv_v0
           FROM entities
-         WHERE device_id = $1::bigint AND kind <> 'if' AND code IS NOT NULL`, [deviceId]),
+         WHERE device_id = $1::bigint AND kind <> 'if' AND source = 'snmp'
+           AND code IS NOT NULL`, [deviceId]),
 
     setEntitiesTrackedByCode: (
         deviceId: string, codes: string[], tracked: boolean[],
@@ -3093,6 +3251,56 @@ export const OPS = {
      * application is its own group, NULL, sorted last: dropping the untagged
      * reports better coverage than exists.
      */
+    /**
+     * The Dashboard's Service health (2026-10-07, SLICE-SERVICE-VIEWS-PLAN
+     * part A): every check on an enabled device, its last run (the entity's
+     * last values), the run before it, and its last 24 hours - all from raw
+     * samples, which every run writes, keyed (entity, ts) so each lateral is
+     * an index range over at most two daily partitions. "The run before" is
+     * the latest sample older than the last value, since a run's sample and
+     * its last value carry the same ts (collector onCheckResult). The 24 h
+     * figures are over ok runs' readings (a failed run's are null) and the
+     * outcome of every run; the latest may not be flushed yet, which the
+     * page covers by folding in the last value. Live, interactive lane: its
+     * point is the last run, so it is not cached per rollup hour.
+     */
+    serviceHealth: () => laneQuery<{
+        code: string; kind: string; name: string; tracked: boolean; extra: Record<string, unknown> | null;
+        outside: boolean | null; device: string; location: string | null;
+        lv_ts: Date | null; lv_status: number | null;
+        lv_v0: number | null; lv_v1: number | null; lv_v2: number | null; lv_v3: number | null; lv_v4: number | null; lv_v5: number | null;
+        prev_ts: Date | null; prev_v0: number | null; prev_v1: number | null; prev_v2: number | null;
+        prev_v3: number | null; prev_v4: number | null; prev_v5: number | null;
+        runs: number; ok_runs: number;
+        min_v0: number | null; min_v1: number | null; max_v0: number | null; max_v1: number | null;
+        max_v2: number | null; max_v3: number | null; min_v4: number | null;
+    }>('interactive', `
+        SELECT e.code, e.kind, e.name, e.tracked, e.extra, e.outside,
+               d.name AS device, nullif(btrim(d.location), '') AS location,
+               e.lv_ts, e.lv_status, e.lv_v0, e.lv_v1, e.lv_v2, e.lv_v3, e.lv_v4, e.lv_v5,
+               p.ts AS prev_ts, p.v0 AS prev_v0, p.v1 AS prev_v1, p.v2 AS prev_v2,
+               p.v3 AS prev_v3, p.v4 AS prev_v4, p.v5 AS prev_v5,
+               coalesce(w.runs, 0) AS runs, coalesce(w.ok_runs, 0) AS ok_runs,
+               w.min_v0, w.min_v1, w.max_v0, w.max_v1, w.max_v2, w.max_v3, w.min_v4
+          FROM entities e
+          JOIN devices d ON d.id = e.device_id
+          LEFT JOIN LATERAL (
+              SELECT s.ts, s.v0, s.v1, s.v2, s.v3, s.v4, s.v5
+                FROM samples s
+               WHERE s.entity_id = e.id AND s.ts < e.lv_ts AND s.ts >= e.lv_ts - interval '2 days'
+               ORDER BY s.ts DESC
+               LIMIT 1
+          ) p ON true
+          LEFT JOIN LATERAL (
+              SELECT count(*)::int AS runs, count(*) FILTER (WHERE s.v5 = 0)::int AS ok_runs,
+                     min(s.v0) AS min_v0, min(s.v1) AS min_v1, max(s.v0) AS max_v0, max(s.v1) AS max_v1,
+                     max(s.v2) AS max_v2, max(s.v3) AS max_v3, min(s.v4) AS min_v4
+                FROM samples s
+               WHERE s.entity_id = e.id AND s.ts >= now() - interval '24 hours'
+          ) w ON true
+         WHERE e.source = 'probe' AND d.enabled = true
+         ORDER BY d.name, e.kind, e.name`),
+
     groupHealth: () =>
         laneQuery<{ axis: 'location' | 'application'; value: string | null; up: number; down: number; other: number }>('interactive', `
         WITH s AS (
@@ -3569,7 +3777,17 @@ export const OPS = {
                                ('ping',     CASE WHEN d.reach_state IN ('up', 'degraded') THEN to_jsonb(round(d.ping_rtt_ms::numeric)) END),
                                ('snmp',     CASE WHEN d.status = 'up' THEN to_jsonb(round(d.snmp_rtt_ms::numeric)) END),
                                ('batt',     CASE WHEN d.status = 'up' THEN to_jsonb(round(d.batt_pct::numeric)) END),
-                               ('runtime',  CASE WHEN d.status = 'up' THEN to_jsonb(d.runtime_s::float8) END)
+                               ('runtime',  CASE WHEN d.status = 'up' THEN to_jsonb(d.runtime_s::float8) END),
+                               -- The device's checks (step 4): from pc below,
+                               -- fresh runs only. NOT blanked by the device's
+                               -- status like the readings above: those come
+                               -- from its agent and go stale with it, while a
+                               -- check is RSCanvas's own measurement with its
+                               -- own freshness - a tile can be down to SNMP and
+                               -- its web checks still answering.
+                               ('mos',      to_jsonb(round(pc.mos::numeric, 2))),
+                               ('bw',       to_jsonb(round(pc.bw::numeric, 1))),
+                               ('svc',      CASE WHEN pc.svc_n > 0 THEN jsonb_build_object('ok', pc.svc_ok, 'n', pc.svc_n) END)
                              ) AS f(k, v)
                             WHERE COALESCE(b.grid_fields, '[]'::jsonb) ? f.k
                               AND f.v IS NOT NULL
@@ -3590,6 +3808,24 @@ export const OPS = {
                          SELECT count(*) AS n FROM alerts al
                           WHERE al.host = d.name AND al.state != 'cleared'
                      ) a ON true
+                     -- The device's service checks, for the mos, bw and svc
+                     -- fields (step 4) - and only on a board that declares one,
+                     -- so every other board pays nothing for them. A run
+                     -- counts while it is fresh (three of the check's own
+                     -- intervals, the card's rule) and its check is running;
+                     -- a voice or bandwidth reading only from a run that came
+                     -- back ok. The worst MOS, the slower direction of the
+                     -- slowest throughput test, and web/TCP as ok of running.
+                     LEFT JOIN LATERAL (
+                         SELECT min(e.lv_v4) FILTER (WHERE e.kind = 'path-voice' AND e.lv_v5 = 0) AS mos,
+                                min(least(e.lv_v0, e.lv_v1)) FILTER (WHERE e.kind = 'path-tput' AND e.lv_v5 = 0) AS bw,
+                                count(*) FILTER (WHERE e.kind IN ('svc-http', 'svc-tcp')) AS svc_n,
+                                count(*) FILTER (WHERE e.kind IN ('svc-http', 'svc-tcp') AND e.lv_v5 = 0) AS svc_ok
+                           FROM entities e
+                          WHERE COALESCE(b.grid_fields, '[]'::jsonb) ?| ARRAY['mos', 'bw', 'svc']
+                            AND e.device_id = d.id AND e.source = 'probe' AND e.tracked
+                            AND e.lv_ts > now() - make_interval(secs => 3 * coalesce(nullif(e.extra->>'intervalS', '')::int, 60))
+                     ) pc ON true
                ), '[]'::jsonb) AS shapes
           FROM boards b
          WHERE b.id = $1::bigint`, [boardId]),
@@ -3744,12 +3980,13 @@ export const OPS = {
      *  jobs.ts must consult the same gate the owed queues apply - see the
      *  comment there for why the gap only shows on a LIVE raise. */
     getAlert: (id: string) => laneQuery<AlertRecord & {
-        in_maintenance: boolean; under_policy: boolean; in_group: boolean; group_overlap: boolean;
+        in_maintenance: boolean; under_policy: boolean; in_group: boolean; group_overlap: boolean; settling: boolean;
     }>('jobs',
         `SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
                ${ALERT_UNDER_POLICY} AS under_policy,
                ${ALERT_IN_GROUP_OUTAGE} AS in_group,
+               ${ALERT_OUTSIDE_SETTLING} AS settling,
                ${ALERT_GROUP_OVERLAP} AS group_overlap
           FROM alerts WHERE id = $1::bigint`, [id]),
 
@@ -4453,7 +4690,29 @@ export const OPS = {
           FROM group_alert_rules r
           LEFT JOIN s ON (r.axis = 'location' AND s.location = r.value)
                       OR (r.axis = 'application' AND s.application = r.value)
+         WHERE r.axis IN ('location', 'application')
+         GROUP BY r.id, r.axis, r.value, r.enabled, r.threshold_pct, r.min_down
+        UNION ALL
+        -- OUTSIDE SERVICES (slice 59): the same rule shape over the outside
+        -- checks instead of a group's devices - "up" a check that answered,
+        -- "down" one that is not serving, the rest neither.
+        SELECT r.axis, r.value, r.enabled, r.threshold_pct, r.min_down,
+               count(*) FILTER (WHERE c.st = 'up')::int AS up,
+               count(*) FILTER (WHERE c.st = 'down')::int AS down
+          FROM group_alert_rules r
+          LEFT JOIN (SELECT ${probeGroupState('e')} AS st FROM ${OUTSIDE_CHECKS}) c ON true
+         WHERE r.axis = 'outside'
          GROUP BY r.id, r.axis, r.value, r.enabled, r.threshold_pct, r.min_down`),
+
+    /**
+     * The outside checks' counts for the Group alerts panel (slice 59), so
+     * the row can show what it would judge before anyone ticks it.
+     */
+    outsideCheckCounts: () => laneQuery<{ up: number; down: number; other: number }>('interactive', `
+        SELECT count(*) FILTER (WHERE st = 'up')::int AS up,
+               count(*) FILTER (WHERE st = 'down')::int AS down,
+               count(*) FILTER (WHERE st = 'unknown')::int AS other
+          FROM (SELECT ${probeGroupState('e')} AS st FROM ${OUTSIDE_CHECKS}) c`),
 
     /**
      * One group's members, with their status and the group's rule: the list
@@ -4461,9 +4720,17 @@ export const OPS = {
      * the caller - the dispatch runs on jobs, the page on interactive.
      */
     groupMembers: (lane: 'jobs' | 'interactive', axis: string, value: string) => laneQuery<{
-        name: string; st: string; min_down: number | null;
-    }>(lane, `
-        SELECT d.name, ${deviceStatusSql('d')} AS st,
+        name: string; st: string; min_down: number | null; device: string;
+    }>(lane, axis === 'outside'
+        // The outside-services group's members are checks, named with their
+        // device; `device` is what the page links to (slice 59).
+        ? `
+        SELECT d.name || ': ' || e.name AS name, ${probeGroupState('e')} AS st, d.name AS device,
+               (SELECT r.min_down FROM group_alert_rules r WHERE r.axis = $1 AND r.value = $2) AS min_down
+          FROM ${OUTSIDE_CHECKS}
+         ORDER BY d.name, e.name`
+        : `
+        SELECT d.name, ${deviceStatusSql('d')} AS st, d.name AS device,
                (SELECT r.min_down FROM group_alert_rules r WHERE r.axis = $1 AND r.value = $2) AS min_down
           FROM devices d
          WHERE d.enabled = true AND d.transient IS NOT TRUE AND d.alerts_muted IS NOT TRUE
@@ -4506,7 +4773,8 @@ export const OPS = {
           WHERE state = 'active' AND NOT notified_raise
             AND NOT ${ALERT_IN_MAINTENANCE}
             AND NOT ${ALERT_UNDER_POLICY}
-            AND NOT ${ALERT_IN_GROUP_OUTAGE}`),
+            AND NOT ${ALERT_IN_GROUP_OUTAGE}
+            AND NOT ${ALERT_OUTSIDE_SETTLING}`),
     // The clear side gates on the same predicate: a clear withheld during a
     // window is still owed afterwards when its raise WAS delivered; clears
     // of never-delivered raises are settled silently by settleInWindowClears
@@ -4535,7 +4803,8 @@ export const OPS = {
             AND escalated_ts IS NOT NULL AND NOT notified_escalate
             AND NOT ${ALERT_IN_MAINTENANCE}
             AND NOT ${ALERT_UNDER_POLICY}
-            AND NOT ${ALERT_IN_GROUP_OUTAGE}`),
+            AND NOT ${ALERT_IN_GROUP_OUTAGE}
+            AND NOT ${ALERT_OUTSIDE_SETTLING}`),
 
     /**
      * The renotify generator's queue (DECISIONS-2026-09-01 ruling 2). CRIT
@@ -4559,7 +4828,8 @@ export const OPS = {
                 < now() - make_interval(hours => $1::int)
             AND NOT ${ALERT_IN_MAINTENANCE}
             AND NOT ${ALERT_UNDER_POLICY}
-            AND NOT ${ALERT_IN_GROUP_OUTAGE}`, [hours]),
+            AND NOT ${ALERT_IN_GROUP_OUTAGE}
+            AND NOT ${ALERT_OUTSIDE_SETTLING}`, [hours]),
 
     /**
      * The flap report (easy-win E11): raise/clear cycles per key over the
@@ -4690,11 +4960,12 @@ export const OPS = {
     // dashboard must never compete with the machinery it is watching.
 
     /** Open alerts for the UI, worst first, newest within a severity. */
-    uiOpenAlerts: (limit: number = UI_PAGE_CAP) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean }>('interactive', `
+    uiOpenAlerts: (limit: number = UI_PAGE_CAP) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean; settling: boolean }>('interactive', `
         SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
                ${ALERT_UNDER_POLICY} AS under_policy,
-               ${ALERT_IN_GROUP_OUTAGE} AS in_group
+               ${ALERT_IN_GROUP_OUTAGE} AS in_group,
+               ${ALERT_OUTSIDE_SETTLING} AS settling
           FROM alerts
          WHERE state != 'cleared'
          ORDER BY CASE severity WHEN 'crit' THEN 0 ELSE 1 END,
@@ -4736,11 +5007,12 @@ export const OPS = {
      * screen, or the operator's click lands on an error at exactly the
      * moment the thing they were watching resolved.
      */
-    uiAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean }>('interactive', `
+    uiAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean; settling: boolean }>('interactive', `
         SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
                ${ALERT_UNDER_POLICY} AS under_policy,
-               ${ALERT_IN_GROUP_OUTAGE} AS in_group
+               ${ALERT_IN_GROUP_OUTAGE} AS in_group,
+               ${ALERT_OUTSIDE_SETTLING} AS settling
           FROM alerts WHERE id = $1::bigint`, [id]),
 
     /**
@@ -4808,7 +5080,7 @@ export const OPS = {
         lv_ts: Date | null; lv_status: number | null; lv_rtt_ms: number | null;
         lv_v0: number | null; lv_v1: number | null; lv_v2: number | null;
         lv_v3: number | null; lv_v4: number | null; lv_v5: number | null;
-        lv_stale_since: Date | null;
+        lv_stale_since: Date | null; source: string; lv_peer: string | null; outside: boolean | null;
     }>('interactive', `
         -- kind and extra travel to the client since the sensors slice: the
         -- drill-down SPLITS on kind - sensors render as cards above the
@@ -4828,7 +5100,10 @@ export const OPS = {
                e.speed_untrusted, e.speed_override_bps::float8 AS speed_override_bps,
                e.lv_ts, e.lv_status, e.lv_rtt_ms,
                e.lv_v0, e.lv_v1, e.lv_v2, e.lv_v3, e.lv_v4, e.lv_v5,
-               e.lv_stale_since
+               e.lv_stale_since,
+               -- Slice 58: a service check renders as its own card, and
+               -- says which address its last run reached.
+               e.source, e.lv_peer, e.outside
           FROM entities e
           JOIN devices d ON d.id = e.device_id
          WHERE d.name = $1
@@ -5087,6 +5362,77 @@ export const OPS = {
          WHERE dy.lo < $5
          GROUP BY dy.day, dy.lo, dy.hi, en.device, en.name, en.alias, en.code
          ORDER BY en.device, en.name, dy.day`, [codes, fromDay, toDay, tz, frontier]),
+
+    /**
+     * The services report (2026-10-07, SLICE-SERVICE-VIEWS-PLAN step 3): one
+     * row per check per local day, from the hourly rollup - the SUMS the
+     * day's figures are computed from (src/reports/services.ts), never the
+     * figures themselves, so a total over a fortnight pools its hours rather
+     * than averaging daily averages. For each of v0..v4: the weighted sum
+     * (a x n) and its count, the minimum and maximum; the spread from the
+     * hours that carry a sum of squares only (an hour rolled before the
+     * upgrade has none, and mixing it in would bias the result), as its own
+     * sums; ok runs and the MOS bands likewise over the hours that carry
+     * them. `codes` NULL is every check of the kinds asked for. Heavy lane,
+     * like the interface report; ends at the rollup frontier.
+     */
+    serviceReport: (kinds: string[], codes: string[] | null, fromDay: string, toDay: string, tz: string, frontier: Date) => laneQuery<{
+        day: string; device: string; name: string; code: string; kind: string;
+        hours: number; runs: number | null; ok_n: number | null; ok_runs: number | null;
+        s0: number | null; s1: number | null; s2: number | null; s3: number | null; s4: number | null;
+        c0: number | null; c1: number | null; c2: number | null; c3: number | null; c4: number | null;
+        qs0: number | null; qs1: number | null; qs2: number | null; qs3: number | null; qs4: number | null;
+        qc0: number | null; qc1: number | null; qc2: number | null; qc3: number | null; qc4: number | null;
+        q0: number | null; q1: number | null; q2: number | null; q3: number | null; q4: number | null;
+        lo0: number | null; lo1: number | null; lo2: number | null; lo3: number | null; lo4: number | null;
+        m0: number | null; m1: number | null; m2: number | null; m3: number | null; m4: number | null;
+        band_n: number | null; mos36: number | null; mos31: number | null;
+    }>('heavy', `
+        WITH days AS (
+            SELECT g::date AS day,
+                   (g::date::timestamp AT TIME ZONE $5) AS lo,
+                   ((g::date + 1)::timestamp AT TIME ZONE $5) AS hi
+              FROM generate_series($3::date, $4::date, interval '1 day') AS g
+        ), ents AS (
+            SELECT e.id, e.code, e.name, e.kind, d.name AS device
+              FROM entities e JOIN devices d ON d.id = e.device_id
+             WHERE e.source = 'probe' AND e.kind = ANY($1::text[])
+               AND ($2::text[] IS NULL OR e.code = ANY($2::text[]))
+        )
+        SELECT to_char(dy.day, 'YYYY-MM-DD') AS day, en.device, en.name, en.code, en.kind,
+               count(h.hour_ts)::int AS hours,
+               sum(h.n)::float8 AS runs,
+               sum(h.n) FILTER (WHERE h.nok IS NOT NULL)::float8 AS ok_n,
+               sum(h.nok)::float8 AS ok_runs,
+               sum(h.a0 * h.n0)::float8 AS s0, sum(h.a1 * h.n1)::float8 AS s1, sum(h.a2 * h.n2)::float8 AS s2,
+               sum(h.a3 * h.n3)::float8 AS s3, sum(h.a4 * h.n4)::float8 AS s4,
+               sum(h.n0)::float8 AS c0, sum(h.n1)::float8 AS c1, sum(h.n2)::float8 AS c2,
+               sum(h.n3)::float8 AS c3, sum(h.n4)::float8 AS c4,
+               sum(h.a0 * h.n0) FILTER (WHERE h.q0 IS NOT NULL)::float8 AS qs0,
+               sum(h.a1 * h.n1) FILTER (WHERE h.q1 IS NOT NULL)::float8 AS qs1,
+               sum(h.a2 * h.n2) FILTER (WHERE h.q2 IS NOT NULL)::float8 AS qs2,
+               sum(h.a3 * h.n3) FILTER (WHERE h.q3 IS NOT NULL)::float8 AS qs3,
+               sum(h.a4 * h.n4) FILTER (WHERE h.q4 IS NOT NULL)::float8 AS qs4,
+               sum(h.n0) FILTER (WHERE h.q0 IS NOT NULL)::float8 AS qc0,
+               sum(h.n1) FILTER (WHERE h.q1 IS NOT NULL)::float8 AS qc1,
+               sum(h.n2) FILTER (WHERE h.q2 IS NOT NULL)::float8 AS qc2,
+               sum(h.n3) FILTER (WHERE h.q3 IS NOT NULL)::float8 AS qc3,
+               sum(h.n4) FILTER (WHERE h.q4 IS NOT NULL)::float8 AS qc4,
+               sum(h.q0)::float8 AS q0, sum(h.q1)::float8 AS q1, sum(h.q2)::float8 AS q2,
+               sum(h.q3)::float8 AS q3, sum(h.q4)::float8 AS q4,
+               min(h.lo0)::float8 AS lo0, min(h.lo1)::float8 AS lo1, min(h.lo2)::float8 AS lo2,
+               min(h.lo3)::float8 AS lo3, min(h.lo4)::float8 AS lo4,
+               max(h.m0)::float8 AS m0, max(h.m1)::float8 AS m1, max(h.m2)::float8 AS m2,
+               max(h.m3)::float8 AS m3, max(h.m4)::float8 AS m4,
+               sum(h.n4) FILTER (WHERE h.mos36 IS NOT NULL)::float8 AS band_n,
+               sum(h.mos36)::float8 AS mos36, sum(h.mos31)::float8 AS mos31
+          FROM days dy
+         CROSS JOIN ents en
+          LEFT JOIN samples_hourly h
+            ON h.entity_id = en.id AND h.hour_ts >= dy.lo AND h.hour_ts < dy.hi AND h.hour_ts < $6
+         WHERE dy.lo < $6
+         GROUP BY dy.day, en.device, en.name, en.code, en.kind
+         ORDER BY en.device, en.name, en.code, dy.day`, [kinds, codes, fromDay, toDay, tz, frontier]),
 
     uiDevices: (limit: number = UI_PAGE_CAP) => laneQuery<{
         name: string; host: string; status: string; last_poll_ts: Date;
@@ -5350,6 +5696,12 @@ export const OPS = {
      * The same three-interval freshness rule as the interface query above:
      * a sensor nobody has heard from is FROZEN by the caller, never read as
      * a comfortable number.
+     *
+     * SNMP sensors only (slice 57). That freshness rule is three of the
+     * DEVICE's poll intervals and needs a device that has been polled, so
+     * a probe measured on its own schedule - or on a device with SNMP off -
+     * would read stale here, or never be read at all. Probes get a scan of
+     * their own.
      */
     alertScanSensors: () => laneQuery<{
         code: string; name: string; kind: string; value: number | null;
@@ -5381,8 +5733,57 @@ export const OPS = {
                d.name AS device_name, d.status AS device_status
           FROM entities e
           JOIN devices d ON d.id = e.device_id
-         WHERE e.kind <> 'if' AND e.tracked = true
+         WHERE e.kind <> 'if' AND e.source = 'snmp' AND e.tracked = true
            AND d.enabled = true AND d.last_poll_ts IS NOT NULL`),
+
+    /**
+     * The service checks for the scan (slice 58): every tracked probe entity
+     * on an enabled device, with what its last run said.
+     *
+     * FRESH IS THREE OF THE CHECK'S OWN INTERVALS, not the device's poll
+     * interval - the reason slice 57 kept probes out of the sensor query. And
+     * no last_poll_ts gate: a check on a device with SNMP off is the common
+     * case for an outside service, and that device is never polled. A stale
+     * check freezes its rules, as a stale sensor does.
+     *
+     * The interval is read from the stored definition, guarded: the API
+     * writes only validated ones, but a hand-edited row must cost that one
+     * check its freshness, never the scan.
+     *
+     * THE RUN BEFORE, for web and TCP checks (2026-10-07): a response-time
+     * alert needs two slow runs in a row, and the scan sees each run many
+     * times over (every few seconds against a check every 30 or 60), so
+     * counting scans could never say "two runs" - one slow run raised and
+     * cleared on its own, a message each way. The previous run is the latest
+     * raw sample older than the last value (they share a ts), one index read
+     * a check, and only for the kinds whose response time is judged.
+     */
+    alertScanServices: () => laneQuery<{
+        code: string; name: string; kind: string; has_assertion: boolean;
+        tls: boolean; lv_status: number | null; lv_v0: number | null; lv_v1: number | null;
+        lv_v2: number | null; lv_v3: number | null; lv_v4: number | null;
+        lv_v5: number | null; fresh: boolean; device_name: string;
+        prev_v0: number | null; prev_v5: number | null;
+    }>('alerts', `
+        SELECT e.code, e.name, e.kind,
+               coalesce(jsonb_typeof(e.extra->'assertion') = 'object', false) AS has_assertion,
+               coalesce(e.extra->>'url', '') LIKE 'https:%' AS tls,
+               -- Every value: a voice test (slice 60) lays its six out differently.
+               e.lv_status, e.lv_v0, e.lv_v1, e.lv_v2, e.lv_v3, e.lv_v4, e.lv_v5,
+               ${probeFresh('e')} AS fresh,
+               d.name AS device_name,
+               p.v0 AS prev_v0, p.v5 AS prev_v5
+          FROM entities e
+          JOIN devices d ON d.id = e.device_id
+          LEFT JOIN LATERAL (
+              SELECT s.v0, s.v5 FROM samples s
+               WHERE e.kind IN ('svc-http', 'svc-tcp')
+                 AND s.entity_id = e.id AND s.ts < e.lv_ts AND s.ts >= e.lv_ts - interval '2 days'
+               ORDER BY s.ts DESC
+               LIMIT 1
+          ) p ON true
+         WHERE e.source = 'probe' AND e.tracked = true AND e.code IS NOT NULL
+           AND d.enabled = true`),
 } as const;
 
 /** One alert as stored. Column list and record type stay side by side. */
@@ -5485,6 +5886,36 @@ const ALERT_UNDER_POLICY = `((alerts.host IS NOT NULL AND EXISTS (
     SELECT 1 FROM notify_policy p WHERE alerts.alert_key = 'group:' || p.scope || ':' || p.target)))`;
 
 /**
+ * THE SETTLING WINDOW (slice 59, found by the operator's real outage on
+ * 2026-10-05). Checks run on staggered schedules, so when RSCanvas's internet
+ * goes they find out one after another, spread over up to one interval - and
+ * the first to fail raised, and was emailed, before enough others had failed
+ * for the outside-services group alert to exist and hold it. Two of five did
+ * exactly that; location groups never meet this, because one ping sweep sees
+ * a dead site's devices in the same instant.
+ *
+ * So while the outside-services rule is ticked, an outside check's own
+ * notification waits long enough for every other outside check to have run
+ * once since it failed - the longest interval plus its timeout, among them -
+ * and two scans more for the group to breach. If the group forms, the hold
+ * above takes over; if not, the owed queue sends it, that much later. A
+ * blip shorter than the window is never sent (the clause above settles its
+ * clear), though it is recorded and shown like any alert.
+ */
+const checkSeconds = (e: string, field: string, dflt: number): string =>
+    `CASE WHEN ${e}.extra->>'${field}' ~ '^[0-9]{1,6}$' THEN (${e}.extra->>'${field}')::int ELSE ${dflt} END`;
+const OUTSIDE_SETTLE_S = `((SELECT coalesce(max(${checkSeconds('x', 'intervalS', 60)} + ${checkSeconds('x', 'timeoutS', 10)}), 0)
+      FROM entities x WHERE x.source = 'probe' AND x.tracked = true AND x.outside = true)
+    + ${2 * Math.ceil(CONFIG.alertScanIntervalMs / 1000)})`;
+function outsideSettlingMember(a: string): string {
+    return `(${a}.kind = 'svc-down' AND ${a}.code IS NOT NULL
+    AND EXISTS (SELECT 1 FROM group_alert_rules r WHERE r.axis = 'outside' AND r.enabled = true)
+    AND EXISTS (SELECT 1 FROM entities e WHERE e.code = ${a}.code AND e.source = 'probe' AND e.outside = true))`;
+}
+const ALERT_OUTSIDE_SETTLING = `(${outsideSettlingMember('alerts')}
+    AND alerts.first_breach_ts > now() - make_interval(secs => ${OUTSIDE_SETTLE_S}))`;
+
+/**
  * Is this device-down alert's device in a group whose GROUP alert is open?
  * (slice 55, the operator's amendment of ruling 7, 2026-09-29)
  *
@@ -5497,20 +5928,47 @@ const ALERT_UNDER_POLICY = `((alerts.host IS NOT NULL AND EXISTS (
  * raise a scan or two later, so their raises land under a group that is
  * already pending - and if the group never raises, they are owed at once.
  */
-const ALERT_IN_GROUP_OUTAGE = `(alerts.kind = 'device-down' AND alerts.host IS NOT NULL AND EXISTS (
+const ALERT_IN_GROUP_OUTAGE = `((alerts.kind = 'device-down' AND alerts.host IS NOT NULL AND EXISTS (
     SELECT 1 FROM devices d
       JOIN alerts g ON g.alert_key IN ('group:location:' || d.location, 'group:application:' || d.application)
      WHERE d.name = alerts.host AND g.kind = 'group-down'
-       AND g.state IN ('pending', 'active', 'clearing')))`;
+       AND g.state IN ('pending', 'active', 'clearing')))
+  -- An OUTSIDE check's down alert while the outside-services group alert is
+  -- open (slice 59): the same hold, the members being checks. Membership is
+  -- entities.outside, the one verdict the scan counted.
+  OR (alerts.kind = 'svc-down' AND alerts.code IS NOT NULL AND EXISTS (
+    SELECT 1 FROM entities e
+      JOIN alerts g ON g.alert_key = 'group:outside:services'
+     WHERE e.code = alerts.code AND e.source = 'probe' AND e.outside = true
+       AND g.kind = 'group-down'
+       -- ...and for one settling window AFTER it clears: checks recover as
+       -- they failed, one run at a time, so the group clears while some
+       -- members have not yet had the run that would clear them. Without
+       -- this, each of those was emailed down and then up seconds apart
+       -- (the race drill, 2026-10-05: eight messages for one recovery).
+       AND (g.state IN ('pending', 'active', 'clearing')
+            OR (g.state = 'cleared' AND g.cleared_ts > now() - make_interval(secs => ${OUTSIDE_SETTLE_S}))))))`;
 
 /**
  * Did this device-down alert's outage overlap a group alert of its group?
  * The SPAN form of the gate above, for clears: by the time a member's clear
  * is looked at, the group has usually cleared too.
  */
-const ALERT_GROUP_OVERLAP = `(alerts.kind = 'device-down' AND alerts.host IS NOT NULL AND EXISTS (
+const ALERT_GROUP_OVERLAP = `((alerts.kind = 'device-down' AND alerts.host IS NOT NULL AND EXISTS (
     SELECT 1 FROM devices d
       JOIN alerts g ON g.alert_key IN ('group:location:' || d.location, 'group:application:' || d.application)
      WHERE d.name = alerts.host AND g.kind = 'group-down'
        AND g.first_breach_ts <= COALESCE(alerts.cleared_ts, now())
-       AND COALESCE(g.cleared_ts, now()) >= alerts.first_breach_ts))`;
+       AND COALESCE(g.cleared_ts, now()) >= alerts.first_breach_ts))
+  OR (alerts.kind = 'svc-down' AND alerts.code IS NOT NULL AND EXISTS (
+    SELECT 1 FROM entities e
+      JOIN alerts g ON g.alert_key = 'group:outside:services'
+     WHERE e.code = alerts.code AND e.source = 'probe' AND e.outside = true
+       AND g.kind = 'group-down'
+       AND g.first_breach_ts <= COALESCE(alerts.cleared_ts, now())
+       AND COALESCE(g.cleared_ts, now()) >= alerts.first_breach_ts))
+  -- ...or it came and went inside its settling window (below): its raise was
+  -- held to see whether it was alone, and it was over before that was known.
+  OR (${outsideSettlingMember('alerts')} AND alerts.cleared_ts IS NOT NULL
+      AND alerts.cleared_ts <= alerts.first_breach_ts + make_interval(secs => ${OUTSIDE_SETTLE_S})))`;
+

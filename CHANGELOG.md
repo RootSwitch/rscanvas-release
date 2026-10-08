@@ -1,5 +1,237 @@
 # Changelog
 
+## 0.1.0-alpha.7 - 2026-10-08
+
+The seventh alpha, and the first with service checks. A device can carry
+checks of what it serves - a web page or endpoint, a TCP port, and against
+an iperf3 responder at a site, a voice test and a throughput test - each
+alerting on its own and charted like a sensor; when everything outside fails
+at once, one alert says so instead of one per check. The Dashboard shows
+service health site by site, a services report gives each check's average,
+worst and standard deviation over any period, and the wall can show a
+device's MOS, bandwidth and checks. A DNS outage no longer reads as devices
+going down, a poll that fails on RSCanvas's own database no longer counts
+against the device, and a restart no longer records every device going
+unknown. The release was built from the public tree on a fresh Linux clone,
+and an alpha.6 install upgraded to it in one step with nothing lost.
+
+### Upgrading
+
+Unpack the bundle over the install and re-run the installer, as `INSTALL.md`
+section 4 describes. Take a backup first with `rscanvas-backup.sh`, and
+reload open browser tabs afterwards.
+
+- **Three schema changes**, applied by the installer. Entities gain a
+  `source` column, `snmp` for every existing row - every query that means
+  "an SNMP sensor" now says so, and a checker in `npm test` refuses one that
+  does not - and `lv_peer` and `outside` columns with a small index for
+  service checks; a group alert rule may now be the outside-services one.
+  Nothing existing behaves differently.
+- **The installer adds the iperf3 client**, for voice tests, with the
+  package's start-as-a-daemon question answered no - this box is the
+  client. It is optional: a box that cannot fetch it warns and carries on,
+  and `--check` warns if anything listens on 5201.
+- **The hourly rollup keeps more for service checks**: each hour's lowest
+  and highest reading and the sum of squares (so a standard deviation) of
+  every value a check records, its runs that came back ok, and a voice
+  test's runs under MOS 3.6 and 3.1. Written for checks only - NULL for
+  every other entity, which costs nothing - by a second, small statement
+  in the rollup; measured on the 30,000-entity lab, an hour's rollup took
+  the same 4.3 to 4.8 s before and after. After the upgrade the rollup job
+  back-fills the checks' hours still in raw samples, once, a week a step,
+  and says so in its job line. This is the ground for the services report.
+- **The service connects to PostgreSQL at 127.0.0.1** when its database
+  URL says localhost, as the installer writes it - so a new connection
+  never waits on a name lookup (Fixed, below). Every distribution's
+  `pg_hba.conf` admits 127.0.0.1 where it admits localhost; a box whose
+  own rules admit only `::1` would refuse the service at start, by name.
+
+### New
+
+- **Service checks.** A device's page has a Services section where an admin
+  adds checks that RSCanvas runs itself, from the box it is installed on:
+  - **a web page or endpoint** (http or https): the status code against
+    the codes you expect (200-299 unless you say otherwise), the response,
+    connect and name-lookup times, and the certificate's days left;
+  - **a TCP port**: open, refused or silent, with the connect time.
+
+  An https check verifies the certificate against Node's roots plus the
+  operating system's, so an internal CA installed with
+  `update-ca-certificates` is trusted; unticking verification is for a
+  self-signed internal site, and the expiry is still recorded. A check can
+  also look at the answer: that the body contains a word, that it does not,
+  or that one JSON field (`status`, `checks.db.state`) equals a value or is
+  one of several. A check by name resolves every run, or is pinned to its
+  device's address while still sending the name, for a site whose address
+  never moves. Redirects on the same host are followed; one to another host
+  is reported, not followed - expect that status, or check that host.
+  Microsoft's sign-in page, for one, redirects to www.office.com; its
+  `/common/v2.0/.well-known/openid-configuration` answers 200 with JSON.
+
+  Each check alerts four ways, each mutable on its own: down (no answer, a
+  certificate failure, an unexpected status), wrong content (it answers,
+  and the assertion fails - never "down"), response time (warn 2 s, crit
+  5 s) and certificate days (warn 14, crit 7). A device that is down or
+  muted holds its checks' alerts the way it holds its sensors'. The Test
+  button runs a check once and shows the outcome and timings; the response
+  body is never stored, shown or logged. Checks run every 30 seconds at the
+  most, are paused and resumed like a sensor is untracked, and chart their
+  response times like a sensor. Adding, editing and testing them is an
+  admin's, like adding a device; every one is in the audit trail.
+- **One alert when everything outside fails at once.** RSCanvas checks from
+  one place, so its own internet going down looks like every outside check
+  failing in the same minute. System > Group alerts gains an Outside
+  services row: tick it, and when at least half the outside checks (and at
+  least three) fail together, one alert says so - naming the checks and
+  pointing at RSCanvas's own internet path first - while each check's own
+  down notification is held, exactly as a location's group alert holds its
+  devices'. Those still failing when it clears are sent then; those that
+  recovered under it are never sent. Because checks run on staggered
+  schedules, they find an outage - and its end - one after another, so
+  while the row is ticked an outside check's own notification waits until
+  every outside check has run once (their longest interval and timeout,
+  plus two scans) before going out alone, and a held check stays held that
+  long after the group clears. A check that fails by itself is sent that
+  much later; a blip shorter than the wait is recorded and shown, never
+  sent. Drilled against a real outage of the lab's internet, DNS included:
+  one notification out, one back, nothing between. A check counts as outside when the
+  address it reaches is public, or when it is marked so - the check form
+  has the setting for a SaaS reached through a proxy, or a public address
+  that is really the next room.
+- **Voice tests to a site.** A check kind that places one G.711-shaped call
+  - 64 kbps, 50 packets a second, marked EF unless told otherwise - from
+  the RSCanvas box to an iperf3 responder at a site, toward it and then
+  back, every five minutes by default. It records loss and jitter each way
+  and a MOS estimate (the simplified E-model, its delay taken from the
+  responder's ping round trip), charts the loss both ways, and alerts on
+  the worse direction - loss over 1% warns and over 3% is crit, jitter over
+  30 and 50 ms, MOS under 3.6 and 3.1 - naming which way it is. A
+  responder that does not answer is a warning, not a crit: it costs a
+  measurement, and the box it runs on has its own device-down. A busy
+  responder (iperf3 serves one test at a time) is retried once and
+  otherwise recorded as a gap; busy twelve tests running reads as taken
+  over. INSTALL.md section 3 says how to set up and lock down a responder.
+  Drilled against a responder on the lab with 2% loss and 40 +/- 10 ms
+  injected on the way back only: it reported 1.0 to 2.8% lost and 5.7 to
+  6.9 ms of jitter from the site, clean toward it, and warned on the loss.
+- **Throughput tests to a site, and the stagger that keeps tests apart.**
+  TCP to the same responder, ten seconds each way after two of slow
+  start, hourly by default: capped (the default) proves a rate you give
+  without filling the link; uncapped fills it, at any hour or only between
+  two hours you choose. Beside each call, an unmarked and an EF-marked
+  ping stream measure the latency the load causes - bufferbloat, and
+  whether the path's QoS keeps voice out of that queue. Throughput tests run one at a
+  time across the install with ten seconds between them, no voice test
+  runs beside one, and a waiting throughput test is let in as soon as the
+  running voice tests finish; a set that cannot fit is refused when saved.
+  A rate alert exists once you set one (only you know what a link should
+  carry), judging the slower direction and naming it. Drilled on the lab:
+  headroom held its cap to the tenth of a Mbps; uncapped read 941 and 928
+  Mbps on a 1 Gb box with no change in the lab's poll failure rate; behind
+  a 200 Mbit bottleneck with a deep queue, latency rose from 0.4 ms to 82
+  ms for both streams, and with an EF priority queue added, to 131 ms
+  unmarked and 3.9 ms marked - the check telling the two apart.
+- **Service health on the Dashboard**, below Device health. The checks
+  counted by kind - voice, bandwidth, web, TCP - as ok, warning, failing
+  or idle; then one row per site with its last voice and bandwidth tests
+  side by side: the MOS against the run before and the day's lowest (amber
+  under 3.6, red under 3.1, the G.109 bands), loss and jitter in the worse
+  direction, the rate both ways against the run before, the latency under
+  load; then web and TCP checks with their last result, the share of the
+  day's runs that came back ok, and the certificate's days. Coloured by
+  the alerts already raised, so a muted or overridden rule reads as the
+  engine reads it. A row opens its device.
+- **A services report**, on the Dashboard after the interface report: one
+  kind of check at a time - voice, bandwidth, or web and TCP - every check
+  of the kind or the ones picked, one row per check per day and a total
+  over the period, on the page or as CSV. Voice: runs, ok %, MOS average,
+  minimum and standard deviation, the runs under 3.6 and 3.1, loss and
+  jitter average and worst. Bandwidth: each direction's average, minimum
+  and standard deviation, and the latency under load. Web and TCP: the
+  response time's average, worst and standard deviation. A period's total
+  is computed from the whole period's readings, not from its days'
+  figures, so its standard deviation is the period's - the number that
+  shows an oversubscribed or intermittently failing link - and the last
+  14 days is the default period.
+- **Service checks on the wall**: three new glance fields a board can
+  tick - mos (the worst MOS of the device's voice tests), bw (the slower
+  direction of its bandwidth test) and svc (its web and TCP checks, as
+  ok of running, "svc 4/5"). Values only, never a check's name: a board
+  shows what it draws, and a check's name is an internal service's. Each
+  counts only checks that are running with a recent run, and none is
+  ticked on a board until someone ticks it. A failing check already
+  raises its device's alert count and colour on the wall.
+- **Service cards say less and hide nothing.** Wider cards, two short
+  lines each, pause, edit and remove behind one button, and everything
+  cut at a card's edge said in full in its tooltip and under the chart it
+  opens. Services now sit below the sensor cards, above the interface
+  filter.
+- **The pages link their own files by relative path** (`app.js`, not
+  `/app.js`), so the same files also work served under a path - a static
+  copy of the interface, say. An install serves them at the root, where
+  nothing changes; the API stays at the root. `npm test`'s link checker
+  now resolves relative links against the page and refuses an absolute
+  link to anything but the API.
+
+### Fixed
+
+- **A response-time alert needs two slow runs in a row.** One slow run
+  raised and cleared on its own, a message each way: the scan sees a run
+  many times over (every few seconds, against a check every 30 or 60), so
+  its count of breaching scans could never mean "two runs". The scan now
+  reads each web and TCP check's run before as well, and the alert is the
+  milder of the two - warning when both are over the warning level,
+  critical when both are over the critical one; a run before that got no
+  answer starts no streak. Found on the lab's first day of long-running
+  checks: a 2.9 s Google and a 2.65 s DNS-over-TCP, each alone.
+- **A DNS outage no longer reads as devices going down.** Found in the
+  operator's second real outage of the lab (2026-10-06, DNS blocked for 21
+  minutes): name lookups the DNS server never answered held the process's
+  lookup capacity - Node runs at most two at once, on a pool shared by
+  every thread - and the database connections to "localhost" queued
+  behind them until they timed out, 93 times. Polls that could not reach
+  the database were recorded as failed polls, and about a hundred lab
+  devices raised and cleared device-down alerts, once a minute, until DNS
+  came back. Two changes, either of which is enough on its own, measured
+  in a process whose DNS never answers: service checks now hold at most
+  one lookup at a time (a check that cannot get it fails as a DNS failure,
+  which it is), and the database is connected to by address. A lookup of
+  "localhost" behind five stuck checks took 19.5 s before, 1 ms after.
+  The outside-services alert itself behaved as built: one message when
+  the group formed and one when it cleared, its members held, and the
+  name-based checks reading as DNS failures while DNS was blocked.
+- **A poll that fails on RSCanvas's own database no longer counts against
+  the device.** That accounting is what turned the outage's refused
+  connects into device-down alerts, and any database trouble would have
+  done the same. The store now names what it throws, and a poll that
+  failed on it writes nothing about the device - not down, not up, not
+  "polled just now" - and only moves its schedule on, so it is not
+  re-polled in a loop. The device keeps its last state; if its polls keep
+  failing to record it goes stale on the wall after three intervals, as a
+  device nobody can look at should. The health page goes red while any
+  poll in the last fifteen minutes could not be recorded, with the count
+  and the database's last words, and `/metrics` counts them
+  (`polls_unrecorded_total`). Drilled by capping the lab app's database
+  connections for three minutes: 1,471 polls could not be recorded, no
+  device-down was raised, polling kept its pace, and the log said so in
+  87 lines.
+- **A restart no longer turns the whole fleet "unknown".** systemd's stop
+  signals every process in the service at once, fping included, and fping
+  prints its results only as it exits - so a ping sweep in flight at a
+  restart came back empty, and every device was recorded going from up to
+  unknown, and back to up at the first sweep after the start. It happens
+  when a sweep is slow enough to be caught - any unreachable target holds
+  one open for the ping timeout. Found by the alpha.7 upgrade drill, 41
+  devices at the signal's millisecond, and then in the operator's own
+  history: their whole ping fleet at five restarts in two weeks. A sweep fping
+  did not finish now changes nothing; the next one decides. Shown with the
+  real fping: a sweep sent SIGTERM mid-flight came back empty before, and
+  as "nothing to apply" after.
+- **The installer's role step names its own revert command.** Every
+  install and upgrade printed `Revert with: sudo $0 rscanvas --revert`,
+  the `$0` literal; it now prints the script's path. Found in the alpha.7
+  upgrade drill.
+
 ## 0.1.0-alpha.6 - 2026-10-03
 
 The sixth alpha. Every earlier installer wrote both database passwords into

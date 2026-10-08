@@ -51,8 +51,9 @@ import { mergeOverrides } from './overrides.ts';
 import { groupConditions } from './groups.ts';
 import {
     evaluate, type Condition, type RulesConfig, type ScanDoc, type ScanInterface,
-    type ScanMetric,
+    type ScanMetric, type ScanService,
 } from './rules.ts';
+import { scanServiceOf } from './services.ts';
 import {
     step, stepMissing, dedupeConditions,
     type AlertRow, type AlertEventType, type MachineConfig,
@@ -78,6 +79,21 @@ export const DEFAULT_RULES: RulesConfig = {
         uptime: null,
         meter: null,
         state: { warn: null, crit: 1 },
+        // Service checks (slice 58). Response time in ms - two seconds is
+        // slow for any page a person waits on, five is broken in all but
+        // name. Certificate days are LOWER_IS_BAD: two weeks' warning is
+        // time to renew by hand, one week is the last call.
+        'svc-ms': { warn: 2000, crit: 5000 },
+        'svc-cert': { warn: 14, crit: 7 },
+        // Voice tests (slice 60). Loss over 1% is heard, over 3% a call
+        // breaks up; jitter past 30 ms outruns a typical jitter buffer; MOS
+        // (LOWER_IS_BAD) 3.6 is where people notice, 3.1 where they complain.
+        'path-loss': { warn: 1, crit: 3 },
+        'path-jitter': { warn: 30, crit: 50 },
+        'path-mos': { warn: 3.6, crit: 3.1 },
+        // Throughput (slice 61, LOWER_IS_BAD): no default - a rate is only
+        // wrong against what the link should carry, which the operator knows.
+        'path-tput': null,
     },
     ifRules: {
         down: { enabled: true, severity: 'crit' },
@@ -86,6 +102,15 @@ export const DEFAULT_RULES: RulesConfig = {
         util: { warn: 80, crit: 95 },
     },
     deviceDown: { enabled: true, severity: 'crit' },
+    services: {
+        down: { enabled: true, severity: 'crit' },
+        // Crit too: an assertion is written to catch a service that answers
+        // and is not well - a health page saying "degraded" - and the
+        // operator who wrote it meant it to page. It mutes on its own.
+        content: { enabled: true, severity: 'crit' },
+        // A voice responder that does not answer: warn (rules.ts says why).
+        pathDown: { enabled: true, severity: 'warn' },
+    },
     overrides: [],
 };
 
@@ -107,6 +132,7 @@ export function loadRulesConfig(): RulesConfig {
         thresholds: { ...DEFAULT_RULES.thresholds, ...parsed.thresholds },
         ifRules: { ...DEFAULT_RULES.ifRules, ...parsed.ifRules },
         deviceDown: parsed.deviceDown ?? DEFAULT_RULES.deviceDown,
+        services: { ...(DEFAULT_RULES.services as NonNullable<RulesConfig['services']>), ...parsed.services },
         overrides: parsed.overrides ?? [],
     };
 }
@@ -220,6 +246,21 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     if (!ifaces.ok) throw new Error(`lane refused the interface view (${ifaces.reason})`);
     const sensors = await OPS.alertScanSensors();
     if (!sensors.ok) throw new Error(`lane refused the sensor view (${sensors.reason})`);
+    // SERVICE CHECKS (slice 58), caught like group alerts below and for the
+    // same reason: an optional feature's read must never cost the alerting
+    // it sits beside - code that arrives before its schema would otherwise
+    // stop device-down, interfaces and sensors with it. A skipped read
+    // leaves open service alerts to the missing count, which forgives one
+    // scan rather than clearing.
+    let services: ScanService[] = [];
+    try {
+        const sv = await OPS.alertScanServices();
+        if (sv.ok) services = sv.rows.map(scanServiceOf);
+        else console.warn(`[scan] service checks unreadable (${sv.reason}) - skipped this scan`);
+    } catch (err) {
+        console.warn(`[scan] service checks skipped this scan: ${(err as Error).message}`
+            + ' - if a column is missing, the schema is behind the code: re-run the installer');
+    }
 
     // The collector's own health, judged FROM THE DATA, never from CONFIG.
     // Three cases, and the discrimination between the first two is the point -
@@ -330,6 +371,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
             unit: s.unit,
             display: s.name,
         })),
+        services,
     };
 
     const conditions = evaluate(doc, cfg);

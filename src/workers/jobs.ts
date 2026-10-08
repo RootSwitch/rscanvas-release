@@ -148,6 +148,10 @@ async function runOnce(
 // Bounded per TICK as well as per chunk, so catching up cannot monopolise the
 // jobs lane forever - it simply resumes on the next tick, from a frontier that
 // has genuinely moved.
+/** Set once the checks' back-fill reports done; per process, and harmless
+ *  to lose - the function says done again at once. */
+let checksBackfillDone = false;
+
 async function rollup(): Promise<string> {
     let chunks = 0;
     let hours = 0;
@@ -173,9 +177,30 @@ async function rollup(): Promise<string> {
         if (row.caught_up) { caughtUp = true; break; }
     }
 
-    return caughtUp
+    // THE CHECKS' BACK-FILL (2026-10-07): once the rollup has caught up, one
+    // bounded step a tick - a week of hours, checks only - until the hours
+    // they still have in raw samples carry the extremes and the spread. Done
+    // once per database (its job_state row says so), then never asked again
+    // in this process. Its own failure is the rollup run's: the rows it
+    // writes are the rollup's rows.
+    let backfill = '';
+    if (caughtUp && !checksBackfillDone) {
+        const b = await OPS.rollUpChecksBackfill(168);
+        if (!b.ok) throw new Error(`checks back-fill refused (${b.reason})`);
+        const r = b.rows[0];
+        if (r && !r.locked) {
+            if (r.done) checksBackfillDone = true;
+            const hoursB = Number(r.hours_written ?? 0);
+            if (hoursB > 0 || !r.done) {
+                backfill = `; checks back-filled ${hoursB} hour-row(s) through ${r.through?.toISOString() ?? '-'}`
+                    + (r.done ? ', done' : `, until ${r.until?.toISOString() ?? '-'}`);
+            }
+        }
+    }
+
+    return (caughtUp
         ? `caught up: ${chunks} chunk(s), ${hours} hours written`
-        : `${chunks} chunk(s), ${hours} hours written, MORE REMAINING - resumes next tick`;
+        : `${chunks} chunk(s), ${hours} hours written, MORE REMAINING - resumes next tick`) + backfill;
 }
 
 // --- retention ------------------------------------------------------------------
@@ -482,7 +507,9 @@ async function alertNotify(): Promise<string> {
         // waives it on this same pass, and dispatching it here first would
         // send "resolved" for an incident only the group email named.
         const r0 = rec.rows[0];
-        if (ev.type !== 'clear' && r0.in_group) continue;
+        // An outside check settling (slice 59) is held the same way: the
+        // owed queue sends it if no outside-services alert forms to name it.
+        if (ev.type !== 'clear' && (r0.in_group || r0.settling)) continue;
         if (ev.type === 'clear' && !r0.notified_raise && r0.group_overlap) continue;
         if (await dispatchEvent(ev.type, rec.rows[0], { budget: notifyBudget })) sent++;
     }

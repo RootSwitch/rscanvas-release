@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.6).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.7).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -17,7 +17,8 @@ Before the third alpha it was drilled on clean servers: install, upgrade
 from each earlier alpha, backup and restore, uninstall, power loss, a
 database outage, a full disk, and a new user's first fifteen minutes in the
 browser. The fourth fixes what running the third on that network and on the
-30,000-entity lab turned up.
+30,000-entity lab turned up. The seventh adds service checks: web pages,
+TCP ports, and voice and throughput tests to your sites.
 `KNOWN-ISSUES.md` says what is missing or untested; `TESTING.md` says what
 was measured and how; `CHANGELOG.md` says what changed. This is public domain software
 (`LICENSE`, the Unlicense); the device-icon artwork carries its own notices
@@ -65,6 +66,16 @@ so they show the page as the code now draws it.
   retention that drops whole partitions inside a lock timeout.
 - **Reachability.** ICMP through fping and TCP connect checks, on a separate
   schedule from polling, with ping latency history.
+- **Service checks.** Run from the RSCanvas box on a schedule: web pages
+  and endpoints (the status code, response time and certificate expiry,
+  and if you ask, a word or one JSON field in the answer), TCP ports, and
+  against an iperf3 responder at a site, a voice test - one G.711-shaped
+  call each way, scored as loss, jitter and a MOS - and a throughput test
+  that proves a capped rate or fills the link, at any hour or only in the
+  hours you choose, measuring the latency the load causes. Each alerts on
+  its own and charts like a sensor; throughput tests run one at a time and
+  never beside a voice test, and when every outside check fails at once,
+  one alert says so instead of one per check.
 - **Syslog and traps.** UDP listeners with bounded ingest, full-text search
   over a trigram-indexed recent window, and event rules that raise alerts
   from message patterns.
@@ -84,14 +95,19 @@ so they show the page as the code now draws it.
 - **Dashboard and reports.** Open alerts first, then the top 10 interfaces
   by traffic received and sent and by errors and discards, and the top 10
   CPU and memory, over 6 hours, 24 hours or 7 days, each with its change
-  against the window before. An interface traffic report gives GB in and
-  out per day with peaks and coverage, on the page or as CSV.
+  against the window before. Service health by site: the last voice and
+  throughput tests against the run before and the day's lowest, and every
+  web and TCP check. An interface traffic report gives GB in and out per
+  day with peaks and coverage, and a services report each check's average,
+  worst and standard deviation per day and over the period - on the page or
+  as CSV.
 - **Boards and the wall.** Boards generated from the device list by location
   or application - one group, several, or the whole fleet - laid out
   automatically to fit each screen, on a wall display with capability
   tokens for kiosks and burn-in guards for screens that never switch off: a
   timed theme rotation and a small random shift of the whole wall. A board
-  notices when its group gains or loses devices and offers to catch up.
+  notices when its group gains or loses devices and offers to catch up, and
+  a tile can show its device's MOS, bandwidth and checks.
 - **Operations.** Per-user accounts with roles and an audit trail - each
   role sees only the controls it may use, and everyone can change their own
   password - TLS, an OpenMetrics endpoint, a one-command installer with hardened database
@@ -147,7 +163,7 @@ from `ADMIN_USERNAME`, default `admin`). Without `COLLECTOR_ENABLED=1`
 nothing is polled and without `JOBS_ENABLED=1` nothing is rolled up or
 expired; retention stays a dry run until `RETENTION_DRY_RUN=0`, and with no
 `RSCANVAS_SECRET` credential profiles are off. The installer sets all four.
-`npm test` runs the offline suite: fifty-seven test files, sixteen static
+`npm test` runs the offline suite: sixty-two test files, eighteen static
 checkers and a type check, no database needed.
 
 ## Configuration

@@ -26,6 +26,7 @@ import {
     isJobsHealthy, isHeartbeatHealthy, isKernelDropFree, JOB_FAILURES_ALARM,
     evaluateWorkers, WORKER_NAMES, STATS_STALE_MS, FRONTIER_STALE_MS,
     isDbSelfHealthy, WRAPAROUND_ALARM_AGE, isRetentionEnforcing, isNotifyDelivering, NOTIFY_FAILURES_ALARM,
+    isPollRecording, type CollectorStats,
     type PartitionState, type FrontierState, type JobRecordState, type KernelUdpState,
     type WorkerName, type WorkerReport, type HealthVerdict, type DbSelfState,
 } from '../src/workers/protocol.ts';
@@ -883,6 +884,38 @@ console.log('\nisNotifyDelivering - a configured channel that has stopped gettin
     if (isNotifyDelivering(undefined).healthy && isNotifyDelivering([]).healthy) {
         ok('no channels, or no ledger yet, is isNotifyConfigSane\'s business, not this one\'s');
     } else bad('absent ledger went red');
+}
+
+console.log('\nisPollRecording - polls the database refused, no longer written against the device:');
+{
+    // Only the field under judgement matters to this verdict; the rest of a
+    // collector's stats are other verdicts' business.
+    const stats = (u: unknown) => ({ pollsUnrecorded: u }) as unknown as CollectorStats;
+    const quiet = {
+        total: 412, recent: 0, windowMs: 900_000,
+        lastReason: 'Connection terminated due to connection timeout', lastTs: '2026-10-07T00:10:40Z',
+    };
+    if (isPollRecording(stats(quiet), true).healthy) {
+        ok('refusals long ago, none in the window: green - the total is the record, not the verdict');
+    } else bad('an old total went red');
+    const red = isPollRecording(stats({ ...quiet, recent: 93 }), true);
+    if (!red.healthy && /93 poll/.test(red.problem) && /15 min/.test(red.problem)
+        && /connection timeout/.test(red.problem) && /keep their last state/.test(red.problem)) {
+        ok('refusals in the window: RED, with the count, the window, the database\'s last words and what it means');
+    } else bad('recent refusals read as healthy, or said nothing useful', red);
+    const malformed: Array<[string, unknown]> = [
+        ['ABSENT', undefined], ['null', null], ['recent not a number', { ...quiet, recent: 'lots' }],
+        ['recent NaN', { ...quiet, recent: Number.NaN }], ['window zero', { ...quiet, windowMs: 0 }],
+    ];
+    for (const [label, u] of malformed) {
+        const v = isPollRecording(stats(u), true);
+        if (!v.healthy && /cannot be judged/.test(v.problem)) ok(`${label} count: RED as unmonitored, not green as satisfied`);
+        else bad(`${label} count read as permission`, v);
+    }
+    if (isPollRecording(stats({ ...quiet, recent: 93 }), false).healthy) ok('collector disabled: not this verdict\'s business');
+    else bad('a disabled collector went red');
+    if (isPollRecording(null, true).healthy) ok('no stats yet: isReporting\'s business, not this one\'s');
+    else bad('null stats went red here');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

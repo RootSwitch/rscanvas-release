@@ -336,6 +336,15 @@ if [ "$DO_CHECK" = 1 ]; then
     say "  node       $(command -v node >/dev/null && node -v || echo 'NOT INSTALLED')"
     if command -v fping >/dev/null; then say "  fping      $(fping -v 2>&1 | head -1 | grep -oE '[0-9][0-9.]*' | head -1)"
     else bad "fping NOT INSTALLED - reachability is off, every device reads unknown"; fi
+    # Slice 60: optional, so absence is a warning; a LISTENER on its port is
+    # the thing worth saying - the installer never starts one, so something
+    # else did, and this box would be an iperf3 server for anyone who can
+    # reach it.
+    if command -v iperf3 >/dev/null; then say "  iperf3     $(iperf3 --version 2>/dev/null | head -1 | grep -oE '[0-9][0-9.]*' | head -1) (voice and throughput tests)"
+    else warn "iperf3 not installed - voice and throughput tests will say so"; fi
+    if command -v ss >/dev/null && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE ':5201$'; then
+        warn "something listens on 5201, iperf3's port - the installer never starts an iperf3 daemon here; if this box should not be a responder, stop it"
+    fi
     # The layout this installer has written since 2026-10-01 (review F6/F17).
     if [ -d "$APP_DIR" ]; then
         o="$(stat -c %U "$APP_DIR" 2>/dev/null)"
@@ -909,6 +918,30 @@ else
     systemctl enable --now postgresql-18
 fi
 good "node $(node -v), postgres $(q 'SHOW server_version')"
+
+# iperf3, the CLIENT, for the path tests (slices 60, 61). OPTIONAL, unlike
+# fping: nothing but a voice or throughput test needs it, and without it each
+# such test says "iperf3 is not installed" and nothing else changes. So it is its own
+# step, after the one that skips the package mirrors when everything is
+# present - an upgrade gets it too - and a box that cannot fetch it warns
+# rather than stops. The Debian package asks whether to start iperf3 as a
+# DAEMON; the answer is no, preseeded, because this box is the client, and a
+# monitoring box listening on 5201 would be an iperf3 server for anyone who
+# can reach it.
+if command -v iperf3 >/dev/null; then
+    good "iperf3 $(iperf3 --version 2>/dev/null | head -1 | grep -oE '[0-9][0-9.]*' | head -1) (the client, for voice and throughput tests)"
+elif [ "$PKG" = apt ]; then
+    echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1 \
+        || { apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1; }; then
+        good "iperf3 installed, its daemon left off (the client, for voice and throughput tests)"
+    else
+        warn "iperf3 could not be installed - voice and throughput tests will say so; everything else is unaffected"
+    fi
+else
+    dnf install -y -q iperf3 >/dev/null 2>&1 && good "iperf3 installed (the client, for voice and throughput tests)" \
+        || warn "iperf3 could not be installed - voice and throughput tests will say so; everything else is unaffected"
+fi
 
 [ -n "$(q 'SELECT 1')" ] || die "postgres is installed but not answering - start it and re-run"
 

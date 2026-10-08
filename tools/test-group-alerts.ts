@@ -73,5 +73,18 @@ console.log('\nthe sentence the group notification carries:');
     eq('and never names the 26th', many.includes('d25,'), false);
 }
 
+console.log('\nthe outside-services group (slice 59):');
+{
+    const [o] = groupConditions([row({ axis: 'outside', value: 'services', up: 1, down: 4 })]);
+    eq('its key and its label speak of checks, not devices',
+        [o?.key, o?.label], ['group:outside:services', 'outside services from RSCanvas: 4 of 5 checks failing']);
+    eq('it trips by the same rule as any group', o?.severity, 'crit');
+    eq('its key parses back', parseGroupKey('group:outside:services'), { axis: 'outside', value: 'services' });
+    const d = groupDetail(['edge: M365', 'edge: Google'], 50, 3, 'outside');
+    eq('its notification names the checks and the likeliest cause first',
+        [d.startsWith('failing now: edge: M365, edge: Google (trips at 50% and 3 failing)'),
+            d.includes("RSCanvas's own internet path"), d.includes('device-down')], [true, true, false]);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
 if (fail === 0) process.exitCode = 0;

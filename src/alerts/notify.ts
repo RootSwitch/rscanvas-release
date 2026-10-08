@@ -377,7 +377,7 @@ export async function dispatchEvent(
             : await OPS.groupMembers('jobs', g.axis, g.value).catch(() => null);
         if (m !== null && m.ok) {
             const down = m.rows.filter((x) => x.st === 'down').map((x) => x.name);
-            vars.detail = groupDetail(down, Number(alert.threshold ?? 0), Number(m.rows[0]?.min_down ?? 0));
+            vars.detail = groupDetail(down, Number(alert.threshold ?? 0), Number(m.rows[0]?.min_down ?? 0), g?.axis);
         }
     }
     const title = render(isClear ? TMPL.subjectClear : TMPL.subjectRaise, vars);

@@ -16,7 +16,7 @@ import { guessStencil } from '../export/stencil.ts';
 import { sensorSample, planSensorRepin, type SensorExtra } from './sensors.ts';
 import { speedTrust } from './speedtrust.ts';
 import { planRekey } from './rekey.ts';
-import { OPS, type SampleRow } from '../store/index.ts';
+import { OPS, storeFailureLane, storeRefusal, type SampleRow } from '../store/index.ts';
 import { inDomain } from '../store/bounds.ts';
 
 export interface PollResult {
@@ -67,7 +67,9 @@ export interface PollResult {
     /** Whether this poll ATTEMPTED the inventory read. Stamps the backoff. */
     inventoryTried: boolean;
     error: string | null;
-    errorKind: 'timeout' | 'auth' | 'other' | null;
+    /** store (2026-10-06): the poll failed on OUR database, not on the
+     *  device - the caller must not count it against the device. */
+    errorKind: 'timeout' | 'auth' | 'other' | 'store' | null;
 }
 
 /**
@@ -97,6 +99,13 @@ export function rate(
     if (elapsedS <= 0) return null;
     if (now < prev) return null;
     return Number(now - prev) / elapsedS;
+}
+
+/** Whose failure a thrown poll error is: the device's (by SNMP's own kind),
+ *  the store's, or other. Exported for tools/test-poll-store.ts. */
+export function pollErrorKind(err: unknown): NonNullable<PollResult['errorKind']> {
+    if (err instanceof SnmpError) return err.kind;
+    return storeFailureLane(err) !== null ? 'store' : 'other';
 }
 
 export async function pollDevice(
@@ -310,7 +319,7 @@ export async function pollDevice(
         result.stencil = guessed === '' ? null : guessed;
 
         const existing = await OPS.entitiesForDevice(device.id);
-        if (!existing.ok) throw new Error(`entitiesForDevice refused (${existing.reason})`);
+        if (!existing.ok) throw storeRefusal('entitiesForDevice', existing);
         const byIndex = new Map(existing.rows.map((r) => [r.snmp_index ?? '', r]));
 
         // RE-ENUMERATION, decided from the whole table BEFORE the per-row
@@ -696,13 +705,14 @@ export async function pollDevice(
     } catch (err) {
         result.rttMs = Number((performance.now() - t0).toFixed(1));
         result.error = (err as Error).message;
-        result.errorKind = err instanceof SnmpError ? err.kind : 'other';
+        result.errorKind = pollErrorKind(err);
 
         // A session-level error explains the failure better than the timeout
         // it caused. Without this, a device sending an undecodable response
         // looks identical to a device that is switched off - and those need
-        // different responses from whoever is holding the pager.
-        if (session.lastError !== null) {
+        // different responses from whoever is holding the pager. Not for a
+        // store failure: whatever the session last said is not why.
+        if (result.errorKind !== 'store' && session.lastError !== null) {
             result.error = `${result.error} (session error: ${session.lastError.message})`;
         }
     } finally {

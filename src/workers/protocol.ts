@@ -314,6 +314,33 @@ export interface CollectorStats {
      *  one total made a log grep to tell apart. Optional so stats fixtures
      *  built before it existed keep compiling. */
     failuresByKind?: { timeout: number; auth: number; other: number };
+    /** Polls that failed on OUR database rather than on the device
+     *  (2026-10-06): not counted in `failures`, and not written against the
+     *  device. `recent` is the last `windowMs` (fifteen minutes), which
+     *  isPollRecording judges. Optional so stats fixtures built before it
+     *  existed keep compiling; the verdict reads its absence as unmonitored. */
+    pollsUnrecorded?: {
+        total: number; recent: number; windowMs: number;
+        lastReason: string | null; lastTs: string | null;
+    };
+    /**
+     * Service checks (slice 58): how many are scheduled, running and run,
+     * how many runs ended anything but ok, how many starts were skipped
+     * because the same check was still running, and how many stored checks
+     * this build could not read (so are not running at all - the same
+     * "not watched must be a number" rule as reachUnsupported). Optional so
+     * stats fixtures built before it existed keep compiling.
+     */
+    checks?: {
+        scheduled: number; inFlight: number; runs: number; notOk: number;
+        skippedInFlight: number; unreadable: number;
+        /** Slice 60: the iperf3 client is installed (null until asked). */
+        iperf3?: boolean | null;
+        /** Slice 61: max-mode throughput tests that came due outside their hours. */
+        skippedWindow?: number;
+        /** Slice 61: the path gate - which path tests run, which wait. */
+        gate?: { throughput: boolean; voices: number; waitingThroughput: number; waitingVoice: number };
+    };
     /**
      * VERDICT. isPartitionHealthy(_, 'collector').
      *
@@ -668,6 +695,37 @@ export function isJobsHealthy(
  * pass retries, and one refused connection is a blip rather than an outage.
  */
 export const NOTIFY_FAILURES_ALARM = 3;
+
+/**
+ * POLLS THE DATABASE REFUSED (2026-10-06). A poll that fails on the store is
+ * no longer written against the device - in the lab's second real outage
+ * that accounting turned 93 refused database connects into about a hundred
+ * device-down alerts. So the device keeps its last state, and THIS is where
+ * the refusal shows: red while any poll in the last fifteen minutes could not
+ * be recorded, naming the count and the database's last words. A device
+ * whose polls keep failing this way also goes stale on the wall after three
+ * intervals. Absent or malformed counts are unmonitored, not satisfied; a
+ * collector that is off or has not reported is isReporting's business.
+ */
+export function isPollRecording(c: CollectorStats | null | undefined, enabled: boolean): HealthVerdict {
+    if (!enabled || c === null || c === undefined) return { healthy: true };
+    const u = c.pollsUnrecorded;
+    if (u === undefined || u === null || typeof u !== 'object'
+        || !Number.isFinite(u.recent) || !Number.isFinite(u.windowMs) || u.windowMs <= 0) {
+        return {
+            healthy: false,
+            problem: 'the collector published no usable count of polls the database refused, '
+                + 'so whether polls are being recorded cannot be judged',
+        };
+    }
+    if (u.recent <= 0) return { healthy: true };
+    return {
+        healthy: false,
+        problem: `${u.recent} poll(s) in the last ${Math.round(u.windowMs / 60_000)} min could not be recorded - `
+            + `the database refused (last: ${u.lastReason ?? 'no reason given'}). Those devices keep their last `
+            + 'state rather than reading down, and read stale if it lasts; the database lanes below say which is failing',
+    };
+}
 
 export function isNotifyDelivering(
     channels: Array<{ channel: string; trailingFailures: number; lastDeliveredTs?: string | null; lastAttemptTs?: string | null }> | null | undefined,

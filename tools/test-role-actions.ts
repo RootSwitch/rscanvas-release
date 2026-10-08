@@ -46,7 +46,7 @@ for (const role of ROLES) {
 }
 
 const WRITES: Action[] = [
-    'device.create', 'device.delete', 'device.rename', 'device.address', 'device.disable', 'device.track',
+    'device.create', 'check.write', 'device.delete', 'device.rename', 'device.address', 'device.disable', 'device.track',
     'device.speed', 'device.group', 'device.mute', 'alert.suppress', 'alertrule.write', 'credential.write',
     'syslog.export', 'board.write', 'token.mint', 'token.revoke', 'user.create', 'user.delete', 'user.setRole',
 ];
@@ -61,6 +61,9 @@ const MATRIX: Array<[Action, Role[]]> = [
     ['device.rename', ['admin']],
     ['device.address', ['admin']],
     ['device.create', ['admin']],
+    // A check fetches what its author chose, from inside the network - the
+    // power of adding a device, so the same role (slice 58).
+    ['check.write', ['admin']],
     ['device.delete', ['admin']],
     ['alertrule.write', ['admin']],
     ['credential.read', ['admin']],

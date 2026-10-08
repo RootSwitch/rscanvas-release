@@ -23,7 +23,7 @@ and the instruments that produced every number are in `tools/`.
 - **A daily fault window** (`tools/soak-fault.sh`): a slice of the fleet
   taken away for ten minutes each night, so alerting and recovery are
   exercised every day of a run rather than assumed.
-- **The offline suite** (`npm test`): fifty-seven test files and sixteen
+- **The offline suite** (`npm test`): sixty-two test files and eighteen
   static checkers that hold invariants the reviews kept finding one instance
   at a time - every query on a declared lane, no DOM injection sinks, no
   duplicate SQL definitions, every worker message type with a sender, and
@@ -124,6 +124,30 @@ for the installer changes behind the sixth alpha.
 | the installer's flags | `--user root`, `--user` naming a person's account, `--dir /`, `--db postgres` and `--http-port 0` refused on an installed box before any change; root's home and `/etc/passwd` untouched |
 | health's 15-minute window at 30k | 21 hours, 253 samples, nothing red but the 15 minutes after a deliberate 1.5-second pause of the whole process |
 | the collector's failure log at 30k | 20 lines in the ten minutes before the change, from devices dead by design; none in the nine after, the same devices still failing every 30 seconds |
+
+## Since the sixth alpha: service checks
+
+Run 2026-10-05 to 10-08 on the 30,000-entity lab box, for the service
+checks, and on a lab box and a test VM for the seventh alpha's build and
+upgrade.
+
+| measurement | what it found |
+|---|---|
+| the entity `source` column | every one of 30,140 rows read `snmp` after the upgrade; the sensor and interface samples in the two minutes after it matched the two minutes before, count for count |
+| eighteen checks every 30 seconds | each outcome as designed, against Google, GitHub, Microsoft's sign-in, badssl.com's expired, wrong-name and self-signed certificates, and a local server answering 500, the wrong JSON, the wrong page, two gigabytes, or nothing: thirteen alerts, all the right ones, none for a healthy check; health 200 throughout, nothing in the log |
+| the spacing | in the suite, 120 checks against a server that never answers finished in about the 3.4 seconds the arithmetic allows, not the 120 a serial prober would take, with at most 52 connections open |
+| an internal CA | trusted from the operating system's store on Ubuntu 24.04's Node 22.23, untrusted without it |
+| the outside-services alert | with checks failing by design: at 4 of 8 failing, one alert, naming the four; the members' own alerts raised and held; once they recovered, the group cleared and the held ones were never sent |
+| throughput tests and the stagger | on the lab's 1 Gb client: headroom held its cap to 0.04 Mbps; uncapped read 941/928 Mbps with the 30k lab's poll failure rate unchanged (2.4%, 2.0% during, 2.4%); behind a 200 Mbit inbound bottleneck with a deep queue, loaded latency 82 ms for both ping streams, and with an EF priority band 131 ms unmarked against 3.9 ms marked; two throughput tests and a voice test pressed together ran one after another with the gap; an over-budget schedule refused at save |
+| voice tests against a responder with known impairment | iperf3 on the lab, 2% loss and 40 +/- 10 ms injected on the way back only: 1.0 to 2.8% lost (mean 1.9%) and 5.7 to 6.9 ms of jitter reported from the site, toward it clean, the loss alert raised and cleared with it; busy retried and recorded as gaps; a stopped responder warned and recovered. iperf3 3.16 crashed on 3 of 10 both-ways calls, so each test is two one-way calls |
+| ... under a real outage | the lab's internet blocked at the router, then its DNS too: one group alert, steady through the DNS block, cleared seconds after the internet came back - and two members emailed before the group formed, because checks find an outage one schedule at a time. With the settling window, re-drilled with checks failing on their own schedules: three raised early and were held, four still failing when the group cleared settled silently - two messages in all; a check failing alone was held 45 s, then sent |
+| ... under a second real outage (2026-10-06) | DNS blocked 21 minutes, the internet 20: two messages for the incident, every member held, the name-based checks reading as DNS failures. And about a hundred lab devices raising and clearing device-down once a minute, for as long as DNS was blocked: the checks' unanswered lookups held both of the process's lookup slots, the database connects to "localhost" timed out behind them (93 times), and polls that could not write were recorded as device failures |
+| the lookup starvation, reproduced | one process on the lab box, in a private mount namespace whose resolver never answers, five name-based checks stuck: a lookup of "localhost" (what each new database connection did) took 19.5 s before the fix and 1 ms after; a connect by address took 3 ms throughout |
+| a database that refuses, for three minutes | the app's role capped four connections under what it held, so new connects were refused on and off: 1,471 polls could not be recorded and none was written against its device - no device-down raised, poll rate unchanged (about 2,800 a minute), two devices briefly stale and back within a minute, health red with the count and the database's words; 87 log lines in all. Before the in-memory hold, the same drill logged 697 lines of schedule writes refused |
+| two slow runs in a row | a local page answering every other request 2.6 s late, checked every 30 s: three slow runs in three minutes, each beside a fast one, and no alert; then every answer late: the warning raised on the second slow run in a row |
+| the build an outsider makes | the public tree, cloned on a Linux box, `npm ci`, `tools/make-bundle.sh`: the three scripts executable, no carriage returns, the dependency audit clean, 1,150 entries |
+| alpha.6 to alpha.7 in one step | on a VM running alpha.6 with 41 devices and 31 million raw samples, by INSTALL.md section 4: backup, unpack, the installer with no flags. Slices 57 to 59 applied in 3 to 5 ms, iperf3 3.16 installed with its daemon off, the service up with no restarts, both health routes 200; the row counts of all 21 tables and the users, devices and entities unchanged, polling straight on, and no password literal or credential URL in the journal. Re-run on the upgraded box, it changed nothing |
+| a restart with a ping sweep in flight | on that VM's second restart, all 41 devices recorded up to unknown at the signal's millisecond and back ten seconds later: systemd's stop reached fping, which prints only as it exits. The operator's history held the same at five restarts in two weeks. Fixed, and shown with the real fping: a sweep sent SIGTERM mid-flight came back empty before the fix, and as nothing to apply after |
 
 ## What was not tested
 

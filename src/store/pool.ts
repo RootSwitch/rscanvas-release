@@ -185,15 +185,35 @@ export function maintenanceConnectionString(base: string, role: string, password
     return u.toString();
 }
 
+/**
+ * "localhost" in the URL is connected to as 127.0.0.1 (2026-10-06). A name
+ * costs a getaddrinfo per new connection, on libuv's threadpool - which
+ * runs at most two lookups at once in the whole process (half of its four
+ * threads), shared with the service checks' lookups of outside names. In
+ * the operator's second real outage those hung on a blocked DNS server, and
+ * the lanes' connects queued behind them until they timed out (0.5 to 30 s)
+ * - 93 times in 20 minutes, read by the poller as devices going down. An
+ * address needs no lookup. The installer writes localhost, and every
+ * distribution's pg_hba admits 127.0.0.1 wherever it admits localhost; any
+ * other host is left alone. Exported for the unit test.
+ */
+export function connectByAddress(url: string): string {
+    let u: URL;
+    try { u = new URL(url); } catch { return url; } // pg says what is wrong with it
+    if (u.hostname.toLowerCase() !== 'localhost') return url;
+    u.hostname = '127.0.0.1';
+    return u.toString();
+}
+
 function runtime(lane: Lane): LaneRuntime {
     const existing = runtimes.get(lane);
     if (existing) return existing;
 
     const spec = LANES[lane];
     const pool = new pg.Pool({
-        connectionString: lane === 'maintenance'
+        connectionString: connectByAddress(lane === 'maintenance'
             ? maintenanceConnectionString(CONFIG.databaseUrl, CONFIG.adminDbRole, CONFIG.adminDbPassword)
-            : CONFIG.databaseUrl,
+            : CONFIG.databaseUrl),
         max: spec.max,
         application_name: `rscanvas:${lane}`,
         // A backstop only. Admission above keeps in-flight at or below max, so
@@ -368,6 +388,12 @@ export async function onLane<T>(
             rt.stats.failed++;
             throw err;
         }
+    } catch (err) {
+        // The connect's own failures land here too - the one the outage
+        // produced, pg-pool's "Connection terminated due to connection
+        // timeout", comes from rt.pool.connect() above, not from work().
+        tagStoreFailure(err, lane);
+        throw err;
     } finally {
         if (client) {
             client.removeListener('error', onClientError);
@@ -378,6 +404,38 @@ export async function onLane<T>(
         }
         rt.admission.release();
     }
+}
+
+/*
+ * A FAILURE OF THE STORE, NAMED AS ONE (2026-10-06). Anything thrown out of
+ * a lane - a connect that timed out, a refused or dropped connection, a
+ * statement the server rejected - is tagged with the lane before it leaves,
+ * so a caller can tell "our database failed" from its own failure without
+ * matching message strings, and the error keeps its class and code for the
+ * callers that branch on them. The poller is the reason: a poll that
+ * reached the device and then could not write was recorded as the DEVICE
+ * failing, and the lab's second real outage turned 93 refused connects into
+ * about a hundred device-down alerts.
+ */
+const STORE_FAILURE_TAG = 'rscanvasStoreLane';
+
+function tagStoreFailure(err: unknown, lane: Lane): void {
+    if (err === null || typeof err !== 'object' || !Object.isExtensible(err) || STORE_FAILURE_TAG in err) return;
+    Object.defineProperty(err, STORE_FAILURE_TAG, { value: lane, enumerable: false });
+}
+
+/** The lane a thrown error came out of, or null when it is not the store's. */
+export function storeFailureLane(err: unknown): Lane | null {
+    if (err === null || typeof err !== 'object' || !(STORE_FAILURE_TAG in err)) return null;
+    return (err as Record<string, Lane>)[STORE_FAILURE_TAG] ?? null;
+}
+
+/** A structured refusal turned into a thrown, tagged error - for a caller
+ *  that cannot go on without the rows (`what` names the operation). */
+export function storeRefusal(what: string, r: Refused): Error {
+    const e = new Error(`${what} refused (${r.reason})`);
+    tagStoreFailure(e, r.lane);
+    return e;
 }
 
 /** The common case: one parameterised statement on a lane. */

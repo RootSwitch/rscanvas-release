@@ -89,6 +89,11 @@ export const MANIFEST = [
         deferred: 'slice7 defers (app, ts) until measured against real volume - the 2026-07 measurement never ran; '
             + 'revisit with the flap report or the first operator complaint about app: latency',
     },
+    {
+        path: 'service checks: the collector loads them every minute and the alert scan reads them every scan',
+        needs: "entities_probe_idx ON entities (device_id) WHERE source = 'probe'",
+        why: 'slice58: a handful of checks among 30,000 entities must not cost a pass over every interface',
+    },
 ];
 
 export function verify(manifest, sqlText) {

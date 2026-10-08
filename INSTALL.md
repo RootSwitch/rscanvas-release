@@ -214,6 +214,102 @@ holds. The time is the BMC's own clock. A BMC is rarely worth polling, but
 adding its address as a ping-only device gives its traps a device name and
 tells you when the BMC itself stops answering.
 
+**Service checks and voice tests** are added from a device's page, under
+Services, by an admin. Every one runs from the RSCanvas box and nowhere
+else - nothing at a site takes orders from it - so a check answers "can
+RSCanvas reach it", not "can that site".
+
+- An https check trusts Node's roots plus the operating system's, so an
+  internal CA installed on the RSCanvas box (`update-ca-certificates`) is
+  trusted without unticking verification.
+- **A voice test** places one G.711-shaped call (64 kbps, 50 packets a
+  second, marked EF) to an **iperf3 responder** at the site, toward it and
+  then back, and reports loss and jitter each way and a MOS estimate. The
+  installer puts the iperf3 client on the RSCanvas box, with its daemon off.
+  The responder is yours to run, on a wired box at the site - a small Linux
+  machine, or a container on a host already there, run with
+  `--network host` so Docker's NAT is not in the measured path. (ESnet does
+  not support iperf3 on Windows.) On Ubuntu or Debian:
+
+      sudo apt install iperf3      # answer Yes to starting it as a daemon
+
+  An iperf3 server answers anyone who can reach port 5201 and lets them
+  fill the site's link, so allow only the RSCanvas box:
+
+      sudo ufw allow from <RSCanvas address> to any port 5201 proto tcp
+      sudo ufw allow from <RSCanvas address> to any port 5201 proto udp
+
+  and cap what any client may ask for (`sudo systemctl edit iperf3`, then
+  add `--server-bitrate-limit` to the `ExecStart` line: `1M` if the
+  responder serves voice tests only - a call needs 64 kbps - or the rate
+  your throughput tests prove, and no limit for an uncapped one). Add the
+  responder to RSCanvas as a device with ping at least: the MOS takes its
+  delay from the device's ping round trip. A responder that requires a
+  login is not supported yet.
+- **The MOS** (mean opinion score) is the 1-to-5 rating a panel of
+  listeners would give a call. Here it is estimated from the network, not
+  heard: iperf3 reports only loss and jitter, and RSCanvas works out the
+  score with the simplified E-model of ITU-T G.107. That model starts a
+  G.711 call at a rating of 93.2 and takes points off:
+
+  - **Delay** costs 1 point for every 40 ms up to 160 ms, then 1 for
+    every 10 ms past it - the point where people start talking over each
+    other. The delay counted is the one-way delay (half the responder's
+    ping round trip), plus twice the jitter, plus 10 ms for the codec.
+  - **Loss** costs 2.5 points for each 1% of packets lost.
+
+  The remaining rating becomes a MOS on a fixed curve. Each direction is
+  scored, and the worse one is shown.
+
+  A perfect network scores about 4.4, not 5: that is the best a G.711
+  call can score at all, and it is where the "4.41 is good" people quote
+  comes from. ITU-T G.109 gives these bands:
+
+  | MOS          | Listeners               |
+  |--------------|-------------------------|
+  | 4.34 or more | very satisfied          |
+  | 4.03 or more | satisfied               |
+  | 3.6 or more  | some dissatisfied       |
+  | 3.1 or more  | many dissatisfied       |
+  | 2.58 or more | nearly all dissatisfied |
+  | under 2.58   | not recommended         |
+
+  The alert defaults are 3.6 (warning) and 3.1 (critical).
+
+  For a site 10 ms away with 3 ms of jitter:
+
+  | Loss | MOS  |
+  |------|------|
+  | none | 4.40 |
+  | 1%   | 4.34 |
+  | 3%   | 4.20 |
+  | 9%   | 3.60 |
+
+  Delay or jitter alone needs far more to do the same: about 337 ms one
+  way (a satellite hop) or 167 ms of jitter to reach 3.6. So on a
+  terrestrial network it is loss that moves the score, and the loss
+  alerts (1% and 3%) and jitter alerts (30 and 50 ms) fire long before
+  the MOS one. Treat those as the warnings and the MOS as the summary.
+
+  The estimate covers the network's share of call quality only. A bad
+  headset, echo, or another codec is outside it (G.729's best is about
+  4.1). A test whose responder has no ping round trip shows no MOS.
+- **A throughput test** sends TCP to the same kind of responder for ten
+  seconds each way (after two of slow start), hourly by default. CAPPED,
+  the default, holds each way to a rate you give - it proves the site can
+  still get that much without taking the link from the people using it.
+  UNCAPPED fills the link for those seconds, so the form then asks when it
+  runs: at any hour, or only between two hours of this box's clock (01:00
+  to 05:00 unless you change them; a window may wrap past midnight).
+  Outside its hours an uncapped test is simply not run. Beside each call
+  two streams of pings measure the
+  latency the load causes - unmarked, which is bufferbloat, and marked EF,
+  which is whether your QoS keeps voice out of that queue. Throughput
+  tests run ONE AT A TIME across the whole install, ten seconds apart, and
+  no voice test runs beside one; a set of them that cannot fit in an hour
+  is refused when you save it, with the numbers. The test cannot measure
+  past the RSCanvas box's own link - a box on 1 Gb tops out near 940 Mbps.
+
 ## 4. Upgrade
 
 Untar the new bundle over the same directory and run the installer again:

@@ -320,7 +320,19 @@ const FIELD_FMT = {
     snmp: { label: 'snmp', fmt: (v) => `${v} ms` },
     batt: { label: 'batt', fmt: (v) => `${v}%` },
     runtime: { label: 'runtime', fmt: (v) => fmtDur(v) },
+    // The device's service checks (2026-10-07): the worst MOS of its voice
+    // tests, the slower direction of its bandwidth test, and its web and TCP
+    // checks as ok of running - values, never a check's name.
+    mos: { label: 'MOS', fmt: (v) => Number(v).toFixed(2) },
+    bw: { label: 'bw', fmt: (v) => fmtMbps(v) },
+    svc: { label: 'svc', fmt: (v) => `${v.ok}/${v.n}` },
 };
+
+function fmtMbps(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '';
+    return n >= 1000 ? `${(n / 1000).toFixed(2)} Gb/s` : `${n >= 10 ? Math.round(n) : n.toFixed(1)} Mb/s`;
+}
 
 function fmtBps(v) {
     if (v === null || v === undefined || !Number.isFinite(Number(v))) return '';
@@ -442,7 +454,11 @@ function tileElement(s) {
     // public/ by filename with no allowlist, so it answered a path the
     // product refuses. A test rig more permissive than the thing it stands in
     // for tests nothing about the thing it stands in for.
-    a.href = `/#device=${encodeURIComponent(device)}`;
+    //
+    // RELATIVE (2026-10-08): `./` is `/` in the product, where both pages
+    // sit at the root, and it stays inside the site when the pages are
+    // served under a path - the static demo on GitHub Pages.
+    a.href = `./#device=${encodeURIComponent(device)}`;
     a.title = `Open ${device} in RSCanvas`;
     return a;
 }

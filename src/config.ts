@@ -345,6 +345,16 @@ export const CONFIG = {
      */
     tcpCheckTimeoutMs: num('TCP_CHECK_TIMEOUT_MS', 2000),
     tcpCheckSpacingMs: num('TCP_CHECK_SPACING_MS', 20),
+    /**
+     * Service checks (slice 58): the least time between two checks STARTING.
+     * The same model as the TCP lane - no pool, spacing is the concurrency
+     * bound - with each check's own timeout (at most 60 s) in place of the
+     * lane's: at most ceil(timeout / spacing) + 1 checks are ever open,
+     * 3,001 at the extremes and in practice the handful due together. 20 ms
+     * starts fifty a second, which drains a minute's worth of a thousand
+     * checks in twenty seconds.
+     */
+    serviceCheckSpacingMs: num('SERVICE_CHECK_SPACING_MS', 20),
 
     /**
      * Whether the collector maintains the denormalised last-value columns.

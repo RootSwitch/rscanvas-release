@@ -27,7 +27,7 @@ import { CONFIG } from '../config.ts';
 import { startHeartbeat } from '../heartbeat.ts';
 import { percentiles } from '../collector/percentiles.ts';
 import { installSafetyNet } from '../safety.ts';
-import { OPS, copySamples, closeAll, type SampleRow } from '../store/index.ts';
+import { OPS, copySamples, closeAll, storeFailureLane, type SampleRow } from '../store/index.ts';
 import { pollDevice } from '../collector/poll.ts';
 import { probeAll, type ProbeResult } from '../collector/probe.ts';
 import {
@@ -45,6 +45,14 @@ import { decrypt, credentialStoreReady } from '../credentials/crypto.ts';
 import { credentialFields, sessionVersion, type Credential } from '../credentials/v3.ts';
 import { isPermittedEnvRef } from '../credentials/profiles.ts';
 import { safeLogArgs } from '../logsafe.ts';
+import { runCheck } from '../checks/probe.ts';
+import { CheckScheduler, type ScheduledCheck } from '../checks/scheduler.ts';
+import {
+    BUSY_RUNS_LIMIT, inWindow, isCheckKind, OUTCOME_TEXT, outsideVerdict, parseCheckDef, sampleOf, storedDef,
+    THROUGHPUT_GAP_S, type CheckDef, type CheckKind, type CheckResult, type ThroughputCheckDef,
+} from '../checks/model.ts';
+import { PathGate, type Release } from '../checks/pathgate.ts';
+import { execFile } from 'node:child_process';
 
 const hb = startHeartbeat('collector', CONFIG.heartbeatMs, CONFIG.heartbeatThresholdMs);
 
@@ -223,6 +231,54 @@ const failuresByKind: Record<'timeout' | 'auth' | 'other', number> = {
     timeout: 0, auth: 0, other: 0,
 };
 
+/**
+ * POLLS THAT COULD NOT BE RECORDED (2026-10-06): they failed on our own
+ * database, not on the device - in the lab's second real outage, 93 refused
+ * connects that the poller wrote down as about a hundred devices going down.
+ * Not device failures, so not in `failures`: counted here instead, and the
+ * last fifteen minutes of them are a health verdict (isPollRecording),
+ * because the device now keeps its last state and health is where the
+ * database's refusal has to show. The window is timestamps, oldest first,
+ * bounded so an outage of any length costs a fixed amount.
+ */
+const UNRECORDED_WINDOW_MS = 15 * 60_000;
+const UNRECORDED_KEEP = 10_000;
+const unrecordedRecent: number[] = [];
+let unrecordedTotal = 0;
+let unrecordedLastReason: string | null = null;
+let unrecordedLastTs: number | null = null;
+
+/**
+ * Devices whose poll could not be recorded, and when each is due again
+ * (2026-10-06). The schedule's anchor is written to the database too
+ * (OPS.advancePollAnchor), but that write meets the same refusal - in the
+ * drill that capped the app's connections, 697 of 2,524 - and a device whose
+ * anchor did not move reads as due on the next dispatch pass, so for as long
+ * as the refusal lasted it would be polled again and again, each poll asking
+ * the device for nothing that could be kept. (The drill did not show harm
+ * from it; the SNMP timeouts logged during it were the lab's long-dead
+ * devices' hourly reminders. The hold is by construction, not by symptom.)
+ * So it is kept here as well, where it does not depend on the database it is
+ * a hold against. Bounded by the fleet: an entry
+ * leaves when it expires, at the next dispatch pass after its due time.
+ */
+const heldUntil = new Map<string, number>();
+
+function heldIds(now: number): string[] {
+    const ids: string[] = [];
+    for (const [id, until] of heldUntil) {
+        if (until <= now) heldUntil.delete(id); else ids.push(id);
+    }
+    return ids;
+}
+
+function unrecordedInWindow(now: number): number {
+    let drop = 0;
+    while (drop < unrecordedRecent.length && unrecordedRecent[drop] < now - UNRECORDED_WINDOW_MS) drop++;
+    if (drop > 0) unrecordedRecent.splice(0, drop);
+    return unrecordedRecent.length;
+}
+
 // Metrics. Poll LAG is the one that matters: how late a poll started against
 // when it was due. The interval can look perfect while every poll inside it is
 // arriving thirty seconds late.
@@ -377,6 +433,41 @@ async function runPoll(device: {
     const recordFailed = () => OPS.recordDevicePoll(
         device.id, false, null, null, null, false, null, null, null, null, null, null, null, null, anchor,
     );
+    // The third path (2026-10-06): the poll failed on the STORE. Nothing
+    // about the device is written - it keeps its status and failure count,
+    // and its last_poll_ts, so a run of these leaves it stale rather than
+    // down - and only the schedule moves on (OPS.advancePollAnchor says why).
+    const recordUnrecorded = async (reason: string): Promise<void> => {
+        const now = Date.now();
+        unrecordedTotal++;
+        unrecordedLastReason = reason;
+        unrecordedLastTs = now;
+        unrecordedRecent.push(now);
+        if (unrecordedRecent.length > UNRECORDED_KEEP) unrecordedRecent.shift();
+        heldUntil.set(device.id, anchor.getTime() + device.poll_interval_s * 1000);
+        const seen = failureLog.get('store') ?? 0;
+        if (now - seen > 30_000) {
+            failureLog.set('store', now);
+            log(`poll of ${device.name} could not be recorded - the database refused (${reason}); `
+                + 'the device keeps its last state [further store refusals quiet for 30s]');
+        }
+        // The same refusal usually meets this write too, so its failure is
+        // rate limited like the poll's, and harmless: heldUntil above keeps
+        // the device from being due again before its time.
+        let why: string | null = null;
+        try {
+            const moved = await OPS.advancePollAnchor(device.id, anchor);
+            if (!moved.ok) why = moved.reason;
+        } catch (err) {
+            why = (err as Error).message;
+        }
+        const seenAnchor = failureLog.get('store-anchor') ?? 0;
+        if (why !== null && Date.now() - seenAnchor > 30_000) {
+            failureLog.set('store-anchor', Date.now());
+            log(`advancePollAnchor refused for ${device.name} (${why}) - held in memory until it is due `
+                + '[further anchor refusals quiet for 30s]');
+        }
+    };
 
     const t0 = performance.now();
     try {
@@ -422,6 +513,10 @@ async function runPoll(device: {
         const res = await pollDevice(device, cred.value, takenCodes, wantInventory);
         pushSample(pollMs, performance.now() - t0);
         polls++;
+        if (!res.ok && res.errorKind === 'store') {
+            await recordUnrecorded(res.error ?? 'refused');
+            return;
+        }
         if (!res.ok) {
             failures++;
             // A failing poll must SAY SO. The first version counted failures
@@ -533,6 +628,10 @@ async function runPoll(device: {
                 + 'this device will be re-polled immediately and forever');
         }
     } catch (err) {
+        if (storeFailureLane(err) !== null) {
+            await recordUnrecorded((err as Error).message);
+            return;
+        }
         failures++;
         failuresByKind.other++;
         log(`poll of ${device.name} threw:`, (err as Error).message);
@@ -574,12 +673,15 @@ async function dispatchLane(lane: 'live' | 'down', budget: number): Promise<void
     // Those rows still carry an old last_poll_ts, so they read as due on every
     // tick, and before this they filled candidate slots that could never be
     // used.
-    const due = await OPS.duePollTargets(budget, lane, CONFIG.pollDownAfter, [...polling.keys()]);
+    // Held devices too (heldUntil): their poll could not be recorded and
+    // they are not due again yet, whatever their row says.
+    const held = heldIds(Date.now());
+    const due = await OPS.duePollTargets(budget, lane, CONFIG.pollDownAfter, [...polling.keys(), ...held]);
     if (!due.ok) return;
 
     for (const d of due.rows) {
         // Raced with another pass between the query and here.
-        if (polling.has(d.id)) continue;
+        if (polling.has(d.id) || heldUntil.has(d.id)) continue;
         if (inFlight >= CONFIG.pollConcurrency) { skippedNoSlot++; break; }
         // BREAK, NOT CONTINUE, and the difference matters. Every remaining
         // candidate is in this same lane, so once the lane is full the rest
@@ -694,6 +796,15 @@ async function reachSweep(): Promise<void> {
             ? tcpSweep(tcpTargets, CONFIG.tcpCheckTimeoutMs, CONFIG.tcpCheckSpacingMs)
             : Promise.resolve(new Map<string, ProbeReading | null>()),
     ]);
+    if (icmpReadings === null) {
+        // fping was ended by a signal before it printed - a restart's stop
+        // reaches it in the same instant as this process. A sweep it did not
+        // finish says nothing, not "every host unknown"; the next one decides
+        // (reach.ts, sweepReadings). The TCP half goes with it: one sweep,
+        // applied whole or not at all.
+        log('reach sweep cut short (fping ended by a signal) - nothing applied');
+        return;
+    }
     const readings = new Map([...icmpReadings, ...tcpReadings]);
     const swept = [...probe, ...tcpDevices];
     const { transitions } = applySweep(swept, readings, CONFIG.pingDegradedMs);
@@ -780,6 +891,193 @@ if (CONFIG.collectorEnabled && CONFIG.pingEnabled) {
         }, CONFIG.pingIntervalS * 1000).unref();
     });
 }
+
+// --- service checks (slice 58) --------------------------------------------------
+//
+// A third scheduler beside polls and reach, in this worker for the same
+// invariant: the collector is the only worker that reaches the network on its
+// own initiative. The decisions are elsewhere - what a check is and what its
+// answer means in src/checks/model.ts, when it starts in scheduler.ts, the
+// sockets in probe.ts - and what lives here is the clock and the writes.
+//
+// A result is two writes: a SAMPLE, into the same pending batch the polls
+// fill (history, charts, rollups, retention - all inherited), and the LAST
+// VALUES, batched once a second into one statement, which is what the alert
+// scan and the device page read.
+let checkRuns = 0;
+let checkNotOk = 0;
+/** Stored checks this build could not read, so is not running. */
+let checksUnreadable = 0;
+const warnedUnreadable = new Set<string>();
+let checkLv: Array<{ id: string; ts: Date; r: CheckResult; outside: boolean | null }> = [];
+let checkLvWriting = false;
+
+/** Each check's last outcome, so a CHANGE is logged once - with the reason in
+ *  the check's own words - and a steady state is silent (slice 60: a voice
+ *  test failed under impairment and nothing anywhere said why). */
+const lastOutcome = new Map<string, string>();
+
+function onCheckResult(c: ScheduledCheck, r: CheckResult): void {
+    const prev = lastOutcome.get(c.code);
+    if (prev !== r.outcome) {
+        lastOutcome.set(c.code, r.outcome);
+        // The first result after a start is a change from nothing; only a
+        // non-ok one is worth a line then.
+        if (prev !== undefined || r.outcome !== 'ok') {
+            log(`check ${c.deviceName}/${c.name}: ${prev ?? 'start'} -> ${r.outcome} - ${r.detail}`);
+        }
+    }
+    const ts = new Date();
+    const s = sampleOf(r);
+    pending.push({ entityId: c.id, ts, status: s.status, rttMs: s.rttMs, v: s.v });
+    // Slice 59: whether this check counts as outside, by its setting or the
+    // address it reached; null (no address) keeps the stored verdict.
+    checkLv.push({ id: c.id, ts, r, outside: outsideVerdict(c.def.outside, r.peer) });
+    checkRuns++;
+    if (r.outcome !== 'ok') checkNotOk++;
+}
+
+/** Voice tests that ended busy, in a row, by code (slice 60). */
+const busyRuns = new Map<string, number>();
+
+/**
+ * One scheduled run, start to written result. A BUSY responder (slice 60) -
+ * the iperf3 daemon serves one test at a time, so someone else is testing -
+ * is retried once 30 to 90 s later, still holding the check's in-flight
+ * mark so the schedule cannot start it twice; busy again is recorded as a
+ * gap, never a failure, and twelve in a row read as the responder taken
+ * over by something else (busy-always, a down reason).
+ */
+/**
+ * THE STAGGER (slice 61, src/checks/pathgate.ts): one throughput test at a
+ * time with a gap after it, no voice test beside one, and a waiting
+ * throughput test let in once the running voice tests end. Services pass
+ * straight through - they share nothing with a path test.
+ */
+const pathGate = new PathGate(THROUGHPUT_GAP_S * 1000, () => Date.now(), (fn, ms) => setTimeout(fn, ms).unref());
+/** Max-mode throughput tests that came due outside their hours. */
+let skippedWindow = 0;
+
+function gateFor(kind: string): Promise<Release> {
+    if (kind === 'path-tput') return pathGate.acquireThroughput();
+    if (kind === 'path-voice') return pathGate.acquireVoice();
+    return Promise.resolve(() => { /* nothing to release */ });
+}
+
+/** One run through the gate; released however it ends. */
+async function gatedRun(kind: CheckKind, def: CheckDef, deviceHost: string, rttMs: number | null): Promise<CheckResult> {
+    const release = await gateFor(kind);
+    try {
+        return await runCheck(kind, def, deviceHost, { rttMs });
+    } finally {
+        release();
+    }
+}
+
+function runScheduled(c: ScheduledCheck, retried = false): void {
+    // An uncapped throughput test outside its hours is simply not due: no
+    // run, no reading, nothing to alert on - the window is the operator's
+    // statement of when the link may be filled.
+    if (c.kind === 'path-tput' && !inWindow(c.def as ThroughputCheckDef, new Date().getHours())) {
+        skippedWindow++;
+        checkScheduler.finished(c.code);
+        return;
+    }
+    // runCheck never throws; the catch is the house rule for a
+    // fire-and-forget promise on this thread, not an expected path.
+    gatedRun(c.kind, c.def, c.deviceHost, c.deviceRttMs ?? null)
+        .then((first) => {
+            // A run cut short on THIS box (iperf3's client stopped with the
+            // service) is a gap, not a reading: nothing is recorded, so the
+            // check keeps its last real one (IPERF_CLIENT_INTERRUPTED).
+            if (first.interrupted === true) {
+                log(`check ${c.deviceName}/${c.name}: cut short on this box (${first.detail}) - not recorded`);
+                checkScheduler.finished(c.code);
+                return;
+            }
+            let r = first;
+            if (r.outcome === 'busy' && !retried) {
+                setTimeout(() => runScheduled(c, true), 30_000 + Math.random() * 60_000).unref();
+                return;
+            }
+            if (r.outcome === 'busy') {
+                const n = (busyRuns.get(c.code) ?? 0) + 1;
+                busyRuns.set(c.code, n);
+                if (n >= BUSY_RUNS_LIMIT) r = { ...r, outcome: 'busy-always', detail: OUTCOME_TEXT['busy-always'] };
+            } else {
+                busyRuns.delete(c.code);
+            }
+            onCheckResult(c, r);
+            checkScheduler.finished(c.code);
+        })
+        .catch((err) => { onAsyncError(err); checkScheduler.finished(c.code); });
+}
+
+const checkScheduler = new CheckScheduler(CONFIG.serviceCheckSpacingMs, () => Date.now(), (c, atMs) => {
+    setTimeout(() => runScheduled(c), Math.max(0, atMs - Date.now()));
+});
+
+/** Whether the iperf3 client is on this box (slice 60): voice tests need it,
+ *  nothing else does - so its absence is a number in the stats and a reason
+ *  on each voice test, never a failure of the service. */
+let iperf3Present: boolean | null = null;
+execFile('iperf3', ['--version'], { timeout: 5000, windowsHide: true }, (err) => { iperf3Present = err === null; });
+
+async function loadChecks(): Promise<void> {
+    const res = await OPS.probeChecks();
+    if (!res.ok) return;   // lane busy: the schedule keeps the set it has
+    const specs: ScheduledCheck[] = [];
+    let unreadable = 0;
+    for (const row of res.rows) {
+        const def = storedDef(row.kind, row.extra);
+        if (def === null || !isCheckKind(row.kind)) {
+            unreadable++;
+            if (!warnedUnreadable.has(row.code)) {
+                warnedUnreadable.add(row.code);
+                log(`ALARM service check ${row.device_name}/${row.name} (${row.code}) has a definition `
+                    + 'this build cannot read - it is NOT running. Edit and save it on the device page.');
+            }
+            continue;
+        }
+        specs.push({
+            id: row.id, code: row.code, kind: row.kind, def,
+            deviceHost: row.device_host, deviceName: row.device_name, name: row.name,
+            deviceRttMs: row.device_rtt_ms,
+        });
+    }
+    checksUnreadable = unreadable;
+    checkScheduler.setChecks(specs);
+}
+
+async function flushCheckLv(): Promise<void> {
+    if (checkLvWriting || checkLv.length === 0) return;
+    checkLvWriting = true;
+    const batch = checkLv;
+    checkLv = [];
+    try {
+        // EVERY field through sampleOf, the one layout: reading status and
+        // rtt off the result directly stored a voice call's ten seconds as
+        // its round trip (slice 60's drill).
+        const s = batch.map((b) => sampleOf(b.r));
+        const v = (i: number): Array<number | null> => s.map((x) => x.v[i] ?? null);
+        const w = await OPS.updateProbeLastValues(
+            batch.map((b) => b.id), batch.map((b) => b.ts),
+            s.map((x) => x.status), s.map((x) => x.rttMs),
+            v(0), v(1), v(2), v(3), v(4), v(5),
+            batch.map((b) => b.r.peer), batch.map((b) => b.outside),
+        );
+        if (!w.ok) log(`service check last-value write refused (${w.reason}), ${batch.length} result(s)`);
+    } finally {
+        checkLvWriting = false;
+    }
+}
+
+setInterval(() => { if (running) checkScheduler.tick(); }, 250).unref();
+setInterval(() => { if (running) flushCheckLv().catch(onAsyncError); }, 1000).unref();
+// Reloaded every minute AND on a 'checks' message from main when one is
+// saved - the credentials pattern: the message makes it prompt, the timer
+// makes it reliable.
+setInterval(() => { if (running) loadChecks().catch(onAsyncError); }, 60_000).unref();
 
 // Partitions for `samples`, owned by the writer for the same reason ingest owns
 // its own: a COPY into a range-partitioned table fails outright if no partition
@@ -923,6 +1221,24 @@ function snapshot(): CollectorStats {
         reachUnsupported,
         oldestInFlightMs: oldestInFlight(),
         failuresByKind: { ...failuresByKind },
+        pollsUnrecorded: {
+            total: unrecordedTotal,
+            recent: unrecordedInWindow(Date.now()),
+            windowMs: UNRECORDED_WINDOW_MS,
+            lastReason: unrecordedLastReason,
+            lastTs: unrecordedLastTs === null ? null : new Date(unrecordedLastTs).toISOString(),
+        },
+        checks: {
+            scheduled: checkScheduler.size,
+            inFlight: checkScheduler.inFlight,
+            runs: checkRuns,
+            notOk: checkNotOk,
+            skippedInFlight: checkScheduler.skippedInFlight,
+            unreadable: checksUnreadable,
+            iperf3: iperf3Present,
+            skippedWindow,
+            gate: pathGate.state,
+        },
         // AT THE TOP LEVEL, deliberately. The ingest worker published exactly
         // this block nested inside `kernel` while main read it at the top, so a
         // correctly computed alarm was published every second and read as
@@ -949,6 +1265,7 @@ parentPort?.on('message', async (msg: {
     type: string; id?: string;
     targets?: Array<{ host: string; port: number; version: string; credentialRef?: string }>;
     hosts?: string[];
+    check?: { kind: string; def: Record<string, unknown>; deviceHost: string; rttMs?: number | null };
 }) => {
     // SUBNET SCAN: an fping sweep of a host list, answered with the
     // responders. Runs here because this is the thread that owns the
@@ -962,7 +1279,8 @@ parentPort?.on('message', async (msg: {
     if (msg.type === 'scan') {
         let results: Array<{ host: string; rttMs: number | null }> = [];
         try {
-            const readings = await runFpingSweep(msg.hosts ?? [], 500);
+            // null: fping was ended by a signal, so this scan found nothing.
+            const readings = await runFpingSweep(msg.hosts ?? [], 500) ?? new Map<string, ProbeReading | null>();
             for (const [host, r] of readings) {
                 if (r !== null && r.alive) results.push({ host, rttMs: r.rttMs });
             }
@@ -1060,6 +1378,37 @@ parentPort?.on('message', async (msg: {
         await loadProfiles();
         return;
     }
+    // Slice 58: a service check was added, edited, paused or removed.
+    if (msg.type === 'checks') {
+        await loadChecks();
+        return;
+    }
+    // Slice 58: the add form's Test button. Run here, on the thread that owns
+    // the network, and answered through the probe plumbing. The definition
+    // is validated AGAIN - main did, but a message is not a promise - and
+    // the reply carries outcome, timings and pass or fail. Never a body.
+    if (msg.type === 'check-test') {
+        const kind = msg.check?.kind;
+        let result: CheckResult;
+        if (!isCheckKind(kind) || msg.check === undefined) {
+            result = {
+                outcome: 'ours', httpStatus: null, totalMs: null, connectMs: null, dnsMs: null,
+                certDays: null, assertion: null, peer: null, detail: 'not a check kind this build runs',
+            };
+        } else {
+            const parsed = parseCheckDef(kind, msg.check.def);
+            result = parsed.ok
+                // Through the gate like a scheduled run: a Test pressed during
+                // a throughput test waits its turn rather than measuring it.
+                ? await gatedRun(kind, parsed.def, msg.check.deviceHost, msg.check.rttMs ?? null)
+                : {
+                    outcome: 'ours', httpStatus: null, totalMs: null, connectMs: null, dnsMs: null,
+                    certDays: null, assertion: null, peer: null, detail: parsed.detail,
+                };
+        }
+        parentPort?.postMessage({ type: 'probe-result', id: msg.id, results: [result] });
+        return;
+    }
     if (msg.type === 'stats') {
         parentPort?.postMessage({ type: 'stats', stats: snapshot() });
         return;
@@ -1108,6 +1457,9 @@ parentPort?.on('message', async (msg: {
             if (!flushing && pending.length > 0) await flush();
             else await new Promise((resolve) => setTimeout(resolve, 100));
         }
+        // The service checks' last values ride their own once-a-second
+        // write; one more pass so a reading taken just before stop is kept.
+        await flushCheckLv().catch(onAsyncError);
         if (inFlight === 0 && !flushing && pending.length === 0) {
             log(`SHUTDOWN drain-exit reason=drained ms=${Date.now() - t0}`);
         } else {
@@ -1135,4 +1487,5 @@ Promise.all([refreshCodes(), ensurePartitions()]).then(() => {
         + `floor ${CONFIG.pollIntervalFloorS}s, last-value writes ${CONFIG.lastValueWrites ? 'ON' : 'OFF'}, `
         + `partition runway ${partitionRunwayDays() ?? 'unknown'} days`);
     dispatch().catch(onAsyncError);
+    loadChecks().catch(onAsyncError);
 }).catch(onAsyncError);

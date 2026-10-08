@@ -27,6 +27,8 @@ export {
     laneState,
     allLaneStates,
     closeAll,
+    storeFailureLane,
+    storeRefusal,
     type Timing,
     type Outcome,
     type Refused,

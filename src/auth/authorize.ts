@@ -132,7 +132,12 @@ export type Action =
     // per-row version of the same act and is already operator work, and the
     // device keeps being polled and charted, so it sits with device.track:
     // reversible with one click, operator and up, never viewer.
-    | 'device.mute';
+    | 'device.mute'
+    // A service check (slice 58) makes RSCanvas fetch a URL or open a port
+    // of the author's choosing, from inside the network, on a schedule -
+    // the same power as adding a device, so the same role: admin. Pausing
+    // one is device.track (an untrack, operator and up), as for a sensor.
+    | 'check.write';
 
 export interface Resource {
     type: 'system' | 'user' | 'syslog' | 'board';
@@ -209,6 +214,7 @@ const BY_ROLE: Record<Role, ReadonlySet<Action>> = {
         'user.setPasswordOwn',
         'user.setPasswordAny',
         'device.create',
+        'check.write',
         'device.disable',
         'device.delete',
         'device.track',

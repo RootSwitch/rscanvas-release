@@ -44,6 +44,46 @@ ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS n3 int;
 ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS n4 int;
 ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS n5 int;
 
+-- THE EXTREMES AND THE SPREAD (2026-10-07, SLICE-SERVICE-VIEWS-PLAN step 2).
+-- An hour kept its averages and the MAXIMA of v0 and v1 - the right extreme
+-- for a traffic rate and the wrong one for nearly everything a service check
+-- measures: a voice test's worst is its LOWEST MOS (v4) and highest jitter
+-- (v2, v3), a throughput test's its LOWEST rate (v0, v1). And with no sum
+-- of squares there was no standard deviation past raw retention, which is
+-- the operator's tool for an oversubscribed or intermittently failing link.
+--
+-- All of them for SERVICE CHECKS ONLY, NULL for every other entity, and
+-- written by a second, small statement in the rollup (it says why):
+--
+--   lo0..lo4  minimum of v0..v4             m2..m4  maximum of v2..v4
+--   q0..q4    sum of squares of v0..v4, so  sd = sqrt((q - n a^2) / (n - 1))
+--             with n the column's own count (n0..n4) - exact enough in
+--             doubles for a check's milliseconds, MOS and Mbps.
+--   nok       runs that came back ok (v5 = 0).
+--   mos36,    a VOICE test's runs under MOS 3.6 and 3.1 - the ITU-T G.109
+--   mos31     bands behind the alert defaults, fixed by the standard rather
+--             than by a threshold, so a count kept now does not go stale
+--             when a threshold changes. NULL for other checks too.
+--
+-- Filled from the upgrade on; the rollup job back-fills checks' hours still
+-- in raw retention once (roll_up_samples' probes_only, src/workers/jobs.ts).
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS lo0 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS lo1 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS lo2 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS lo3 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS lo4 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS m2 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS m3 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS m4 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS q0 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS q1 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS q2 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS q3 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS q4 double precision;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS nok int;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS mos36 int;
+ALTER TABLE samples_hourly ADD COLUMN IF NOT EXISTS mos31 int;
+
 -- --- job state, and the rollup frontier -------------------------------------------
 --
 -- WITHOUT A PERSISTED FRONTIER, "a missed run self-heals" IS FALSE.
@@ -318,14 +358,18 @@ END $$;
 -- protects data, and a function is code.
 DROP FUNCTION IF EXISTS roll_up_samples(timestamptz, timestamptz);
 
+-- probes_only (2026-10-07): the checks' extremes and spread over hours the
+-- rollup has already written - the one-off back-fill over what raw
+-- retention still holds - and nothing else. Defaulted, so every existing
+-- two-argument call means what it meant.
 CREATE OR REPLACE FUNCTION roll_up_samples(
-    from_ts timestamptz, to_ts timestamptz
+    from_ts timestamptz, to_ts timestamptz, probes_only boolean DEFAULT false
 ) RETURNS TABLE(hours_written bigint, from_clamped timestamptz, to_clamped timestamptz)
 LANGUAGE plpgsql AS $$
 DECLARE
     lo timestamptz;
     hi timestamptz;
-    written bigint;
+    written bigint := 0;
 BEGIN
     SET LOCAL TimeZone = 'UTC';
 
@@ -340,6 +384,7 @@ BEGIN
         RETURN;
     END IF;
 
+    IF NOT probes_only THEN
     INSERT INTO samples_hourly (entity_id, hour_ts, n, a0, a1, a2, a3, a4, a5, m0, m1, st,
                                 n0, n1, n2, n3, n4, n5)
     SELECT entity_id,
@@ -389,9 +434,113 @@ BEGIN
            n0 = excluded.n0, n1 = excluded.n1, n2 = excluded.n2,
            n3 = excluded.n3, n4 = excluded.n4, n5 = excluded.n5;
     GET DIAGNOSTICS written = ROW_COUNT;
+    END IF;
+
+    -- THE CHECKS' EXTREMES AND SPREAD, a second, small statement over the
+    -- rows just written (see the columns' comment above). Small because it
+    -- starts from the checks - a few hundred entities - and reaches their
+    -- samples through the samples' own key, instead of carrying 30,000
+    -- entities' worth through a join to find them. Measured on the 30k lab
+    -- 2026-10-07: folding these into the statement above, with a join to
+    -- pick the checks out, took an hour's rollup from 4.3 s to 6.3 s, for
+    -- columns nothing but checks fill.
+    UPDATE samples_hourly h
+       SET lo0 = x.lo0, lo1 = x.lo1, lo2 = x.lo2, lo3 = x.lo3, lo4 = x.lo4,
+           m2 = x.m2, m3 = x.m3, m4 = x.m4,
+           q0 = x.q0, q1 = x.q1, q2 = x.q2, q3 = x.q3, q4 = x.q4,
+           nok = x.nok, mos36 = x.mos36, mos31 = x.mos31
+      FROM (
+          SELECT s.entity_id, date_trunc('hour', s.ts) AS hour_ts,
+                 min(s.v0) AS lo0, min(s.v1) AS lo1, min(s.v2) AS lo2, min(s.v3) AS lo3, min(s.v4) AS lo4,
+                 max(s.v2) AS m2, max(s.v3) AS m3, max(s.v4) AS m4,
+                 sum(s.v0 * s.v0) AS q0, sum(s.v1 * s.v1) AS q1, sum(s.v2 * s.v2) AS q2,
+                 sum(s.v3 * s.v3) AS q3, sum(s.v4 * s.v4) AS q4,
+                 count(*) FILTER (WHERE s.v5 = 0)::int AS nok,
+                 -- A voice test's own counts; NULL for other checks, whose v4
+                 -- is something else.
+                 (CASE WHEN max(p.kind) = 'path-voice' THEN count(*) FILTER (WHERE s.v4 < 3.6) END)::int AS mos36,
+                 (CASE WHEN max(p.kind) = 'path-voice' THEN count(*) FILTER (WHERE s.v4 < 3.1) END)::int AS mos31
+            FROM entities p
+            JOIN samples s ON s.entity_id = p.id AND s.ts >= lo AND s.ts < hi
+           WHERE p.source = 'probe'
+           GROUP BY s.entity_id, date_trunc('hour', s.ts)
+      ) x
+     WHERE h.entity_id = x.entity_id AND h.hour_ts = x.hour_ts;
+    IF probes_only THEN GET DIAGNOSTICS written = ROW_COUNT; END IF;
 
     hours_written := written;
     from_clamped  := lo;
     to_clamped    := hi;
+    RETURN NEXT;
+END $$;
+
+/*
+ * THE CHECKS' BACK-FILL (2026-10-07, SLICE-SERVICE-VIEWS-PLAN step 2): once
+ * per database, the hours service checks still have in raw samples are
+ * rolled again, so the extremes and the spread reach back as far as raw
+ * retention did on the day of the upgrade, not just from it. Checks only
+ * (roll_up_samples' probes_only): re-rolling every entity's fortnight to
+ * refresh a few hundred checks' would be most of a day's work at 30,000.
+ *
+ * Bounded and resumable, the rollup's own shape: each call covers at most
+ * max_hours from where the last one stopped, and the progress is a job_state
+ * row ('rollup:checks-backfill') written in the same transaction as the hours
+ * it describes - through_ts the next hour to do, detail.until where it ends:
+ * the rollup frontier as it stood when the back-fill began, since everything
+ * from there on the rollup itself writes with the new columns. Starts at the
+ * oldest raw sample any check has, found through the samples' own key (a
+ * min(ts) over all of raw would scan it). Its own advisory lock, so two jobs
+ * workers in a rolling deploy cannot write the same hours at once.
+ */
+CREATE OR REPLACE FUNCTION roll_up_checks_backfill(max_hours int DEFAULT 168)
+RETURNS TABLE(hours_written bigint, done boolean, through timestamptz, until timestamptz, locked boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+    st   job_state%ROWTYPE;
+    lo   timestamptz;
+    hi   timestamptz;
+    stop timestamptz;
+    wrote bigint := 0;
+    -- The rollup's namespace (roll_up_chunk), its own job number: the
+    -- back-fill writes only hours below the frontier, which the rollup has
+    -- left, so the two run side by side; two back-fills do not.
+    RSCANVAS_LOCK_NS       constant int := 1381253120;
+    LOCK_CHECKS_BACKFILL   constant int := 3;
+BEGIN
+    SET LOCAL TimeZone = 'UTC';
+    IF NOT pg_try_advisory_xact_lock(RSCANVAS_LOCK_NS, LOCK_CHECKS_BACKFILL) THEN
+        hours_written := 0; done := false; through := NULL; until := NULL; locked := true;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    locked := false;
+
+    SELECT * INTO st FROM job_state WHERE job = 'rollup:checks-backfill';
+    IF NOT FOUND THEN
+        stop := (SELECT j.through_ts FROM job_state j WHERE j.job = 'rollup');
+        lo := (SELECT date_trunc('hour', min(s.ts))
+                 FROM entities e
+                 JOIN LATERAL (SELECT s.ts FROM samples s WHERE s.entity_id = e.id ORDER BY s.ts LIMIT 1) s ON true
+                WHERE e.source = 'probe');
+        -- No rollup yet, or no check has a sample: nothing to back-fill.
+        IF stop IS NULL OR lo IS NULL OR lo >= stop THEN lo := coalesce(stop, now()); stop := lo; END IF;
+        INSERT INTO job_state (job, through_ts, last_run_ts, last_ok_ts, runs, detail)
+        VALUES ('rollup:checks-backfill', lo, now(), now(), 0, jsonb_build_object('until', stop, 'from', lo));
+        SELECT * INTO st FROM job_state WHERE job = 'rollup:checks-backfill';
+    END IF;
+
+    lo := st.through_ts;
+    stop := (st.detail->>'until')::timestamptz;
+    IF lo < stop THEN
+        hi := least(lo + make_interval(hours => max_hours), stop);
+        SELECT r.hours_written INTO wrote FROM roll_up_samples(lo, hi, true) r;
+        lo := hi;
+    END IF;
+    UPDATE job_state
+       SET through_ts = lo, last_run_ts = now(), last_ok_ts = now(), runs = runs + 1,
+           detail = detail || jsonb_build_object('done', lo >= stop)
+     WHERE job = 'rollup:checks-backfill';
+
+    hours_written := wrote; done := lo >= stop; through := lo; until := stop;
     RETURN NEXT;
 END $$;

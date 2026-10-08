@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.6
+# Known issues, as of 0.1.0-alpha.7
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01 and 2026-10-03 for the second to the sixth. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03 and 2026-10-08 for the second to the seventh. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
@@ -44,9 +44,10 @@ what each alpha fixed.
   (2026-09-30).
 - **The Dashboard reads the hourly rollup**, so its windows end at the last
   complete hour and can be up to an hour behind, and the 7-day trend is
-  blank until a little over ten days of history exist. Memory percentages
-  are only as good as the device's own accounting; some devices count
-  caches as used.
+  blank until a little over ten days of history exist. The services report
+  reads the same rollup, so its last day ends at the last complete hour.
+  Memory percentages are only as good as the device's own accounting; some
+  devices count caches as used.
 - **A traffic report covers an interface's tracked history only.** An
   interface the discovery defaults leave untracked (some sub-interface
   types) has none until it is tracked.
@@ -147,11 +148,48 @@ decision or a drill before it is changed.
 
 - **Hardening of interface identity** on agents that report no physical
   address.
+- **Service checks, as built.** A check cannot send an authorization header yet, so an
+  endpoint behind a token is out of reach - and a token in the URL's query
+  is stored and shown like the rest of the URL, so do not put one there.
+  Every check runs
+  from the RSCanvas box only - by design, so nothing at a site takes
+  orders - which means it answers "can RSCanvas reach it", not "can that
+  site". A response-time alert needs two slow runs in a row (2026-10-07),
+  so a one-off spike is quiet - the lab's first day had two, at 2.65 and
+  2.9 s against medians of 24 and 151 ms - but a page that hovers at its
+  threshold can still raise and clear with it; there is no band between
+  raising and clearing yet.
+- **Voice tests, as built.** A voice test places its two
+  calls one after the other, so it holds the responder twice as long as
+  the plan meant: iperf3 3.16 (Ubuntu 24.04's) crashed on 3 of 10
+  both-ways-at-once calls under loss, the very case the test is for. Its
+  chart draws loss; jitter and the MOS are on its card and in its alerts,
+  not charted. A responder that requires a login cannot be used yet. Under
+  2% injected loss, one test in eleven ended in an iperf3 error whose words
+  were not captured; such an error now freezes the test's rules rather
+  than reading as the responder down, and every change of a check's
+  outcome is logged with its reason, so the next one will say what it was.
+- **Throughput tests, as built.** One TCP stream each way:
+  a path faster than one stream can fill reads low, and there is no
+  setting for more yet. Nothing measures past the RSCanvas box's own link.
+  An uncapped test on the lab's 1 Gb LAN did not move the 30,000-entity
+  lab's poll failure rate, but what one does to polls and pings ACROSS a
+  slow WAN link - where the test and the site's polling share the
+  bottleneck - is unmeasured, and a site's devices could read degraded
+  for the length of the test; the intended answer (hold degraded during
+  the window) waits for that measurement. A paused throughput test resumed
+  later is not re-judged against the hour's budget. Latency under load is
+  on the card, not charted, and raises no alert of its own.
 
 ## Tests and drills owed
 
-None at the moment: the last, the retention drop at 30,000 entities, ran on
-2026-10-01 (TESTING.md).
+- **The lookup ration and the by-address database connects under a real
+  DNS block**. The operator's second real outage (2026-10-06)
+  confirmed the settling window and the DNS naming - two messages for the
+  whole incident, every name-based check reading as a DNS failure - and
+  found database connects starving behind unanswered lookups (CHANGELOG,
+  Fixed). The fix was measured in a process whose DNS never answers, in a
+  private namespace on the lab box; it has not yet met a real outage.
 
 ## Ideas, not promises
 

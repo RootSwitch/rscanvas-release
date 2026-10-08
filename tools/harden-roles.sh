@@ -329,5 +329,5 @@ Done. Schema changes now need the admin credential
   ADMIN_DATABASE_URL=postgres://$ADMIN_ROLE:<that password>@localhost:5432/$DB \\
     node src/db/apply-schema.ts --with-retention
 
-Revert with: sudo \$0 $DB --revert
+Revert with: sudo bash $0 $DB --revert
 EOF

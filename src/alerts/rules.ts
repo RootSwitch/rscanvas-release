@@ -53,8 +53,9 @@
 // went away. Ageing it out would say "fixed" when the truth is "unknown", which
 // is the same class as a health check reading absent data as healthy.
 
-/** Kinds where a LOW value is the problem: battery %, runtime, uptime. */
-export const LOWER_IS_BAD = new Set(['battery', 'runtime', 'uptime']);
+/** Kinds where a LOW value is the problem: battery %, runtime, uptime - and
+ *  a service check's certificate days (slice 58). */
+export const LOWER_IS_BAD = new Set(['battery', 'runtime', 'uptime', 'svc-cert', 'path-mos', 'path-tput']);
 
 export const METRIC_KINDS = [
     'cpu', 'mem', 'disk', 'temp', 'fan', 'power', 'util',
@@ -109,6 +110,9 @@ export interface RulesConfig {
         util: Levels | null;
     };
     deviceDown: BoolRule;
+    /** Service checks' yes/no rules (slice 58); their levelled ones live in
+     *  thresholds under 'svc-ms' and 'svc-cert'. Absent means both on, crit. */
+    services?: { down: BoolRule; content: BoolRule; pathDown?: BoolRule };
     overrides?: Override[];
 }
 
@@ -146,10 +150,47 @@ export interface ScanMetric {
     unit?: string | null;
     display?: string | null;
 }
+/**
+ * One service check as the scan read it (slice 58). Classified by the
+ * caller from the stored outcome code, so this module keeps its property of
+ * importing nothing: the engine judges, it does not decode.
+ */
+export interface ScanService {
+    code?: string | null;
+    /** The owning device's name. */
+    host?: string | null;
+    name?: string | null;
+    /** Its last run is within three of its own intervals. */
+    fresh?: boolean;
+    /** No evidence either way: never run, or the prober's own failure. */
+    unknown?: boolean;
+    /** Why it is not serving, in words, or null when it is. */
+    downReason?: string | null;
+    /** It answered with something an assertion could judge. */
+    answered?: boolean;
+    /** It carries an assertion at all. */
+    hasAssertion?: boolean;
+    /** The assertion failed (or could not read the body); null when not judged. */
+    contentFailed?: boolean | null;
+    httpStatus?: number | null;
+    totalMs?: number | null;
+    /** The run before's response time, when it answered (2026-10-07). */
+    prevTotalMs?: number | null;
+    /** An https check: its certificate rule exists even on a run that never saw one. */
+    tls?: boolean;
+    certDays?: number | null;
+    /** svc-http, svc-tcp, or path-voice (slice 60), which has rules of its own. */
+    kind?: string;
+    /** A voice test's last call, both ways; null when it did not run. */
+    voice?: { lossTo: number; lossFrom: number; jitterTo: number; jitterFrom: number; mos: number | null } | null;
+    /** A throughput test's last calls, Mbps each way; null when they did not run. */
+    tput?: { mbpsTo: number; mbpsFrom: number } | null;
+}
 export interface ScanDoc {
     devices?: ScanDevice[];
     interfaces?: ScanInterface[];
     metrics?: ScanMetric[];
+    services?: ScanService[];
 }
 
 export interface OverrideIndex { byCode: Map<string, Override>; byHostKind: Map<string, Override>; byKind: Map<string, Override> }
@@ -227,7 +268,22 @@ export const IF_RULE_KINDS = ['if-down', 'if-errors', 'if-discards', 'if-util'] 
 /** The yes/no rules: no levels, so an override is on or off and nothing else.
  *  An ENABLED override of one is how a port alerts under a device-wide mute
  *  (manual link-down, 2026-10-02) - resolveBoolInfo already honoured it. */
-export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down']);
+export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down', 'svc-down', 'svc-content', 'path-down']);
+
+/** The four rules a service check carries (slice 58): two yes/no, two levelled. */
+export const SERVICE_RULE_KINDS = ['svc-down', 'svc-content', 'svc-ms', 'svc-cert'] as const;
+
+/** The four a voice test carries (slice 60): no answer, and three readings. */
+export const PATH_RULE_KINDS = ['path-down', 'path-loss', 'path-jitter', 'path-mos'] as const;
+
+/** The two a throughput test carries (slice 61): no answer, and the rate. */
+export const THROUGHPUT_RULE_KINDS = ['path-down', 'path-tput'] as const;
+
+const SERVICE_BOOL_DEFAULT: BoolRule = { enabled: true, severity: 'crit' };
+/** WARN, not crit: a responder that does not answer costs a MEASUREMENT, not a
+ *  service - and the box it runs on has its own device-down alert, crit,
+ *  if it is gone. */
+const PATH_DOWN_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
 
 /** What governs one target today: which tier, whether it is muted, and the
  *  levels when the kind has levels. */
@@ -252,6 +308,20 @@ export function resolveRuleInfo(
     if (kind === 'if-down' || kind === 'device-down') {
         const b = resolveBoolInfo(idx, kind === 'if-down' ? config.ifRules.down : config.deviceDown, code, host, kind);
         return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'svc-down' || kind === 'svc-content') {
+        const d = kind === 'svc-down' ? config.services?.down : config.services?.content;
+        const b = resolveBoolInfo(idx, d ?? SERVICE_BOOL_DEFAULT, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'path-down') {
+        const b = resolveBoolInfo(idx, config.services?.pathDown ?? PATH_DOWN_DEFAULT, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'svc-ms' || kind === 'svc-cert' || kind === 'path-loss' || kind === 'path-jitter' || kind === 'path-mos'
+        || kind === 'path-tput') {
+        const info = resolveLevelsInfo(idx, config.thresholds[kind], code, host, kind);
+        return { source: info.source, muted: info.muted, levels: info.levels };
     }
     const defaults = kind === 'if-errors' ? config.ifRules.errors
         : kind === 'if-discards' ? config.ifRules.discards
@@ -487,6 +557,170 @@ export function evaluate(doc: ScanDoc, config: RulesConfig): Condition[] {
             label: metricLabel(m),
             value: frozen ? null : round2(m.value as number), threshold: thr, unit: m.unit || '',
         });
+    }
+
+    // --- service checks (slice 58) ---
+    //
+    // Four rules per check, each its own key so each can be muted on its own:
+    // down (not serving), content (answering, wrong content - never "down",
+    // the operator's ruling), response time, certificate days. The device's
+    // own state governs them as it governs a sensor: muted emits nothing,
+    // down FREEZES (the device's alert already says it, and an outside
+    // service hung off an edge router must not page twenty times when the
+    // router goes), transient-down quiets. A check with no recent run, or
+    // whose prober failed, freezes too - no evidence is not "up".
+    for (const s of doc.services || []) {
+        if (!s || !s.code) continue;
+        const host = s.host ?? null;
+        if (mutedDevices.has(host ?? '')) continue;
+        const code = s.code;
+        const name = `${host} ${s.name ?? code}`;
+        const noData = s.fresh !== true || s.unknown === true;
+
+        // --- a throughput test (slice 61): no answer, and the rate ---
+        // The rate rule has NO default: only the operator knows what a link
+        // should carry, so it exists once they say (an override), and judges
+        // the SLOWER direction, naming it.
+        if (s.kind === 'path-tput') {
+            const downR = resolveBool(idx, config.services?.pathDown ?? PATH_DOWN_DEFAULT, code, host, 'path-down');
+            const rateLv = resolveLevels(idx, config.thresholds['path-tput'], code, host, 'path-tput');
+            const frozenAll = downDevices.has(host ?? '') || noData;
+            const quiet = !noData && transientDown.has(host ?? '');
+            if (downR) {
+                const reason = frozenAll ? null : s.downReason ?? null;
+                out.push({
+                    key: `svc:${code}:down`, severity: reason !== null ? downR.severity : null, frozen: frozenAll && !quiet,
+                    kind: 'path-down', host, code, label: reason !== null ? `${name}: ${reason}` : name,
+                    value: null, threshold: null, unit: '',
+                });
+            }
+            if (rateLv) {
+                const t = s.tput ?? null;
+                if (frozenAll || t === null) {
+                    out.push({ key: `svc:${code}:tput`, severity: null, frozen: !(frozenAll && quiet), kind: 'path-tput', host, code, label: `${name} throughput`, value: null, threshold: null, unit: 'Mbps' });
+                } else {
+                    const [v, dir] = t.mbpsFrom < t.mbpsTo ? [t.mbpsFrom, 'from the site'] : [t.mbpsTo, 'toward the site'];
+                    const [sev, thr] = levelSeverity('path-tput', v, rateLv);
+                    out.push({
+                        key: `svc:${code}:tput`, severity: sev, frozen: false, kind: 'path-tput', host, code,
+                        label: `${name} throughput ${dir}`, value: round2(v), threshold: thr, unit: 'Mbps',
+                    });
+                }
+            }
+            continue;
+        }
+
+        // --- a voice test (slice 60): no answer, loss, jitter, MOS ---
+        // Loss and jitter are judged on the WORSE direction and the label
+        // says which, since "4% lost" is half an answer to "where".
+        if (s.kind === 'path-voice') {
+            const downR = resolveBool(idx, config.services?.pathDown ?? PATH_DOWN_DEFAULT, code, host, 'path-down');
+            const lossLv = resolveLevels(idx, config.thresholds['path-loss'], code, host, 'path-loss');
+            const jitLv = resolveLevels(idx, config.thresholds['path-jitter'], code, host, 'path-jitter');
+            const mosLv = resolveLevels(idx, config.thresholds['path-mos'], code, host, 'path-mos');
+            const v = s.voice ?? null;
+            const worse = (to: number, from: number): [number, string] => (from > to ? [from, 'from the site'] : [to, 'toward the site']);
+            const rules: Array<[string, string, string, Levels | null, [number, string] | null]> = [];
+            if (lossLv) rules.push([`svc:${code}:loss`, 'path-loss', '%', lossLv, v ? worse(v.lossTo, v.lossFrom) : null]);
+            if (jitLv) rules.push([`svc:${code}:jitter`, 'path-jitter', 'ms', jitLv, v ? worse(v.jitterTo, v.jitterFrom) : null]);
+            if (mosLv) rules.push([`svc:${code}:mos`, 'path-mos', '', mosLv, v && v.mos !== null ? [v.mos, 'worse direction'] : null]);
+            const word: Record<string, string> = { 'path-loss': 'loss', 'path-jitter': 'jitter', 'path-mos': 'MOS' };
+            if (downDevices.has(host ?? '') || noData) {
+                const quiet = !noData && transientDown.has(host ?? '');
+                if (downR) out.push({ key: `svc:${code}:down`, severity: null, frozen: !quiet, kind: 'path-down', host, code, label: name, value: null, threshold: null, unit: '' });
+                for (const [key, kind, unit] of rules) {
+                    out.push({ key, severity: null, frozen: !quiet, kind, host, code, label: `${name} ${word[kind]}`, value: null, threshold: null, unit });
+                }
+                continue;
+            }
+            if (downR) {
+                const reason = s.downReason ?? null;
+                out.push({
+                    key: `svc:${code}:down`, severity: reason !== null ? downR.severity : null, frozen: false,
+                    kind: 'path-down', host, code, label: reason !== null ? `${name}: ${reason}` : name,
+                    value: null, threshold: null, unit: '',
+                });
+            }
+            for (const [key, kind, unit, levels, reading] of rules) {
+                // No call, no reading: a responder that did not answer (or
+                // was busy) freezes these - path-down speaks for it.
+                if (reading === null || !Number.isFinite(reading[0])) {
+                    out.push({ key, severity: null, frozen: true, kind, host, code, label: `${name} ${word[kind]}`, value: null, threshold: null, unit });
+                    continue;
+                }
+                const [sev, thr] = levelSeverity(kind, reading[0], levels as Levels);
+                out.push({
+                    key, severity: sev, frozen: false, kind, host, code,
+                    label: kind === 'path-mos' ? `${name} ${word[kind]}` : `${name} ${word[kind]} ${reading[1]}`,
+                    value: round2(reading[0]), threshold: thr, unit,
+                });
+            }
+            continue;
+        }
+
+        const downRule = resolveBool(idx, config.services?.down ?? SERVICE_BOOL_DEFAULT, code, host, 'svc-down');
+        const contentRule = s.hasAssertion === true
+            ? resolveBool(idx, config.services?.content ?? SERVICE_BOOL_DEFAULT, code, host, 'svc-content') : null;
+        const msLevels = resolveLevels(idx, config.thresholds['svc-ms'], code, host, 'svc-ms');
+        const certLevels = s.tls === true ? resolveLevels(idx, config.thresholds['svc-cert'], code, host, 'svc-cert') : null;
+        const keys: Array<[string, string, string, string]> = [];
+        if (downRule) keys.push([`svc:${code}:down`, 'svc-down', name, '']);
+        if (contentRule) keys.push([`svc:${code}:content`, 'svc-content', `${name} content`, '']);
+        if (msLevels) keys.push([`svc:${code}:ms`, 'svc-ms', `${name} response time`, 'ms']);
+        if (certLevels) keys.push([`svc:${code}:cert`, 'svc-cert', `${name} certificate`, 'days']);
+        const noEvidence = s.fresh !== true || s.unknown === true;
+        if (downDevices.has(host ?? '') || noEvidence) {
+            const quiet = !noEvidence && transientDown.has(host ?? '');
+            for (const [key, kind, label, unit] of keys) {
+                out.push({ key, severity: null, frozen: !quiet, kind, host, code, label, value: null, threshold: null, unit });
+            }
+            continue;
+        }
+        if (downRule) {
+            const reason = s.downReason ?? null;
+            out.push({
+                key: `svc:${code}:down`, severity: reason !== null ? downRule.severity : null, frozen: false,
+                kind: 'svc-down', host, code, label: reason !== null ? `${name}: ${reason}` : name,
+                value: s.httpStatus ?? null, threshold: null, unit: '',
+            });
+        }
+        if (contentRule) {
+            // Judged only on an answer: a service that is down says nothing
+            // about its content, so the content rule freezes beside it.
+            const judged = s.answered === true && s.contentFailed !== null && s.contentFailed !== undefined;
+            out.push({
+                key: `svc:${code}:content`, severity: judged && s.contentFailed === true ? contentRule.severity : null,
+                frozen: !judged, kind: 'svc-content', host, code, label: `${name} content`,
+                value: null, threshold: null, unit: '',
+            });
+        }
+        if (msLevels) {
+            // TWO SLOW RUNS IN A ROW (2026-10-07, the operator): one slow run
+            // raised and cleared by itself - the lab's first day had two,
+            // a 2.9 s Google and a 2.65 s DNS-over-TCP, each a message each
+            // way. So the alert is the MILDER of this run and the one before:
+            // warn needs both over warn, crit both over crit, and a run before
+            // that did not answer (or none at all) starts no streak.
+            const v = s.answered === true ? s.totalMs : null;
+            const frozen = typeof v !== 'number' || !Number.isFinite(v);
+            const prev = typeof s.prevTotalMs === 'number' && Number.isFinite(s.prevTotalMs) ? s.prevTotalMs : null;
+            const [sev, thr] = frozen ? [null, null]
+                : prev === null ? [null, levelSeverity('svc-ms', v as number, msLevels)[1]]
+                    : levelSeverity('svc-ms', Math.min(v as number, prev), msLevels);
+            out.push({
+                key: `svc:${code}:ms`, severity: sev, frozen, kind: 'svc-ms', host, code,
+                label: `${name} response time`, value: frozen ? null : round2(v as number), threshold: thr, unit: 'ms',
+            });
+        }
+        if (certLevels) {
+            const v = s.certDays;
+            const frozen = typeof v !== 'number' || !Number.isFinite(v);
+            const [sev, thr] = frozen ? [null, null] : levelSeverity('svc-cert', v as number, certLevels);
+            out.push({
+                key: `svc:${code}:cert`, severity: sev, frozen, kind: 'svc-cert', host, code,
+                label: `${name} certificate`, value: frozen ? null : round2(v as number), threshold: thr, unit: 'days',
+            });
+        }
     }
 
     return out;

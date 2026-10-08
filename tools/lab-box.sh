@@ -56,7 +56,8 @@ packages)
     install -d /etc/needrestart/conf.d
     echo '$nrconf{override_rc}{qr(^rscanvas)} = 0;' > /etc/needrestart/conf.d/50-rscanvas.conf
     apt-get update -qq
-    apt-get install -y -qq curl ca-certificates gnupg openssl git fping jq sysstat rsync >/dev/null
+    echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
+    apt-get install -y -qq curl ca-certificates gnupg openssl git fping jq sysstat rsync iperf3 >/dev/null
     # PGDG and NodeSource exactly as rscanvas-setup.sh adds them.
     if ! command -v psql >/dev/null; then
         . /etc/os-release

@@ -11,10 +11,10 @@
      sharp one for every browser that takes it; the apple-touch icon is the
      180px raster for a home screen. Both rasters are drawn from favicon.svg
      by tools/make-favicons.mjs, and npm test refuses them when they drift. -->
-<link rel="icon" href="/favicon.ico" sizes="32x32">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <!--
@@ -32,7 +32,7 @@
              the tab and the page cannot drift apart; the raster copies in
              the head are stamped with its hash and checked by npm test. -->
         <span class="logo" aria-hidden="true">
-            <img src="/favicon.svg" width="20" height="20" alt="">
+            <img src="favicon.svg" width="20" height="20" alt="">
         </span>
         <span class="brand-name">RSCanvas</span>
     </span>
@@ -140,6 +140,52 @@
                 </div>
             </div>
             <div id="dash-groups-msg" class="muted small"></div>
+        </div>
+
+        <!-- SERVICE HEALTH (2026-10-07, SLICE-SERVICE-VIEWS-PLAN part A), below
+             Device health: the checks counted by kind, then the operator's
+             ThousandEyes shape - one row per site, its voice and bandwidth
+             tests side by side against the run before and the day's low -
+             then web and TCP checks in their own table. Live with the 10 s
+             refresh; coloured by the alerts already raised, never by a second
+             reading of the thresholds. A row opens its device. -->
+        <div class="panel" data-section="dashboard" id="dash-svc-panel">
+            <h2>Service health <span id="dash-svc-sub" class="muted"></span></h2>
+            <table class="list compact dash-svc-kinds" id="dash-svc-kinds">
+                <thead><tr><th>checks</th><th class="num">ok</th><th class="num">warning</th>
+                    <th class="num">failing</th><th class="num" title="paused, not run yet, no recent run, or the responder was busy">idle</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="dash-sites-wrap" class="hidden">
+                <h3>Sites</h3>
+                <div class="table-scroll">
+                    <table class="list compact" id="dash-sites">
+                        <thead><tr><th>site</th><th>location</th>
+                            <th class="num" title="the last voice test's MOS, the worse direction">MOS</th>
+                            <th class="num" title="against the voice test before it">vs prev</th>
+                            <th class="num" title="the lowest MOS in the last 24 hours">24 h low</th>
+                            <th class="num" title="the worse direction of each, from the last voice test">loss / jitter</th>
+                            <th class="num" title="the last throughput test, toward the site and from it">Mbps to / from</th>
+                            <th class="num" title="against the throughput test before it, the direction that moved most">vs prev</th>
+                            <th class="num" title="latency under the throughput test's load, unmarked">loaded ms</th>
+                            <th class="num">last run</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+            <div id="dash-svcs-wrap" class="hidden">
+                <h3>Web and TCP</h3>
+                <div class="table-scroll">
+                    <table class="list compact" id="dash-svcs">
+                        <thead><tr><th>check</th><th>device</th><th>result</th>
+                            <th class="num" title="runs that came back ok in the last 24 hours">ok 24 h</th>
+                            <th class="num" title="days the certificate has left">cert</th>
+                            <th class="num">last run</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+            <div id="dash-svc-msg" class="muted small"></div>
         </div>
 
         <div class="panel" data-section="dashboard" id="dash-top-panel">
@@ -257,6 +303,50 @@
                 </tr></thead>
                 <tbody></tbody>
             </table>
+        </div>
+
+        <!-- THE SERVICES REPORT (2026-10-07, SLICE-SERVICE-VIEWS-PLAN step 3): the
+             interface report's shape for service checks, one kind at a time -
+             each kind's columns are its own. Per check per day and a total
+             over the period, from the hourly rollup; the standard deviation
+             is what finds an oversubscribed or intermittently failing link,
+             the minimum how bad it got, the runs under the G.109 bands how
+             often. Every check of the kind unless some are picked. -->
+        <div class="panel" data-section="dashboard" id="svc-report-panel">
+            <h2>Services report</h2>
+            <div class="row">
+                <label for="svc-report-kind" class="small">checks</label>
+                <select id="svc-report-kind">
+                    <option value="voice" selected>voice tests</option>
+                    <option value="bandwidth">bandwidth tests</option>
+                    <option value="web">web and TCP checks</option>
+                </select>
+                <label class="small"><input type="checkbox" id="svc-report-all" checked> all of them</label>
+                <span id="svc-report-pick-msg" class="muted small"></span>
+            </div>
+            <div id="svc-report-pick" class="report-pick hidden"></div>
+            <div class="row">
+                <label for="svc-report-period" class="small">period</label>
+                <select id="svc-report-period">
+                    <option value="last-14" selected>last 14 days</option>
+                    <option value="last-7">last 7 days</option>
+                    <option value="this-month">this month so far</option>
+                    <option value="last-month">last month</option>
+                    <option value="last-30">last 30 days</option>
+                    <option value="custom">from ... to ...</option>
+                </select>
+                <input type="date" id="svc-report-from" class="hidden">
+                <input type="date" id="svc-report-to" class="hidden">
+                <button type="button" id="svc-report-run" class="btn-primary">Show report</button>
+                <a id="svc-report-csv" class="btn hidden" download>Download CSV</a>
+                <span id="svc-report-msg" class="muted small"></span>
+            </div>
+            <div class="table-scroll">
+                <table class="list compact hidden" id="svc-report-table">
+                    <thead><tr></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
         </div>
 
         <div class="panel" data-section="search">
@@ -835,6 +925,137 @@
                  above the interface table - the parent's layout, which the
                  operator named as the porting bar. -->
             <div id="sensor-cards" class="cards hidden"></div>
+            <!-- SERVICE CHECKS (slice 58): what RSCanvas fetches or connects
+                 to on this device's behalf - an https page, a JSON health
+                 endpoint, a TCP port - each a card with its last outcome,
+                 opening its response-time chart like a sensor's. The form is
+                 static markup, outside the cards, so the page's refresh
+                 re-rendering the cards cannot wipe a half-typed check. Shown
+                 to everyone when the device has checks; to an admin always,
+                 so the first one can be added. Below the sensor cards and
+                 above the chart and the interface filter (operator,
+                 2026-10-07): the device's own readings first, then what
+                 RSCanvas tests on its behalf. -->
+            <div id="services" class="hidden">
+                <div class="row">
+                    <h3 class="grow">Services</h3>
+                    <button type="button" id="svc-add" class="small" data-can="check.write">+ Add check</button>
+                </div>
+                <div id="service-cards" class="cards svc-cards"></div>
+                <div id="svc-form" class="svc-form hidden">
+                    <div class="form-grid">
+                        <label for="svc-kind">check</label>
+                        <select id="svc-kind">
+                            <option value="svc-http" selected>a web page or endpoint (http, https)</option>
+                            <option value="svc-tcp">a TCP port</option>
+                            <option value="path-voice">a voice path - an iperf3 responder at a site</option>
+                            <option value="path-tput">a throughput path - an iperf3 responder at a site</option>
+                        </select>
+                        <label for="svc-name">name</label>
+                        <input type="text" id="svc-name" maxlength="80" autocomplete="off" placeholder="blank: named after its address">
+                        <label for="svc-url" class="svc-http">URL</label>
+                        <input type="text" id="svc-url" class="svc-http" maxlength="2048" autocomplete="off"
+                               placeholder="https://portal.example.com/health">
+                        <label for="svc-method" class="svc-http">request</label>
+                        <div class="row svc-http">
+                            <select id="svc-method">
+                                <option value="GET" selected>GET</option>
+                                <option value="HEAD">HEAD</option>
+                            </select>
+                            <label for="svc-expect">expect status</label>
+                            <input type="text" id="svc-expect" size="14" autocomplete="off" placeholder="200-299">
+                        </div>
+                        <label for="svc-connect" class="svc-http">connect to</label>
+                        <select id="svc-connect" class="svc-http">
+                            <option value="resolve" selected>the address its name resolves to, looked up every run</option>
+                            <option value="pin">this device's address, sending the name</option>
+                        </select>
+                        <label for="svc-verify" class="svc-http">certificate</label>
+                        <label class="svc-http"><input type="checkbox" id="svc-verify" checked> verify it (untick for an internal site's self-signed one)</label>
+                        <label for="svc-assert-type" class="svc-http">and check that</label>
+                        <div class="row svc-http">
+                            <select id="svc-assert-type">
+                                <option value="none" selected>nothing more - the status is enough</option>
+                                <option value="contains">the body contains</option>
+                                <option value="absent">the body does not contain</option>
+                                <option value="json">a JSON field</option>
+                            </select>
+                            <input type="text" id="svc-assert-text" class="svc-assert-kw hidden" size="24" maxlength="200" autocomplete="off" placeholder="text">
+                            <input type="text" id="svc-assert-path" class="svc-assert-json hidden" size="18" maxlength="200" autocomplete="off" placeholder="status or checks.db.state">
+                            <select id="svc-assert-op" class="svc-assert-json hidden">
+                                <option value="equals" selected>equals</option>
+                                <option value="not-equals">does not equal</option>
+                                <option value="one-of">is one of</option>
+                            </select>
+                            <input type="text" id="svc-assert-values" class="svc-assert-json hidden" size="18" autocomplete="off" placeholder="ok  (one-of: comma-separated)">
+                        </div>
+                        <label for="svc-host" class="svc-target hidden">host</label>
+                        <input type="text" id="svc-host" class="svc-target hidden" autocomplete="off" placeholder="blank: this device's address">
+                        <label for="svc-port" class="svc-target hidden">port</label>
+                        <input type="text" id="svc-port" class="svc-target hidden" size="6" autocomplete="off">
+                        <!-- A VOICE TEST (slice 60): one G.711-shaped call, 64 kbps both
+                             ways at once, against an iperf3 responder - the device the
+                             test belongs to, unless a host is given. -->
+                        <label for="svc-duration" class="svc-path hidden">each call</label>
+                        <div class="row svc-path hidden">
+                            <input type="text" id="svc-duration" size="4" autocomplete="off" value="10">
+                            <span class="muted small">seconds each way</span>
+                            <span class="muted small svc-voice">, marked</span>
+                            <select id="svc-dscp" class="svc-voice">
+                                <option value="46" selected>EF (46), as voice is</option>
+                                <option value="0">unmarked (0), as bulk is</option>
+                            </select>
+                        </div>
+                        <!-- A THROUGHPUT TEST (slice 61): capped (headroom) proves a rate
+                             without taking the link from the people on it; uncapped (max)
+                             fills the link, so it asks WHEN as a question of its own - any
+                             hour, or only between two (stored as 0 to 24 for any hour, so
+                             the API is unchanged). The operator set a test to 1 to 23
+                             meaning "all day" when the two shared one row. Tests run one
+                             at a time, everywhere, and never beside a voice test. -->
+                        <label for="svc-mode" class="svc-tput hidden">speed</label>
+                        <div class="row svc-tput hidden">
+                            <select id="svc-mode">
+                                <option value="headroom" selected>capped at</option>
+                                <option value="max">uncapped - as fast as the link goes</option>
+                            </select>
+                            <input type="text" id="svc-cap" class="svc-headroom" size="6" autocomplete="off" placeholder="200">
+                            <span class="muted small svc-headroom">Mbps each way - proves the site can still get that much</span>
+                        </div>
+                        <label for="svc-hours" class="svc-max hidden">runs</label>
+                        <div class="row svc-max hidden">
+                            <select id="svc-hours">
+                                <option value="any">at any hour</option>
+                                <option value="window" selected>only between</option>
+                            </select>
+                            <input type="text" id="svc-wstart" class="svc-window" size="3" autocomplete="off" value="1">
+                            <span class="muted small svc-window">:00 and</span>
+                            <input type="text" id="svc-wend" class="svc-window" size="3" autocomplete="off" value="5">
+                            <span class="muted small svc-window">:00, this box's time - it fills the link while it runs</span>
+                        </div>
+                        <label for="svc-outside" class="svc-service">outside service</label>
+                        <select id="svc-outside" class="svc-service">
+                            <option value="auto" selected>decide by the address it reaches - a public one is outside</option>
+                            <option value="yes">yes - count it toward the outside services alert</option>
+                            <option value="no">no - it is on our network</option>
+                        </select>
+                        <label for="svc-interval">every</label>
+                        <div class="row">
+                            <input type="text" id="svc-interval" size="6" autocomplete="off" value="60">
+                            <span class="muted small svc-service">seconds (at least 30), time out after</span>
+                            <input type="text" id="svc-timeout" class="svc-service" size="4" autocomplete="off" value="10">
+                            <span class="muted small svc-service">seconds</span>
+                            <span id="svc-interval-hint" class="muted small svc-path hidden">seconds</span>
+                        </div>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" id="svc-test">Test</button>
+                        <button type="button" id="svc-save" class="btn-primary">Save</button>
+                        <button type="button" id="svc-cancel">Cancel</button>
+                        <span id="svc-msg" class="muted small"></span>
+                    </div>
+                </div>
+            </div>
             <!-- The chart opens in place when a card or an interface row is
                  clicked. One at a time, deliberately: a page of twenty
                  charts is a dashboard, and this is a drill-down. -->
@@ -852,6 +1073,10 @@
                     </select>
                     <button type="button" id="chart-close">Close</button>
                 </div>
+                <!-- A service check's whole story, untruncated (2026-10-07): its
+                     card is cut to the card's edge, and a tooltip is no use on a
+                     touch screen, so opening the card says it all here. -->
+                <div id="chart-detail" class="chart-detail muted small hidden"></div>
                 <div id="chart-body"></div>
                 <!-- Errors and discards get their OWN chart, sharing the x
                      axis above rather than a second y axis on it: traffic is
@@ -1108,6 +1333,10 @@
                still raise and show, but their emails are held: the group's email names them.
                Any still down when the group recovers are emailed then. Transient and muted
                devices are not counted.</p>
+            <p class="muted small">Outside services works the same way over the service checks that
+               count as outside - those reaching a public address, or marked so. When enough
+               of them fail at once, the likeliest cause is RSCanvas's own internet, and one
+               alert says so instead of one for each check.</p>
             <table class="list compact" id="group-alerts-table">
                 <thead><tr>
                     <th>watch</th><th>group</th><th class="num">up</th><th class="num">down</th>
@@ -1320,7 +1549,7 @@
     </div>
 </div>
 
-<script src="/themes.js"></script>
-<script type="module" src="/app.js"></script>
+<script src="themes.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

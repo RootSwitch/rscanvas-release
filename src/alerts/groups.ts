@@ -22,7 +22,14 @@
 import type { Condition } from './rules.ts';
 
 export const GROUP_KIND = 'group-down';
-export type GroupAxis = 'location' | 'application';
+/** 'outside' (slice 59) is the outside-services group: its members are the
+ *  service checks marked outside, its value always OUTSIDE_VALUE. */
+export type GroupAxis = 'location' | 'application' | 'outside';
+export const OUTSIDE_VALUE = 'services';
+
+function axisOf(v: string): GroupAxis {
+    return v === 'application' || v === 'outside' ? v : 'location';
+}
 
 /** One opted-in group with its current counts, as the scan reads it. */
 export interface GroupCount {
@@ -41,7 +48,7 @@ export function groupKey(axis: GroupAxis, value: string): string {
 
 /** The axis and value back out of a key; a value may itself contain ':'. */
 export function parseGroupKey(key: string): { axis: GroupAxis; value: string } | null {
-    const m = /^group:(location|application):(.+)$/s.exec(key);
+    const m = /^group:(location|application|outside):(.+)$/s.exec(key);
     return m ? { axis: m[1] as GroupAxis, value: m[2] as string } : null;
 }
 
@@ -59,7 +66,7 @@ export function groupTripped(up: number, down: number, thresholdPct: number, min
  */
 export function groupConditions(rows: GroupCount[]): Condition[] {
     return rows.map((r) => {
-        const axis = r.axis === 'application' ? 'application' : 'location';
+        const axis = axisOf(r.axis);
         const up = Number(r.up) || 0;
         const down = Number(r.down) || 0;
         const known = up + down;
@@ -71,7 +78,9 @@ export function groupConditions(rows: GroupCount[]): Condition[] {
             kind: GROUP_KIND,
             host: null,
             code: null,
-            label: `${r.value} (${axis}): ${down} of ${known} devices down`,
+            label: axis === 'outside'
+                ? `outside services from RSCanvas: ${down} of ${known} checks failing`
+                : `${r.value} (${axis}): ${down} of ${known} devices down`,
             value: known === 0 ? 0 : Math.round((down * 100) / known),
             threshold: Number(r.threshold_pct),
             unit: '%',
@@ -86,9 +95,16 @@ export function groupConditions(rows: GroupCount[]): Condition[] {
  * not repeated: the label beside it already says "4 of 6 devices down"
  * (the first drill's email said it twice, 2026-09-30).
  */
-export function groupDetail(down: string[], thresholdPct: number, minDown: number): string {
+export function groupDetail(down: string[], thresholdPct: number, minDown: number, axis: GroupAxis = 'location'): string {
     const SHOWN = 25;
     const names = down.slice(0, SHOWN).join(', ') + (down.length > SHOWN ? `, and ${down.length - SHOWN} more` : '');
+    if (axis === 'outside') {
+        // The likeliest cause first: every outside check failing at once is
+        // what RSCanvas's own internet going away looks like.
+        return (down.length > 0 ? `failing now: ${names} ` : '')
+            + `(trips at ${thresholdPct}% and ${minDown} failing) - check RSCanvas's own internet path first; `
+            + "these checks' own down notifications are held while this is open";
+    }
     return (down.length > 0 ? `down now: ${names} ` : '')
         + `(trips at ${thresholdPct}% and ${minDown} down) - their own device-down notifications are held while this is open`;
 }

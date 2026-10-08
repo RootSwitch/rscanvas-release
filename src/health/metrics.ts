@@ -80,6 +80,8 @@ export function serializeMetrics(m: MetricsInput): string {
         for (const [kind, n] of Object.entries(c.failuresByKind ?? {})) {
             line('poll_failures_total', n, `kind="${esc(kind)}"`);
         }
+        family('polls_unrecorded_total', 'counter', 'Polls that failed on the database, not the device - not written against it.');
+        line('polls_unrecorded_total', c.pollsUnrecorded?.total);
         family('samples_written_total', 'counter', 'Sample rows written.');
         line('samples_written_total', c.samplesWritten);
         family('sample_write_failures_total', 'counter', 'Sample batches refused or thrown.');
