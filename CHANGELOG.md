@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.0-alpha.8 - 2026-10-08
+
+A small alpha the same day as the seventh. Virtual machines keep their VM
+icon, and Cisco IOS-XE routers draw as routers rather than servers - both
+found by running a simulated company network for the coming demo, whose
+cloud VMs and branch routers came out as servers. The installer now names
+the commit it installed. Built from the public tree on a fresh Linux clone,
+and an alpha.7 install upgraded to it in one step.
+
+### Upgrading
+
+Unpack the bundle over the install and re-run the installer, as `INSTALL.md`
+section 4 describes. There is no schema change. Icons correct themselves on
+each device's next poll.
+
+### Fixed
+
+- **A virtual machine keeps its VM icon.** The icon is guessed again on
+  every poll, but only the daily inventory poll reads the CPU model that
+  tells a VM from a server - so every other poll guessed with none, and
+  drew the VM as a server again until the next inventory. The guess now
+  falls back to the stored CPU model.
+- **A Cisco ISR draws as a router.** IOS-XE routers name an image rather
+  than a role - an ISR 4331 reports "ISR Software
+  (X86_64_LINUX_IOSD-UNIVERSALK9-M)" - and the LINUX in it made the device
+  a server. Any `_IOSD` image (ISR, ASR, CSR, Catalyst 8000 Edge) is now a
+  router; a Catalyst 9000 says "Switch Software" and stays a switch.
+- **The installer names the commit it installed.** Its code line showed the
+  manifest's first 60 bytes, which ended just before the commit's value
+  ("commit:      )"); it now prints the bundle and commit lines whole.
+
 ## 0.1.0-alpha.7 - 2026-10-08
 
 The seventh alpha, and the first with service checks. A device can carry

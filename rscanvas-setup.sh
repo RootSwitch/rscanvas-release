@@ -1239,7 +1239,9 @@ if [ -d "$APP_DIR/data/exports" ]; then
     rmdir "$APP_DIR/data/exports" "$APP_DIR/data" 2>/dev/null || true
     good "the old export spool in $APP_DIR/data removed ($n orphaned file(s)); exports now go to $SPOOL_DIR"
 fi
-good "$APP_DIR ($( [ -f "$APP_DIR/BUNDLE-MANIFEST.txt" ] && head -c 60 "$APP_DIR/BUNDLE-MANIFEST.txt" | tr '\n' ' ' || echo 'no manifest'))"
+# The bundle and commit lines whole: the first 60 bytes of the manifest cut
+# off just before the commit's value, on every install (2026-10-08).
+good "$APP_DIR ($( [ -f "$APP_DIR/BUNDLE-MANIFEST.txt" ] && sed -nE 's/^(bundle|commit):[[:space:]]+/\1 /p' "$APP_DIR/BUNDLE-MANIFEST.txt" | paste -sd ' ' - || echo 'no manifest'))"
 
 step "schema - BUILD, then HARDEN, never the other way round"
 # Reversed these two are circular: harden-roles makes four functions SECURITY

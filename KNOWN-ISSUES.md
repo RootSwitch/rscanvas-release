@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.7
+# Known issues, as of 0.1.0-alpha.8
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01, 2026-10-03 and 2026-10-08 for the second to the seventh. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03 and 2026-10-08 for the second to the eighth. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists

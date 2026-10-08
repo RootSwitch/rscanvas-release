@@ -172,7 +172,14 @@ export function guessStencil(e: StencilEvidence): string {
     // 3. Network gear by role keyword.
     if (/access ?point|\bwifi\b|\bwlan\b|wireless/.test(hay)) return 'access point';
     if (/catalyst|procurve|\bnexus\b|powerconnect|\bswitch\b/.test(hay)) return 'switch';
-    if (/\bios[- ]?xe\b|\bvyos\b|\brouter\b/.test(hay)) return 'router';
+    // _IOSD- (2026-10-08): IOS-XE runs as a daemon on Linux, and its image
+    // name says so - an ISR 4331 reports "ISR Software
+    // (X86_64_LINUX_IOSD-UNIVERSALK9-M)" with no role word anywhere, so the
+    // LINUX in it fell through to the server rule below. Every _IOSD image
+    // is a router platform (ISR, ASR, CSR, Catalyst 8000 Edge); a Catalyst
+    // 9000 runs CAT9K_IOSXE and says "Switch Software", claimed one line up.
+    // Found by the demo fleet, whose branch routers drew as servers.
+    if (/\bios[- ]?xe\b|\bvyos\b|\brouter\b|_iosd-/.test(hay)) return 'router';
 
     // 4. General-purpose operating systems, last, and only as "server".
     //

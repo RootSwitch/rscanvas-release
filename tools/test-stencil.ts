@@ -49,6 +49,14 @@ check('access point', { sysDescr: 'U6-Enterprise 6.8.2.15592', name: 'U6-Enterpr
 check('access point', { sysDescr: 'U7-Pro-XG-B 8.6.11.18870', name: 'U7-Pro-XG' }, 'U7 AP');
 check('firewall', { sysDescr: 'UDM-Pro 3.2.12', name: 'udm-pro' }, 'Dream Machine is the gateway');
 
+// --- Cisco IOS-XE, whose banner names an image, not a role (2026-10-08) -----
+check('router', { sysDescr: 'Cisco IOS Software [Cupertino], ISR Software (X86_64_LINUX_IOSD-UNIVERSALK9-M), Version 17.9.4a, RELEASE SOFTWARE (fc3)', name: 'br1-rtr' },
+    'an ISR 4331: the LINUX in its image name used to make it a server');
+check('router', { sysDescr: 'Cisco IOS Software [Bengaluru], ASR1000 Software (X86_64_LINUX_IOSD-UNIVERSALK9-M), Version 17.6.5', name: 'wan-edge' },
+    'an ASR 1000, the same image family');
+check('switch', { sysDescr: 'Cisco IOS Software [Cupertino], Catalyst L3 Switch Software (CAT9K_IOSXE), Version 17.9.4a', name: 'idf-3' },
+    'a Catalyst 9300 runs IOS-XE too, and says Switch - claimed before the router rule');
+
 // --- appliances that must beat the OS they run on ----------------------------
 check('firewall', { sysDescr: 'pfSense FW-1.dl 2.8.1-RELEASE FreeBSD 15.0-CURRENT amd64', name: 'FW-1' },
     'pfSense IS FreeBSD - the appliance rule has to run first');

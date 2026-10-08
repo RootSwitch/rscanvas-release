@@ -1,6 +1,6 @@
 {
   "name": "rscanvas",
-  "version": "0.1.0-alpha.7",
+  "version": "0.1.0-alpha.8",
   "private": true,
   "license": "Unlicense",
   "description": "RSCanvas: a converged, internally-modular network monitoring platform. One process, isolated runtimes, deliberate lanes.",

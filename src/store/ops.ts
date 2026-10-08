@@ -1195,6 +1195,9 @@ export const OPS = {
         poll_anchor_ts: Date | null;
         /** Last ATTEMPT at the slow-changing inventory read; null = never. */
         inventory_ts: Date | null;
+        /** The CPU model the last inventory read stored - the stencil guess
+         *  needs it on every poll, and only inventory polls read it. */
+        cpu_model: string | null;
     }>('collector', `
         -- host(), NOT host::text. Casting an inet to text keeps the netmask,
         -- so a device stored as 127.0.0.1 comes back "127.0.0.1/32" and every
@@ -1205,7 +1208,8 @@ export const OPS = {
                poll_anchor_ts,
                -- One more column on a row already being read, so the caller
                -- can decide whether the inventory refresh is due.
-               inventory_ts
+               inventory_ts,
+               cpu_model
           FROM devices
          WHERE enabled = true
            -- Slice 35: a ping-only device has no agent, so polling it buys

@@ -112,6 +112,9 @@ export async function pollDevice(
     device: {
         id: string; name: string; host: string; snmp_port: number;
         snmp_version: string; credential_ref: string;
+        /** The stored CPU model, for the stencil guess on polls that do not
+         *  read the inventory. */
+        cpu_model?: string | null;
     },
     credential: Credential,
     takenCodes: Set<string>,
@@ -312,9 +315,16 @@ export async function pollDevice(
         // not still be wrong in November. Empty stays empty: guessStencil
         // returns '' when the evidence is ambiguous, and coalesce keeps the
         // last confident answer rather than blanking a tile on one odd poll.
+        //
+        // The CPU model falls back to the STORED one (2026-10-08). Only an
+        // inventory poll reads it - about daily - so every other poll guessed
+        // with none, and "no CPU model" is honestly "server": a VM was drawn
+        // as a vm on its inventory poll and back as a server on the next one,
+        // for good. Found by the demo fleet's cloud VMs, which never showed as
+        // vms though their QEMU CPU was stored.
         const guessed = guessStencil({
             sysDescr: result.sysDescr, sysName: result.sysName,
-            name: device.name, cpuModel: result.cpuModel,
+            name: device.name, cpuModel: result.cpuModel ?? device.cpu_model ?? null,
         });
         result.stencil = guessed === '' ? null : guessed;
 

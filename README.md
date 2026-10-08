@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.7).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.8).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
