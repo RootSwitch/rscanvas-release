@@ -50,9 +50,12 @@ import { isGhostInterface } from './ghosts.ts';
 import { mergeOverrides } from './overrides.ts';
 import { groupConditions } from './groups.ts';
 import {
-    evaluate, type Condition, type RulesConfig, type ScanDoc, type ScanInterface,
-    type ScanMetric, type ScanService,
+    evaluate, buildOverrideIndex, REBOOT_DEFAULT, TEMP_CHANGE_DEFAULT, TEMP_ROOM_DEFAULT,
+    type Condition, type RulesConfig, type ScanDoc, type ScanInterface, type ScanMetric, type ScanService,
 } from './rules.ts';
+import {
+    changeConditions, takingPart, ROOM_WINDOW_S, SINGLE_WINDOW_S, type ChangeSensor,
+} from './tempchange.ts';
 import { scanServiceOf } from './services.ts';
 import {
     step, stepMissing, dedupeConditions,
@@ -111,6 +114,12 @@ export const DEFAULT_RULES: RulesConfig = {
         // A voice responder that does not answer: warn (rules.ts says why).
         pathDown: { enabled: true, severity: 'warn' },
     },
+    // Restarts (slice 62): off until an override turns them on - rules.ts
+    // REBOOT_DEFAULT says why.
+    reboot: REBOOT_DEFAULT,
+    // Change from normal (slice 65): on - rules.ts TEMP_CHANGE_DEFAULT says why.
+    tempChange: TEMP_CHANGE_DEFAULT,
+    tempRoom: TEMP_ROOM_DEFAULT,
     overrides: [],
 };
 
@@ -133,8 +142,46 @@ export function loadRulesConfig(): RulesConfig {
         ifRules: { ...DEFAULT_RULES.ifRules, ...parsed.ifRules },
         deviceDown: parsed.deviceDown ?? DEFAULT_RULES.deviceDown,
         services: { ...(DEFAULT_RULES.services as NonNullable<RulesConfig['services']>), ...parsed.services },
+        reboot: parsed.reboot ?? DEFAULT_RULES.reboot,
+        tempChange: parsed.tempChange ?? DEFAULT_RULES.tempChange,
+        tempRoom: parsed.tempRoom ?? DEFAULT_RULES.tempRoom,
         overrides: parsed.overrides ?? [],
     };
+}
+
+/** The change-from-normal conditions for one scan (slice 65). Exported for
+ *  tools/test-scratch-db.ts, which runs it against the real statements. */
+export async function changeScan(cfg: RulesConfig): Promise<Condition[]> {
+    const rows = await OPS.tempChangeSensors();
+    if (!rows.ok) {
+        console.warn(`[scan] temperature baselines unreadable (${rows.reason}) - change from normal skipped this scan`);
+        return [];
+    }
+    const idx = buildOverrideIndex(cfg.overrides);
+    const ids = new Map<string, number>();
+    const all: ChangeSensor[] = rows.rows.map((r) => {
+        ids.set(r.code, r.id);
+        return {
+            code: r.code, name: r.name, host: r.device_name, location: r.location, stencil: r.stencil,
+            status: r.status, transient: r.transient, muted: r.alerts_muted, pollS: r.poll_interval_s,
+            hours: r.hours, med: r.med, q1: r.q1, q3: r.q3, r10: null, n10: 0, r20: null, n20: 0,
+        };
+    });
+    const part = takingPart(all, idx);
+    if (part.length === 0) return [];
+    const partIds = part.map((s) => ids.get(s.code) as number);
+    const recent = await OPS.tempChangeRecent(partIds, ROOM_WINDOW_S, SINGLE_WINDOW_S);
+    if (!recent.ok) {
+        console.warn(`[scan] recent temperatures unreadable (${recent.reason}) - change from normal skipped this scan`);
+        return [];
+    }
+    const byId = new Map(recent.rows.map((r) => [r.id, r]));
+    for (const s of part) {
+        const r = byId.get(ids.get(s.code) as number);
+        if (!r) continue;
+        s.r10 = r.r10; s.n10 = r.n10; s.r20 = r.r20; s.n20 = r.n20;
+    }
+    return changeConditions(part, cfg, idx);
 }
 
 /** SNMP status integers to the feed's words. 1 is up; null is not a reading. */
@@ -323,6 +370,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
         devices: devices.rows.map((d) => ({
             name: d.name, host: d.host, status: d.status, transient: d.transient,
             muted: d.alerts_muted,
+            rebootAgeS: d.reboot_age_s, rebootUpBeforeS: d.reboot_up_before_s, rebootPlanned: d.reboot_planned,
         })),
         // THE GHOST GATE (src/alerts/ghosts.ts): a row whose went-quiet
         // stamp outlived the horizon leaves the doc entirely, so its
@@ -409,6 +457,18 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
         else console.warn(`[scan] group_alert_rules unreadable (${groupRows.reason}) - group alerts skipped this scan`);
     } catch (err) {
         console.warn(`[scan] group alerts skipped this scan: ${(err as Error).message}`
+            + ' - if the table is missing, the schema is behind the code: re-run the installer');
+    }
+
+    // CHANGE FROM NORMAL (slice 65): each temperature taking part against
+    // its own week, and each room's together (alerts/tempchange.ts). Caught
+    // like the group alerts above, for the same reason. Two reads: the
+    // sensors with a week behind them, then the recent readings of only the
+    // ones taking part.
+    try {
+        conditions.push(...await changeScan(cfg));
+    } catch (err) {
+        console.warn(`[scan] change from normal skipped this scan: ${(err as Error).message}`
             + ' - if the table is missing, the schema is behind the code: re-run the installer');
     }
 
@@ -505,6 +565,20 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     // carry two rows for one id and last-write-wins never arises.
     await persistBatch(toPersist);
 
+    // A RESTART ALERT'S CLEAR IS NOT NEWS (slice 62): it clears because its
+    // hold ran out, not because anything recovered. Settled here, after the
+    // clear is written and before the notify job can read the queue or these
+    // events, so no email says so - and dropped from the events this scan
+    // hands on. By id: only the clears this scan made.
+    const restartClears = events.filter((e) => e.type === 'clear' && e.key.startsWith('reboot:'))
+        .map((e) => e.alertId);
+    let quiet = new Set<string>();
+    if (restartClears.length > 0) {
+        const settled = await OPS.settleRestartClears(restartClears);
+        if (!settled.ok) throw new Error(`restart clear settlement refused (${settled.reason})`);
+        quiet = new Set(settled.rows.map((r) => r.id));
+    }
+
     // The event-alert TTL, gated on INGEST liveness rather than
     // collectorHealthy - the per-source freeze scoping the slice-10 design
     // named as the trap to avoid (a stale SNMP collector must not freeze the
@@ -520,7 +594,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
         interfaces: ifaces.rows.length,
         conditions: collapsed.length,
         open: openRes.rows.length,
-        events,
+        events: quiet.size === 0 ? events : events.filter((e) => !quiet.has(e.alertId)),
         collectorHealthy,
     };
 }

@@ -47,6 +47,7 @@ import { loadRulesConfig } from './alerts/scan.ts';
 import { mergeOverrides } from './alerts/overrides.ts';
 import { GROUP_KIND, OUTSIDE_VALUE, parseGroupKey } from './alerts/groups.ts';
 import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS, BOOL_RULE_KINDS, PATH_RULE_KINDS, SERVICE_RULE_KINDS, THROUGHPUT_RULE_KINDS } from './alerts/rules.ts';
+import { classifyTempSensor, participation, BASELINE_MIN_HOURS, TEMP_CHANGE_KIND, TEMP_ROOM_KIND } from './alerts/tempchange.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
 import { parseSourceDeclaration, sameCoverage } from './boards/source.ts';
@@ -80,6 +81,9 @@ import {
     reportLines, reportCsv, isDay, isTimeZone,
 } from './reports/traffic.ts';
 import { parseReportKind, REPORT_KINDS, serviceCsv, serviceLines, SERVICE_COLUMNS } from './reports/services.ts';
+import { availabilityCsv, availabilityLines, leftOutTransient, parseAvailabilityGroup } from './reports/availability.ts';
+import { answerCache, type Answer } from './reports/answer-cache.ts';
+import { normalizeRepeat, describeRepeat } from './alerts/maintenance-schedule.ts';
 import { safeLogArgs } from './logsafe.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -100,12 +104,14 @@ const STARTED = Date.now();
 // other windows are computed in the background as soon as anyone opens the
 // Dashboard, and again when the frontier moves - so a switch finds its
 // answer waiting. Background work stops a day after the last visit. A
-// device renamed mid-hour shows its new name at the next rollup.
+// device renamed mid-hour shows its new name at the next rollup; a device
+// DELETED goes at once (dashboards.forget) - it used to stay listed for up
+// to an hour, under a name that no longer opened anything. The cache's
+// rules live in src/reports/answer-cache.ts.
 const DASHBOARD_TOP_N = 10;
 const DASHBOARD_WARM_IDLE_MS = 24 * 3600_000;
-type DashboardAnswer = { ok: true; body: Record<string, unknown> } | { ok: false; reason: string };
-const dashboardCache = new Map<number, { hi: number; body: Record<string, unknown> }>();
-const dashboardInflight = new Map<string, Promise<DashboardAnswer>>();
+type DashboardAnswer = Answer<Record<string, unknown>>;
+const dashboards = answerCache(computeDashboard);
 let dashboardLastAsked = 0;
 let dashboardWarming = false;
 const REPORT_MAX_INTERFACES = 50;
@@ -113,6 +119,16 @@ const REPORT_MAX_DAYS = 366;
 /** A services report names at most this many checks; none named is every
  *  check of its kind, which a fleet of sites will usually want. */
 const REPORT_MAX_CHECKS = 500;
+/** An acknowledgement's note (slice 62): a ticket number or a sentence. */
+const ACK_NOTE_MAX = 200;
+/** Restarts the device page lists (slice 62). */
+const DEVICE_RESTARTS_SHOWN = 10;
+/** The device timeline (IDEAS-2026-10-15 item 4): at most 30 days back, and
+ *  the newest this many rows of it - a flapping device fills a month. */
+const TIMELINE_MAX_HOURS = 720;
+const TIMELINE_ROWS = 300;
+/** A device's notes (slice 64): a screenful, not a document. */
+const NOTES_MAX = 2000;
 
 // THE ORDERING IS CHECKED, NOT TRUSTED. Main must outwait the ingest worker's
 // drain deadline; if it does not, main exits while the worker is still writing
@@ -1328,6 +1344,50 @@ const server = createWebServer(tlsPair, (req, res) => {
             sendJson(res, 200, { ok: true, alert: { ...a, ...provenance, ...(group ? { group } : {}) }, history: history.rows });
             return;
         }
+        // ACKNOWLEDGE (slice 62): "I am on this", with an optional note. The
+        // alert stays active and visible and clears on its own; renotify
+        // skips it. Undone with /api/alerts/unack. Both audited, naming the
+        // alert, because "who said they had it" is the question this answers.
+        if ((path === '/api/alerts/ack' || path === '/api/alerts/unack') && method === 'POST') {
+            if (!enforce(res, principal, 'alert.ack')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const id = String(body.id ?? '').trim();
+            if (!/^[0-9]{1,19}$/.test(id)) { sendJson(res, 400, { ok: false, detail: 'id must be a positive integer' }); return; }
+            const ack = path === '/api/alerts/ack';
+            const by = principal.kind === 'user' ? principal.username : 'unknown';
+            const note = ack && typeof body.note === 'string' && body.note.trim() !== ''
+                ? body.note.trim().slice(0, ACK_NOTE_MAX) : null;
+            const w = ack ? await OPS.ackAlert(id, by, note) : await OPS.unackAlert(id);
+            if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+            if (w.rows.length === 0) {
+                // Say which: a missing id is a 404, a cleared alert or one
+                // nobody acknowledged is a 409 - the page offers the button
+                // on what it saw, and the alert may have moved since.
+                const seen = await OPS.uiAlert(id);
+                const row = seen.ok ? seen.rows[0] : undefined;
+                if (row === undefined) { sendJson(res, 404, { ok: false, detail: 'no such alert' }); return; }
+                sendJson(res, 409, {
+                    ok: false,
+                    detail: row.state === 'cleared' ? 'this alert has cleared - there is nothing left to acknowledge'
+                        : 'this alert is not acknowledged',
+                });
+                return;
+            }
+            await auth.audit(principal, ack ? 'alert.ack' : 'alert.unack', w.rows[0]!.label,
+                { id, ...(note !== null ? { note } : {}) }, inetOrNull(clientIp(req)));
+            sendJson(res, 200, {
+                ok: true,
+                detail: ack ? `acknowledged by ${by} - renotify stops for this alert; it stays open until it clears`
+                    : 'acknowledgement removed - renotify applies again',
+            });
+            return;
+        }
         if (path === '/api/devices' && method === 'GET') {
             if (!enforce(res, principal, 'devices.read')) return;
             const devices = await OPS.uiDevices();
@@ -1412,6 +1472,30 @@ const server = createWebServer(tlsPair, (req, res) => {
         // recorded for reach, and inventing a series from them would be the
         // chart lying. If ping rtt earns a history it earns a write path
         // first.
+        // THE DEVICE TIMELINE (IDEAS-2026-10-15 item 4): its alerts, ping
+        // changes, restarts, maintenance and - for a role that may read the
+        // audit trail - the changes people made to it, newest first, one
+        // statement (OPS.deviceTimeline). Also drawn on its charts.
+        if (path === '/api/device/timeline' && method === 'GET') {
+            if (!enforce(res, principal, 'devices.read')) return;
+            const name = url.searchParams.get('name') ?? '';
+            if (name === '') { sendJson(res, 400, { ok: false, detail: 'name is required' }); return; }
+            const hours = Math.min(TIMELINE_MAX_HOURS, Math.max(1, Math.floor(Number(url.searchParams.get('hours')) || 24)));
+            const withAudit = authorize(principal, 'audit.read').allowed;
+            const to = new Date();
+            const r = await OPS.deviceTimeline(name, hours, withAudit, TIMELINE_ROWS);
+            if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            sendJson(res, 200, {
+                ok: true, device: name, hours,
+                from: Math.floor((to.getTime() - hours * 3600_000) / 1000), to: Math.floor(to.getTime() / 1000),
+                // Said, so the page can say the audit lines are not missing
+                // but not this role's to see.
+                audit: withAudit,
+                capped: r.rows.length >= TIMELINE_ROWS,
+                events: r.rows,
+            });
+            return;
+        }
         if (path === '/api/device/rtt' && method === 'GET') {
             if (!enforce(res, principal, 'devices.read')) return;
             const name = url.searchParams.get('name') ?? '';
@@ -1475,7 +1559,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             }
             const hiMs = Math.floor(new Date(through).getTime() / 3600_000) * 3600_000;
             dashboardLastAsked = Date.now();
-            const answer = await dashboardFor(hours, hiMs);
+            const answer = await dashboards.answer(hours, hiMs);
             if (!answer.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${answer.reason})` }); return; }
             sendJson(res, 200, answer.body);
             // The windows not yet computed for this hour, in the background,
@@ -1588,6 +1672,51 @@ const server = createWebServer(tlsPair, (req, res) => {
                 columns: SERVICE_COLUMNS[kind], lines,
                 // Codes that matched no check of this kind: said, not silently dropped.
                 missing: codes === null ? [] : codes.filter((c) => !found.has(c)),
+            });
+            return;
+        }
+        if (path === '/api/report/availability' && method === 'GET') {
+            // THE AVAILABILITY REPORT (IDEAS-2026-10-15 item 8): every device
+            // probed in the period, or pooled by location or application -
+            // the share of minute probes answered, how much of the period
+            // was measured, the outages from the ten-second sweep, and what
+            // fell inside maintenance kept apart. Arithmetic in
+            // src/reports/availability.ts; the other reports' limits.
+            if (!enforce(res, principal, 'devices.read')) return;
+            const group = parseAvailabilityGroup(url.searchParams.get('group'));
+            if (group === null) { sendJson(res, 400, { ok: false, detail: 'group is device, location or application' }); return; }
+            const fromDay = url.searchParams.get('from');
+            const toDay = url.searchParams.get('to');
+            if (!isDay(fromDay) || !isDay(toDay) || fromDay > toDay) {
+                sendJson(res, 400, { ok: false, detail: 'from and to must be dates (YYYY-MM-DD), from not after to' });
+                return;
+            }
+            if ((Date.parse(toDay) - Date.parse(fromDay)) / 86_400_000 > REPORT_MAX_DAYS) {
+                sendJson(res, 400, { ok: false, detail: `a report covers at most ${REPORT_MAX_DAYS} days` });
+                return;
+            }
+            const tz = url.searchParams.get('tz') ?? 'UTC';
+            if (!isTimeZone(tz)) { sendJson(res, 400, { ok: false, detail: 'tz must be a time zone name, e.g. America/Chicago' }); return; }
+            const f = await OPS.pingRollupFrontier();
+            if (!f.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${f.reason})` }); return; }
+            const frontier = f.rows[0]?.through_ts ?? null;
+            const r = frontier === null ? null : await OPS.availabilityReport(fromDay, toDay, tz, new Date(frontier));
+            if (r !== null && !r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            const lines = availabilityLines(r === null ? [] : r.rows, group);
+            if (url.searchParams.get('format') === 'csv') {
+                res.writeHead(200, {
+                    'content-type': 'text/csv; charset=utf-8',
+                    'content-disposition': `attachment; filename="rscanvas-availability-${group}-${fromDay}-to-${toDay}.csv"`,
+                    'cache-control': 'no-store',
+                });
+                res.end(availabilityCsv(lines, group));
+                return;
+            }
+            sendJson(res, 200, {
+                ok: true, group, from: fromDay, to: toDay, tz,
+                through: frontier === null ? null : new Date(frontier).toISOString(),
+                lines,
+                transient: leftOutTransient(r === null ? [] : r.rows),
             });
             return;
         }
@@ -2059,6 +2188,23 @@ const server = createWebServer(tlsPair, (req, res) => {
             // device's own row so the page can switch it back. Null when
             // resolution failed - the page then offers no switch.
             let linkDown: { source: string; muted: boolean; deviceRowId: string | null } | null = null;
+            // RESTART ALERTS (slice 62), the same shape: whether they are on
+            // for this device, whether they would be with this device's own
+            // row gone (the fleet's answer), and both rows' ids, so the page
+            // can turn them on or off here or everywhere without guessing.
+            let restartAlerts: {
+                on: boolean; source: string; fleetOn: boolean;
+                deviceRowId: string | null; fleetRowId: string | null;
+            } | null = null;
+            // CHANGE FROM NORMAL (slice 65), the device's part: whether its
+            // own row has taken it out, and the fleet's two switches (one
+            // sensor, a room) with their rows' ids. Each temperature's own
+            // answer rides on its entity as `change`, below.
+            let tempChange: {
+                deviceOff: boolean; deviceRowId: string | null;
+                singleOn: boolean; roomOn: boolean; singleRowId: string | null; roomRowId: string | null;
+                minHours: number;
+            } | null = null;
             try {
                 let cfg = loadRulesConfig();
                 const orows = await OPS.thresholdOverrides('interactive');
@@ -2073,12 +2219,39 @@ const server = createWebServer(tlsPair, (req, res) => {
                 const own = orows.ok
                     ? orows.rows.find((o) => o.kind === 'if-down' && o.host === name && o.code === null) : undefined;
                 linkDown = { source: ld.source, muted: ld.muted, deviceRowId: own?.id ?? null };
+                const rb = resolveRuleInfo(idx, cfg, 'reboot', null, name);
+                const rbFleet = resolveRuleInfo(buildOverrideIndex((cfg.overrides ?? []).filter((o) =>
+                    !(o.kind === 'reboot' && o.scope === 'host-kind' && o.host === name))), cfg, 'reboot', null, name);
+                const rbRow = (host: string | null) => (orows.ok
+                    ? orows.rows.find((o) => o.kind === 'reboot' && o.host === host && o.code === null)?.id ?? null : null);
+                restartAlerts = {
+                    on: rb.source !== 'none' && !rb.muted, source: rb.source,
+                    fleetOn: rbFleet.source !== 'none' && !rbFleet.muted,
+                    deviceRowId: rbRow(name), fleetRowId: rbRow(null),
+                };
+                const tcRow = (kind: string, host: string | null) => (orows.ok
+                    ? orows.rows.find((o) => o.kind === kind && o.host === host && o.code === null) ?? null : null);
+                const tcDev = tcRow(TEMP_CHANGE_KIND, name);
+                const tcSingle = resolveRuleInfo(idx, cfg, TEMP_CHANGE_KIND, null, null);
+                const tcRoom = resolveRuleInfo(idx, cfg, TEMP_ROOM_KIND, null, null);
+                tempChange = {
+                    deviceOff: tcDev !== null && tcDev.enabled !== true, deviceRowId: tcDev?.id ?? null,
+                    singleOn: tcSingle.source !== 'none' && !tcSingle.muted,
+                    roomOn: tcRoom.source !== 'none' && !tcRoom.muted,
+                    singleRowId: tcRow(TEMP_CHANGE_KIND, null)?.id ?? null,
+                    roomRowId: tcRow(TEMP_ROOM_KIND, null)?.id ?? null,
+                    minHours: BASELINE_MIN_HOURS,
+                };
                 // The collector-to-engine kind rename, the same one
                 // alertScanSensors makes in SQL and the POST route makes on
                 // write. Three sites is two too many; if a third kind ever
                 // diverges, unify them before adding it here.
                 const ek = (k: string): string => (k === 'fs' ? 'disk' : k === 'gauge' ? 'util' : k);
-                entities = entities.map((r) => {
+                entities = entities.map((row) => {
+                    // The week and the stencil (slice 65) ride the query for
+                    // every row and are wanted on a temperature's `change`
+                    // alone - a 600-port chassis would carry five nulls a port.
+                    const { base_hours, base_med, base_q1, base_q3, stencil, ...r } = row;
                     if (r.code === null || r.code === undefined) return r;
                     // INTERFACE RULES ON THE ROW (2026-09-23, operator: "no
                     // obvious way to mute alerts on individual interfaces").
@@ -2118,10 +2291,25 @@ const server = createWebServer(tlsPair, (req, res) => {
                         }
                         return differs ? { ...r, checkRules: rules } : r;
                     }
+                    // A TEMPERATURE'S CHANGE FROM NORMAL (slice 65): its
+                    // class by name, whether it takes part and what said
+                    // so, its own row's id, and its week when it has one.
+                    let change: Record<string, unknown> | null = null;
+                    if (r.kind === 'temp') {
+                        const cls = classifyTempSensor(String(r.name ?? ''), (stencil as string | null) ?? null);
+                        const p = participation(idx, String(r.code), name, cls);
+                        const own = orows.ok
+                            ? orows.rows.find((o) => o.kind === TEMP_CHANGE_KIND && o.code === r.code) : undefined;
+                        change = {
+                            cls, on: p.on, why: p.why, rowId: own?.id ?? null,
+                            hours: base_hours ?? null, med: base_med ?? null, q1: base_q1 ?? null, q3: base_q3 ?? null,
+                        };
+                    }
                     const info = resolveRuleInfo(idx, cfg, ek(String(r.kind)), String(r.code), name);
-                    if (info.source === 'none') return r;
+                    if (info.source === 'none') return change === null ? r : { ...r, change };
                     return {
                         ...r,
+                        ...(change === null ? {} : { change }),
                         threshold: {
                             source: info.source, muted: info.muted,
                             warn: info.levels?.warn ?? null, crit: info.levels?.crit ?? null,
@@ -2147,8 +2335,12 @@ const server = createWebServer(tlsPair, (req, res) => {
             const avail = await OPS.pingAvailability(name, 24);
             const availRow = avail.ok ? avail.rows[0] : undefined;
             const probes = Number(availRow?.probes ?? 0);
+            // The device's restarts (slice 62), newest first. One bounded
+            // read; a refusal costs the list (null), never the page.
+            const restarts = await OPS.deviceRestarts(name, DEVICE_RESTARTS_SHOWN);
             sendJson(res, 200, {
-                ok: true, device: name, entities, ifRuleDefaults, linkDown,
+                ok: true, device: name, entities, ifRuleDefaults, linkDown, restartAlerts, tempChange,
+                restarts: restarts.ok ? restarts.rows : null,
                 entitiesCapped: rows.rows.length >= UI_DEVICE_ENTITY_CAP,
                 availability24h: probes > 0
                     ? { probes, misses: Number(availRow?.misses ?? 0) }
@@ -2588,6 +2780,13 @@ const server = createWebServer(tlsPair, (req, res) => {
                 : await OPS.disableDevices(names, mode === 'enable');
             if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
             const affected = r.rows.map((x) => x.name);
+            // A deleted device must leave the Dashboard now, not at the next
+            // rollup hour (found on the demo box 2026-10-09): every held
+            // answer may name one. The next visit, or the minute's warm-up
+            // while the Dashboard is in use, computes them again. Not for
+            // disable or enable - the lists are the window's history, which
+            // a stopped device still has.
+            if (mode === 'delete' && affected.length > 0) dashboards.forget();
             await auth.audit(principal, `device.${mode}`, `${affected.length} device(s)`,
                 { names: affected, entities: plan.entities, shapes: plan.shapes },
                 inetOrNull(clientIp(req)));
@@ -3481,7 +3680,14 @@ const server = createWebServer(tlsPair, (req, res) => {
             if (!enforce(res, principal, 'alerts.read')) return;
             const w = await OPS.maintenanceWindows();
             if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
-            sendJson(res, 200, { ok: true, windows: w.rows });
+            const s = await OPS.maintenanceSchedules();
+            if (!s.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${s.reason})` }); return; }
+            sendJson(res, 200, {
+                ok: true, windows: w.rows,
+                // Repeating windows (slice 61), each with the sentence that
+                // names it and its occurrence open now or next.
+                schedules: s.rows.map((r) => ({ ...r, summary: describeRepeat(r.days, r.start_time, r.minutes) })),
+            });
             return;
         }
         if (path === '/api/maintenance' && method === 'POST') {
@@ -3504,6 +3710,40 @@ const server = createWebServer(tlsPair, (req, res) => {
                     ok: false,
                     detail: scope === 'all' ? 'scope all takes no target' : `scope ${scope} requires a target`,
                 });
+                return;
+            }
+            // A REPEATING window (slice 61): weekdays, a local time, a length
+            // and the zone it was meant in, instead of two timestamps. No end
+            // date - each occurrence ends, and what is still active then is
+            // delivered - but never over everything: a standing quiet hour
+            // for the whole estate is a different feature from a backup's.
+            if (body.repeat !== undefined) {
+                if (scope === 'all') {
+                    sendJson(res, 400, { ok: false, detail: 'a repeating window names a device, location or application - not everything' });
+                    return;
+                }
+                const rep = normalizeRepeat(body.repeat, isTimeZone);
+                if (!rep.ok) { sendJson(res, 400, { ok: false, detail: rep.detail }); return; }
+                const m = await OPS.maintenanceTargetCount(scope, target);
+                if (!m.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${m.reason})` }); return; }
+                if ((m.rows[0]?.n ?? '0') === '0') {
+                    sendJson(res, 404, { ok: false, detail: `no device matches ${scope} ${JSON.stringify(target)}` });
+                    return;
+                }
+                const note = typeof body.note === 'string' && body.note.trim() !== ''
+                    ? body.note.trim().slice(0, 500) : null;
+                const { days, at, minutes, tz } = rep.req;
+                const made = await OPS.createMaintenanceSchedule(scope, target, days, at, minutes, tz, note,
+                    principal.kind === 'user' ? principal.username : 'unknown');
+                if (!made.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${made.reason})` }); return; }
+                if (made.rows.length === 0) {
+                    sendJson(res, 400, { ok: false, detail: `the database does not know the time zone ${JSON.stringify(tz)}` });
+                    return;
+                }
+                const summary = describeRepeat(days, at, minutes);
+                await auth.audit(principal, 'alert.suppress', `${scope}:${target}`,
+                    { repeat: summary, days, at, minutes, tz, note }, inetOrNull(clientIp(req)));
+                sendJson(res, 200, { ok: true, id: made.rows[0]?.id ?? null, schedule: true, summary, tz });
                 return;
             }
             // Both ends are REQUIRED (plan decision 2): a window with no end
@@ -3550,6 +3790,20 @@ const server = createWebServer(tlsPair, (req, res) => {
                 { starts: starts.toISOString(), ends: ends.toISOString(), note },
                 inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, id: created.rows[0]?.id ?? null, starts, ends });
+            return;
+        }
+        if (path === '/api/maintenance' && method === 'DELETE' && url.searchParams.has('schedule')) {
+            if (!enforce(res, principal, 'alert.suppress')) return;
+            const id = url.searchParams.get('schedule') ?? '';
+            if (!/^[0-9]{1,19}$/.test(id)) { sendJson(res, 400, { ok: false, detail: 'schedule must be a positive integer' }); return; }
+            const gone = await OPS.cancelMaintenanceSchedule(id);
+            if (!gone.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${gone.reason})` }); return; }
+            const row = gone.rows[0];
+            if (row === undefined) { sendJson(res, 404, { ok: false, detail: 'no such repeating window' }); return; }
+            await auth.audit(principal, 'alert.unsuppress', `${row.scope}:${row.target}`,
+                { repeat: describeRepeat(row.days, row.start_time, row.minutes), tz: row.tz, note: row.note },
+                inetOrNull(clientIp(req)));
+            sendJson(res, 200, { ok: true });
             return;
         }
         if (path === '/api/maintenance' && method === 'DELETE') {
@@ -3932,6 +4186,35 @@ const server = createWebServer(tlsPair, (req, res) => {
             await auth.audit(principal, 'device.group', name,
                 { location, application }, inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, name, location, application });
+            return;
+        }
+        // NOTES (slice 64): the operator's free text about a device - owner,
+        // who to call, asset tag. The grouping right, because it is the same
+        // kind of statement about the device. A note longer than the limit
+        // is REFUSED, not cut: cutting someone's text silently loses the end
+        // of it, which is usually the part they just typed. Audited by length
+        // - the note is on the device; the audit says who changed it.
+        if (path === '/api/device/notes' && method === 'POST') {
+            if (!enforce(res, principal, 'device.group')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const name = typeof body.name === 'string' ? body.name : '';
+            if (name === '') { sendJson(res, 400, { ok: false, detail: 'name is required' }); return; }
+            const raw = typeof body.notes === 'string' ? body.notes.replace(/\r\n?/g, '\n').trimEnd() : '';
+            if (raw.length > NOTES_MAX) {
+                sendJson(res, 400, { ok: false, detail: `notes are at most ${NOTES_MAX} characters - these are ${raw.length}` });
+                return;
+            }
+            const r = await OPS.setDeviceNotes(name, raw === '' ? null : raw);
+            if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            if (r.rows.length === 0) { sendJson(res, 404, { ok: false, detail: 'no such device' }); return; }
+            await auth.audit(principal, 'device.notes', name, { chars: raw.length }, inetOrNull(clientIp(req)));
+            sendJson(res, 200, { ok: true, name, notes: raw === '' ? null : raw });
             return;
         }
         // THE INVENTORY EXPORT: RSCanvas feeding CrossCanvas.
@@ -5009,25 +5292,6 @@ async function computeDashboard(hours: number, hiMs: number): Promise<DashboardA
 }
 
 /**
- * The answer for a window at this rollup hour: cached, or being computed
- * (join it), or computed now. A refusal is not cached - the next ask tries
- * again.
- */
-function dashboardFor(hours: number, hiMs: number): Promise<DashboardAnswer> {
-    const cached = dashboardCache.get(hours);
-    if (cached !== undefined && cached.hi === hiMs) return Promise.resolve({ ok: true, body: cached.body });
-    const key = `${hours}@${hiMs}`;
-    const running = dashboardInflight.get(key);
-    if (running !== undefined) return running;
-    const p = computeDashboard(hours, hiMs)
-        .then((r) => { if (r.ok) dashboardCache.set(hours, { hi: hiMs, body: r.body }); return r; })
-        .catch((err: unknown): DashboardAnswer => ({ ok: false, reason: (err as Error).message }))
-        .finally(() => dashboardInflight.delete(key));
-    dashboardInflight.set(key, p);
-    return p;
-}
-
-/**
  * Compute, one after another, the windows not yet answered for this hour.
  * One at a time on purpose: the heavy lane is four connections shared with
  * charts, searches and reports, and a warm-up is never urgent.
@@ -5037,8 +5301,8 @@ function warmDashboards(hiMs: number): void {
     dashboardWarming = true;
     void (async () => {
         for (const w of DASHBOARD_WINDOWS) {
-            if (dashboardCache.get(w)?.hi === hiMs) continue;
-            const r = await dashboardFor(w, hiMs);
+            if (dashboards.has(w, hiMs)) continue;
+            const r = await dashboards.answer(w, hiMs);
             if (!r.ok) { log(`dashboard warm-up of ${w} h refused (${r.reason}) - it computes on the next visit`); break; }
         }
     })().catch((err: unknown) => log('dashboard warm-up failed:', (err as Error).message))

@@ -47,7 +47,7 @@ for (const role of ROLES) {
 
 const WRITES: Action[] = [
     'device.create', 'check.write', 'device.delete', 'device.rename', 'device.address', 'device.disable', 'device.track',
-    'device.speed', 'device.group', 'device.mute', 'alert.suppress', 'alertrule.write', 'credential.write',
+    'device.speed', 'device.group', 'device.mute', 'alert.suppress', 'alert.ack', 'alertrule.write', 'credential.write',
     'syslog.export', 'board.write', 'token.mint', 'token.revoke', 'user.create', 'user.delete', 'user.setRole',
 ];
 const MATRIX: Array<[Action, Role[]]> = [
@@ -57,6 +57,8 @@ const MATRIX: Array<[Action, Role[]]> = [
     ['device.disable', ['operator', 'admin']],
     ['device.speed', ['operator', 'admin']],
     ['alert.suppress', ['operator', 'admin']],
+    // Slice 62: "I am on this" is the shift's claim, not a viewer's.
+    ['alert.ack', ['operator', 'admin']],
     ['syslog.export', ['operator', 'admin']],
     ['device.rename', ['admin']],
     ['device.address', ['admin']],

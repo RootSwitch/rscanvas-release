@@ -407,6 +407,10 @@ async function runPoll(device: {
     poll_anchor_ts: Date | null;
     /** Last ATTEMPT at the inventory read; null means never, so it is due. */
     inventory_ts: Date | null;
+    /** Slice 62: the last good poll's uptime and the database's age of that
+     *  poll, for the restart judgement in pollDevice. */
+    uptime_s?: number | null;
+    since_seen_s?: number | null;
 }): Promise<void> {
     const isDown = device.consecutive_failures >= CONFIG.pollDownAfter;
     polling.set(device.id, { name: device.name, since: Date.now() });
@@ -560,6 +564,12 @@ async function runPoll(device: {
         // before this existed, and an operator who just installed a card
         // wants to see that the tool followed the names.
         for (const line of res.rekeyed) log(`${device.name} re-enumeration: ${line}`);
+        // A restart (slice 62): a line each, like a re-enumeration - rare,
+        // and the moment a chart has a blank poll in it for a reason.
+        if (res.restart.kind === 'restarted') {
+            log(`${device.name} restarted (the device or its SNMP agent): up ${Math.round(res.restart.bootAgoS)}s,`
+                + ` after at least ${Math.round(res.restart.upBeforeS)}s up - this poll's rates left blank`);
+        }
 
         if (res.samples.length > 0) {
             pending.push(...res.samples);
@@ -622,6 +632,7 @@ async function runPoll(device: {
             res.uptimeS, res.cpuCores, res.ramKb,
             res.ok && res.rttMs > 0 ? res.rttMs : null,
             res.stencil, anchor,
+            res.restart.kind === 'restarted' ? res.restart.upBeforeS : null,
         );
         if (!recorded.ok) {
             log(`ALARM recordDevicePoll refused for ${device.name} (${recorded.reason}) - `

@@ -28,7 +28,8 @@ import { startHeartbeat } from '../heartbeat.ts';
 import { installSafetyNet } from '../safety.ts';
 import { OPS, closeAll } from '../store/index.ts';
 import { scanTick } from '../alerts/scan.ts';
-import { dispatchEvent, retryPass, flushDigests } from '../alerts/notify.ts';
+import { BASELINE_DAYS } from '../alerts/tempchange.ts';
+import { dispatchEvent, retryPass, flushDigests, queuedEventGate } from '../alerts/notify.ts';
 import { NotifyBudget } from '../alerts/notify-budget.ts';
 import { serial } from './serial.ts';
 import type { FrontierState, JobsStats } from './protocol.ts';
@@ -201,6 +202,99 @@ async function rollup(): Promise<string> {
     return (caughtUp
         ? `caught up: ${chunks} chunk(s), ${hours} hours written`
         : `${chunks} chunk(s), ${hours} hours written, MORE REMAINING - resumes next tick`) + backfill;
+}
+
+// --- the ping roll-up (slice 63, 2026-10-16) -------------------------------------
+//
+// The minute probes by the hour, kept for good, so the availability report
+// can cover a month the probes themselves no longer reach. The samples
+// roll-up's loop and limits, its own lock and frontier ('rollup:ping') - a
+// separate job so a failure in one is not charged to the other. Ping
+// retention waits for this (OPS.prunePingSamples).
+async function rollupPing(): Promise<string> {
+    let chunks = 0;
+    let hours = 0;
+    let rows = 0;
+    while (running && chunks < CONFIG.rollupChunksPerRun) {
+        // WRITE-IN-LOOP-OK: one transaction PER CHUNK, as the samples
+        // roll-up - bounded by ROLLUP_CHUNKS_PER_RUN, not by fleet size.
+        const res = await OPS.rollUpPingChunk(CONFIG.rollupChunkHours, CONFIG.rollupSettleMinutes);
+        if (!res.ok) throw new Error(`lane refused (${res.reason}) after ${chunks} chunks`);
+        const row = res.rows[0];
+        if (!row) throw new Error('roll_up_ping_chunk returned no row');
+        if (row.locked === true) return 'another instance holds the ping roll-up lock, skipping';
+        chunks++;
+        hours += Number(row.hours_written ?? 0);
+        rows += Number(row.rows_written ?? 0);
+        if (row.caught_up) {
+            return `caught up: ${chunks} chunk(s), ${hours} hour(s), ${rows} device-hour row(s)`;
+        }
+    }
+    return `${chunks} chunk(s), ${hours} hour(s), ${rows} device-hour row(s), MORE REMAINING - resumes next tick`;
+}
+
+// --- change from normal (slice 65) -----------------------------------------------
+//
+// Every tracked temperature's last week, from the hourly rollup, once an hour
+// (and once shortly after boot - every() runs hourly jobs then). The scan
+// judges against it; nothing here decides which sensors take part.
+async function tempBaselines(): Promise<string> {
+    const res = await OPS.refreshTempBaselines(BASELINE_DAYS);
+    if (!res.ok) throw new Error(`lane refused (${res.reason})`);
+    const row = res.rows[0];
+    return `${row?.kept ?? 0} temperature baseline(s) written, ${row?.dropped ?? 0} dropped`;
+}
+
+// --- the rollup purge (slice 60, 2026-10-09) -------------------------------------
+//
+// A deleted entity's hourly rows, which the rollup keeps and nothing else would
+// ever remove. Every entity delete queues its ids (sql/slice60.sql says why the
+// delete itself does not purge); this drains the queue in bounded batches once
+// the rollup is an hour past the delete. Until it is done it also takes one step
+// of the census that queues what was deleted before the queue existed - one
+// partition an hour. Its own job name, like the corpses': "how much went" is
+// what the first runs after an upgrade are watched for.
+const PURGE_BATCH_ENTITIES = 200;
+const PURGE_BATCHES_PER_RUN = 25;
+let purgeCensusDone = false;
+
+async function purgeRollup(): Promise<string> {
+    let census = '';
+    if (!purgeCensusDone) {
+        const c = await OPS.rollupPurgeCensus();
+        if (!c.ok) throw new Error(`census refused (${c.reason})`);
+        const r = c.rows[0];
+        if (r && !r.locked) {
+            if (r.parts_left === 0) purgeCensusDone = true;
+            if (r.waiting) census = '; the census waits for the rollup to pass its start';
+            else if (r.part !== null) {
+                census = `; the census queued ${r.queued} deleted entit(ies) from ${r.part}, `
+                    + `${r.parts_left} partition(s) left`;
+            }
+        }
+    }
+
+    let batches = 0;
+    let entities = 0;
+    let rows = 0;
+    let queued = 0;
+    while (running && batches < PURGE_BATCHES_PER_RUN) {
+        // WRITE-IN-LOOP-OK: one bounded transaction PER BATCH is the design -
+        // a mass delete's year of rollup is millions of rows, and one
+        // statement holding them all is the long transaction the batches
+        // exist to avoid. Bounded by PURGE_BATCHES_PER_RUN, not by fleet size.
+        const p = await OPS.purgeRollupBatch(PURGE_BATCH_ENTITIES);
+        if (!p.ok) throw new Error(`lane refused (${p.reason}) after ${batches} batch(es)`);
+        const r = p.rows[0];
+        batches++;
+        entities += r?.entities ?? 0;
+        rows += Number(r?.rows ?? 0);
+        queued = r?.queued ?? 0;
+        if ((r?.entities ?? 0) < PURGE_BATCH_ENTITIES) break;
+    }
+    return `purged ${rows} hourly row(s) of ${entities} deleted entit(ies)`
+        + (queued > 0 ? `; ${queued} still queued (the rollup has not passed them, or the next run takes them)` : '')
+        + census;
 }
 
 // --- retention ------------------------------------------------------------------
@@ -472,45 +566,14 @@ async function alertNotify(): Promise<string> {
         // by fleet size.
         const rec = await OPS.getAlert(ev.alertId);
         if (!rec.ok || rec.rows[0] === undefined) continue;   // cleared+pruned mid-tick
-        // THE SECOND HALF OF THE MAINTENANCE GATE (slice 22), and the drill
-        // that shipped the first half could not see this one: it inserted
-        // alerts by SQL, so every delivery went through the owed queues,
-        // which are gated in ops.ts. A LIVE raise arrives here first -
-        // dispatched immediately at its true type, before retryPass runs -
-        // and without this check a window suppressed the queue while the
-        // scan's own event stream paged anyway. Skipping leaves every debt
-        // unsettled, and since ruling 1 that sentence covers ESCALATES too:
-        // escalated_ts and notified_escalate open a debt the moment the
-        // scan's batch write records the transition, and
-        // alertsOwingEscalate delivers it when the window closes. SO DO NOT
-        // "FIX" THIS SKIP - dispatching an escalate inside the window is
-        // the one edit that would defeat the gate for exactly the event
-        // type ruling 1 made safe to skip. (Two earlier versions of this
-        // comment were each wrong in turn: the first claimed the scan
-        // re-emits escalates - it never did - and the second claimed a
-        // skipped escalate is lost forever, which ruling 1 had already
-        // fixed by the time the comment landed; AUDIT-2026-09-01 finding 2
-        // called the second "a comment describing a hazard the code no
-        // longer has ... worse than a stale comment, because it argues for
-        // reintroducing it". Renotify has its generator now too, opt-in
-        // via ALERT_RENOTIFY_H.)
-        // under_policy rides the same gate for the same reason (slice 25):
-        // the live-raise path must consult every filter the owed queues
-        // apply, or a policy quiets the queue while the scan's own event
-        // stream pages anyway.
-        if (rec.rows[0].in_maintenance || rec.rows[0].under_policy) continue;
-        // And the group gate (slice 55), in both of its forms. A member's
-        // raise (or escalate) while its group alert is open is held - the
-        // owed queue delivers it if the member is still down when the group
-        // clears. A member's CLEAR whose raise was never told, under or
-        // across a group outage, is not told either: settleGroupCoveredClears
-        // waives it on this same pass, and dispatching it here first would
-        // send "resolved" for an incident only the group email named.
-        const r0 = rec.rows[0];
-        // An outside check settling (slice 59) is held the same way: the
-        // owed queue sends it if no outside-services alert forms to name it.
-        if (ev.type !== 'clear' && (r0.in_group || r0.settling)) continue;
-        if (ev.type === 'clear' && !r0.notified_raise && r0.group_overlap) continue;
+        // Every gate a queued event must pass - not already sent (the
+        // timer and the scan's kick race, 2026-10-11), not in maintenance or
+        // under a policy, not held by a group or a settling outside check -
+        // is queuedEventGate (alerts/notify.ts), where each one's reason is
+        // written down and the matrix is tested. SO DO NOT "FIX" a skip here
+        // without reading it: the maintenance skip of an escalate is the
+        // one that keeps the window's gate whole.
+        if (queuedEventGate(ev.type, rec.rows[0]) !== 'send') continue;
         if (await dispatchEvent(ev.type, rec.rows[0], { budget: notifyBudget })) sent++;
     }
     const r = await retryPass(new Date(), notifyBudget);
@@ -604,6 +667,8 @@ function every(ms: number, name: string, fn: () => Promise<string>): void {
 }
 
 every(CONFIG.rollupIntervalMs, 'rollup', rollup);
+every(CONFIG.rollupIntervalMs, 'rollup:ping', rollupPing);
+every(3600_000, 'temps:baseline', tempBaselines);
 every(CONFIG.retentionIntervalMs, 'retention:samples',
     () => retention('samples', CONFIG.rawRetentionDays));
 every(CONFIG.retentionIntervalMs, 'retention:messages',
@@ -636,7 +701,7 @@ every(CONFIG.retentionIntervalMs, 'retention:alerts', async () => {
     return `pruned ${r.rows[0]?.n ?? '0'} cleared alert(s), `
         + `${n.rows[0]?.n ?? '0'} aged notification row(s), `
         + `${w.rows[0]?.n ?? '0'} expired window(s) past ${CONFIG.alertRetentionDays}d, `
-        + `${p.rows[0]?.n ?? '0'} ping sample(s) past ${CONFIG.pingHistoryDays}d`;
+        + `${p.rows[0]?.n ?? '0'} ping sample(s) past ${CONFIG.pingHistoryDays}d and rolled up`;
 });
 // Generation corpses (INVESTIGATION-DUP-INTERFACES remedy 6): untracked,
 // week-stale, superseded interface rows from ifIndex re-deals. Its own job
@@ -649,6 +714,7 @@ every(CONFIG.retentionIntervalMs, 'retention:corpses', async () => {
     return `removed ${c.rows[0]?.n ?? '0'} superseded interface generation(s) `
         + `untracked and stale past ${CONFIG.corpseRetentionDays}d`;
 });
+every(CONFIG.retentionIntervalMs, 'retention:rollup-purge', purgeRollup);
 
 // Deliberately NOT through `every`/`runOnce`. This is a single-row read, not a
 // job: it takes no lock, cannot overlap meaningfully, and must keep reporting

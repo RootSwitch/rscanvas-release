@@ -57,6 +57,7 @@ const HOST2 = '192.0.2.202';
 async function cleanup(): Promise<void> {
     await q(`DELETE FROM boards WHERE name = $1`, [BOARD]);
     await q(`DELETE FROM maintenance_windows WHERE scope = 'device' AND target = ANY($1::text[])`, [[OLD, NEW, OTHER, TAKEN]]);
+    await q(`DELETE FROM maintenance_schedules WHERE scope = 'device' AND target = ANY($1::text[])`, [[OLD, NEW, OTHER, TAKEN]]);
     // The clash step's standing policy is under a name no device carries;
     // an aborted run leaves it, and it would collide on the next plant.
     await q(`DELETE FROM notify_policy WHERE scope = 'device' AND target = ANY($1::text[])`, [[OLD, NEW, OTHER, TAKEN, OTHER + '-x']]);
@@ -79,6 +80,11 @@ async function main(): Promise<void> {
     await q(`INSERT INTO maintenance_windows (scope, target, starts_ts, ends_ts, note)
              VALUES ('device', $1, now(), now() + interval '1 hour', 'rename test'),
                     ('device', $2, now(), now() + interval '1 hour', 'bystander')`, [OLD, OTHER]);
+    // A repeating window too (slice 61): the nightly backup's, which would
+    // otherwise stop applying the night after a rename, silently.
+    await q(`INSERT INTO maintenance_schedules (scope, target, days, start_time, minutes, tz, note)
+             VALUES ('device', $1, '{1,2,3,4,5,6,7}', '03:00', 10, 'UTC', 'rename test'),
+                    ('device', $2, '{1,2,3,4,5,6,7}', '03:00', 10, 'UTC', 'bystander')`, [OLD, OTHER]);
     await q(`INSERT INTO notify_policy (scope, target, note) VALUES ('device', $1, 'rename test'), ('device', $2, 'bystander')`, [OLD, OTHER]);
     // Four shapes: bound with the generated label, bound with a label the
     // operator changed, a bystander device, and a text shape with no bind.
@@ -97,7 +103,7 @@ async function main(): Promise<void> {
     if (!r.ok) throw new Error(`rename refused (${r.reason})`);
     const row = r.rows[0]!;
     eq('one device renamed', row.renamed, 1);
-    eq('its maintenance window carried', row.windows, 1);
+    eq('its maintenance window and its repeating window carried', row.windows, 2);
     eq('its notify policy carried', row.policies, 1);
     eq('the one board holding it rewritten', row.boards, 1);
 
@@ -109,6 +115,10 @@ async function main(): Promise<void> {
     // thought, which the first live run got wrong.
     eq('window rows: the new name has one, the old none, the bystander untouched',
         win.map((w) => `${w.target}=${w.n}`), [`${OTHER}=1`, `${NEW}=1`]);
+    const sch = await q<{ target: string }>(
+        `SELECT target FROM maintenance_schedules WHERE scope = 'device' AND target = ANY($1::text[]) ORDER BY target`,
+        [[OLD, NEW, OTHER]]);
+    eq('repeating window rows: the same', sch.map((s) => s.target), [OTHER, NEW]);
     const pol = await q<{ target: string }>(
         `SELECT target FROM notify_policy WHERE scope = 'device' AND target = ANY($1::text[]) ORDER BY target`, [[OLD, NEW, OTHER]]);
     eq('policy rows: the same', pol.map((p) => p.target), [OTHER, NEW]);

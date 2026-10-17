@@ -26,7 +26,7 @@ process.env.ALERT_SYSLOG_PORT = String(port);
 process.env.ALERT_RENOTIFY_H = '4';
 
 const { OPS } = await import('../src/store/index.ts');
-const { retryPass, dispatchEvent, flushDigests } = await import('../src/alerts/notify.ts');
+const { retryPass, dispatchEvent, flushDigests, queuedEventGate } = await import('../src/alerts/notify.ts');
 const { NotifyBudget, digestMessage } = await import('../src/alerts/notify-budget.ts');
 import type { AlertRecord } from '../src/store/ops.ts';
 
@@ -53,6 +53,7 @@ function alert(id: string, over: Partial<AlertRecord> = {}): AlertRecord {
         breach_count: 3, clear_count: 0, missing_count: 0,
         first_breach_ts: ago(120), raised_ts: ago(110), escalated_ts: null,
         cleared_ts: null, last_seen_ts: NOW, renotified_ts: null, acked_ts: null,
+        acked_by: null, ack_note: null,
         clear_reason: null, notified_raise: true, notified_clear: false,
         notified_escalate: false, notify_attempts: 0, last_attempt_ts: null,
         ...over,
@@ -253,6 +254,52 @@ console.log('the notify pass, orchestrated offline\n');
     eq('its syslog line stays one datagram', d.line.length < 1600 && d.line.includes(' more'), true);
     eq('and it carries the worst severity it holds', d.severity, 'crit');
     eq('a digest of clears only is a notice', digestMessage([{ alertId: '1', event: 'clear', severity: 'crit', line: 'clear x', heldAt: 0 }]).severity, 'notice');
+}
+
+{
+    console.log('\nthe queued-event gate (queuedEventGate), and the race it closes:');
+    const G = { in_maintenance: false, under_policy: false, in_group: false, group_overlap: false, settling: false };
+    const at = (over: Partial<AlertRecord> = {}, gates: Partial<typeof G> = {}) => ({ ...alert('9', over), ...G, ...gates });
+    const all = (a: ReturnType<typeof at>) => (['raise', 'escalate', 'clear'] as const).map((t) => queuedEventGate(t, a));
+
+    // THE RACE, as production met it on 2026-10-10: the timer pass drained
+    // the event queue a moment before the scan queued a clear; that pass's
+    // retryPass delivered the clear from the owed queue and marked it sent;
+    // the next pass drained the stale event.
+    reset();
+    queues = { raise: [], escalate: [], clear: [alert('9', { state: 'cleared', cleared_ts: ago(1) })], renotify: [] };
+    await retryPass(NOW);
+    await settle();
+    eq('the owed queue delivers the clear once', eventsSent(), ['CLEAR']);
+    const reread = at({ state: 'cleared', cleared_ts: ago(1), notified_clear: true });   // getAlert, after markNotified
+    eq('the stale event, read again, is already sent - and the pass skips it', queuedEventGate('clear', reread), 'already-sent');
+    reset();
+    await dispatchEvent('clear', reread);
+    await settle();
+    eq('(without the gate, dispatchEvent sends it a second time - the nine duplicates)', eventsSent(), ['CLEAR']);
+    queues = { raise: [], escalate: [], clear: [], renotify: [] };
+    reset();
+
+    eq('a raise already sent is not sent again', queuedEventGate('raise', at({ notified_raise: true })), 'already-sent');
+    eq('an escalate already sent is not sent again',
+        queuedEventGate('escalate', at({ escalated_ts: ago(1), notified_escalate: true })), 'already-sent');
+    eq('owed, each goes out', [
+        queuedEventGate('raise', at({ notified_raise: false })),
+        queuedEventGate('escalate', at({ escalated_ts: ago(1), notified_escalate: false })),
+        queuedEventGate('clear', at({ state: 'cleared', notified_clear: false })),
+    ], ['send', 'send', 'send']);
+
+    // The gates that were already there, asserted for the first time.
+    eq('in maintenance, every type is held - the escalate included, which keeps the window whole',
+        all(at({ notified_raise: false }, { in_maintenance: true })), ['maintenance', 'maintenance', 'maintenance']);
+    eq('under a policy, every type is held', all(at({ notified_raise: false }, { under_policy: true })), ['policy', 'policy', 'policy']);
+    eq('a member of an open group outage: raise and escalate held, its clear goes',
+        all(at({ notified_raise: false }, { in_group: true })), ['group', 'group', 'send']);
+    eq('an outside check settling: raise and escalate held, its clear goes',
+        all(at({ notified_raise: false }, { settling: true })), ['settling', 'settling', 'send']);
+    eq('a clear whose raise was never told, across a group outage, is not told either',
+        queuedEventGate('clear', at({ notified_raise: false }, { group_overlap: true })), 'group-overlap');
+    eq('but a clear whose raise WAS told is', queuedEventGate('clear', at({ notified_raise: true }, { group_overlap: true })), 'send');
 }
 
 sock.close();

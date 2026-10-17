@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.8
+# Known issues, as of 0.1.0-alpha.9
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01, 2026-10-03 and 2026-10-08 for the second to the eighth. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08 and 2026-10-17 for the second to the ninth. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
@@ -36,7 +36,8 @@ what each alpha fixed.
   devices still email on their own, and so does a syslog rule matching a
   link-down: which of those belong with an outage, and which are worth
   hearing anyway, is not one answer, so a group alert is about devices up
-  and down.
+  and down. (A room's change-from-normal alert, alpha.9, likewise holds only
+  its own devices' temperature change alerts.)
 - **Board access is by role, not per board.** Anyone signed in sees the
   boards their role allows, and an operator may change any of them; a
   screen or a person who should see one board is given a display token
@@ -66,6 +67,20 @@ what each alpha fixed.
   its host - a nightly backup, say - reads red for a quarter of an hour
   after each pause and then clears; the worst stall since start, and when,
   stays in the thread table. Before, one stall held it red until a restart.
+- **Change from normal decides by a sensor's name** (alpha.9). A
+  motherboard, network card, disk, memory module, switch chip, inlet or UPS
+  probe takes part; CPUs, GPUs, NVMe drives and chipsets do not, and a name
+  RSCanvas does not recognise takes no part until it is included on its
+  card. A sensor that reports a fixed value - some boards' ACPI "temp1"
+  reads 27.8 C forever - takes part and can never move, and an unconnected
+  input reading 100 C or more is judged like any other; exclude either on
+  its card. A sensor is judged after three days of history, upward only,
+  and a room needs two devices with a sensor taking part.
+- **Restarts are the SNMP agent's** (alpha.9). The uptime read is the
+  agent's, so restarting snmpd alone records a restart of the device, and
+  the page and email say "the device or its SNMP agent".
+- **Availability is by ping alone** (alpha.9), by the operator's ruling: a
+  host that answers ping with every service down is available.
 
 ## Findings still open
 

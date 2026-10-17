@@ -91,6 +91,11 @@
                  same grammar searches them (proto:trap). Operator's call,
                  2026-08-14. -->
             <button type="button" data-section="search" class="navbtn">Logs</button>
+            <!-- Reports (2026-10-16, operator): the three reports had grown
+                 into most of the Dashboard's length, below the lists it is
+                 for. A report is a question asked now and then, not a
+                 status, so it gets its own tab. -->
+            <button type="button" data-section="reports" class="navbtn">Reports</button>
             <button type="button" data-section="system" class="navbtn">System</button>
         </div>
 
@@ -260,10 +265,14 @@
                caches as used.</p>
         </div>
 
-        <!-- THE INTERFACE REPORT (2026-09-25, operator): "how much did this ISP
+        <!-- THE REPORTS TAB. The three reports below lived at the bottom of
+             the Dashboard until 2026-10-16, when the operator gave them their
+             own tab; nothing about them changed but where they sit.
+
+             THE INTERFACE REPORT (2026-09-25, operator): "how much did this ISP
              link or sub-interface carry this month" - pick interfaces from
              any devices, a period, and read it here or take the CSV. -->
-        <div class="panel" data-section="dashboard" id="report-panel">
+        <div class="panel" data-section="reports" id="report-panel">
             <h2>Interface traffic report</h2>
             <div class="row">
                 <label for="report-device" class="small">device</label>
@@ -312,7 +321,7 @@
              is what finds an oversubscribed or intermittently failing link,
              the minimum how bad it got, the runs under the G.109 bands how
              often. Every check of the kind unless some are picked. -->
-        <div class="panel" data-section="dashboard" id="svc-report-panel">
+        <div class="panel" data-section="reports" id="svc-report-panel">
             <h2>Services report</h2>
             <div class="row">
                 <label for="svc-report-kind" class="small">checks</label>
@@ -343,6 +352,49 @@
             </div>
             <div class="table-scroll">
                 <table class="list compact hidden" id="svc-report-table">
+                    <thead><tr></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- THE AVAILABILITY REPORT (IDEAS-2026-10-15 item 8): how available
+             each device was over a period, by ping alone (the operator's
+             ruling), or pooled by location or application. Worst first. The
+             two measurements come from where each is exact, and the note
+             under the controls says which is which. -->
+        <div class="panel" data-section="reports" id="avail-report-panel">
+            <h2>Availability report</h2>
+            <div class="row">
+                <label for="avail-group" class="small">show</label>
+                <select id="avail-group">
+                    <option value="device" selected>every device</option>
+                    <option value="location">by location</option>
+                    <option value="application">by application</option>
+                </select>
+                <label for="avail-period" class="small">period</label>
+                <select id="avail-period">
+                    <option value="this-month" selected>this month so far</option>
+                    <option value="last-month">last month</option>
+                    <option value="last-7">last 7 days</option>
+                    <option value="last-30">last 30 days</option>
+                    <option value="custom">from ... to ...</option>
+                </select>
+                <input type="date" id="avail-from" class="hidden">
+                <input type="date" id="avail-to" class="hidden">
+                <button type="button" id="avail-run" class="btn-primary">Show report</button>
+                <a id="avail-csv" class="btn hidden" download>Download CSV</a>
+                <span id="avail-msg" class="muted small"></span>
+            </div>
+            <div class="muted small">
+                Availability is the share of the once-a-minute pings answered; pings
+                inside a maintenance window are left out. Measured is how much of
+                the period anyone was looking. Outages come from the ten-second
+                sweep: down a minute or more is an outage, less is a blip, and one
+                that began in maintenance is counted apart.
+            </div>
+            <div class="table-scroll">
+                <table class="list compact hidden" id="avail-table">
                     <thead><tr></tr></thead>
                     <tbody></tbody>
                 </table>
@@ -485,6 +537,17 @@
                 <button type="button" id="alert-mute" class="hidden"></button>
                 <span id="alert-mute-msg" class="muted small"></span>
             </div>
+            <!-- Acknowledge (slice 62): "I am on this", with an optional note.
+                 Shown by renderAlertDetail to a role holding alert.ack, on an
+                 alert that has not cleared - not by data-can, which would
+                 fight the per-alert hidden toggle over the same class. -->
+            <form id="alert-ack-form" class="row hidden">
+                <input type="text" id="alert-ack-note" class="grow" maxlength="200" autocomplete="off"
+                       placeholder="optional note - a ticket number, who has it, what is being done">
+                <button type="submit" id="alert-ack">Acknowledge</button>
+                <button type="button" id="alert-unack" class="hidden">Remove acknowledgement</button>
+                <span id="alert-ack-msg" class="muted small"></span>
+            </form>
             <div id="alert-facts" class="hints"></div>
             <!-- The note sits BELOW the heading, not inside it: h3 is
                  uppercased by the stylesheet, and a sentence swept up into
@@ -790,9 +853,16 @@
                  anything in the block, and nobody else. -->
             <h2 class="device-head"><span id="device-title"></span>
                 <span id="device-badges"></span>
+                <!-- The address RSCanvas polls and pings, first after the name
+                     (2026-10-16, operator): it was only to be found by opening
+                     Modify. The port only when it is not SNMP's 161. -->
+                <span id="device-address" class="device-address"></span>
                 <span id="device-sub" class="muted"></span>
                 <span id="device-grouping" class="device-grouping small"></span>
                 <span class="head-spacer"></span>
+                <!-- In the header, not beside the timeline's range (2026-10-16,
+                     operator): there it read as part of the range. -->
+                <button type="button" id="device-logs" class="small hidden">Logs from this device</button>
                 <button type="button" id="device-modify" class="small" aria-expanded="false"
                         aria-controls="device-edit"
                         data-can="device.rename device.address alert.suppress device.group device.mute alertrule.write">Modify</button></h2>
@@ -831,11 +901,31 @@
             </form>
             <!-- "Maintenance for two hours" lives where the operator already
                  is when they decide to work on something (slice 22). -->
+            <!-- Or a repeating one (slice 61): the nightly backup, the daily
+                 reboot - every occurrence at a local time, for its minutes. -->
             <form id="maint-dev-form" class="row" data-can="alert.suppress">
-                <label for="dev-maint-min">maintenance for</label>
+                <label for="dev-maint-repeat">maintenance</label>
+                <select id="dev-maint-repeat">
+                    <option value="">once, from now</option>
+                    <option value="1,2,3,4,5,6,7">every day</option>
+                    <option value="1,2,3,4,5">weekdays</option>
+                    <option value="6,7">weekends</option>
+                    <option value="1">Mondays</option>
+                    <option value="2">Tuesdays</option>
+                    <option value="3">Wednesdays</option>
+                    <option value="4">Thursdays</option>
+                    <option value="5">Fridays</option>
+                    <option value="6">Saturdays</option>
+                    <option value="7">Sundays</option>
+                </select>
+                <span id="dev-maint-at-wrap" class="hidden">
+                    <label for="dev-maint-at">at</label>
+                    <input type="time" id="dev-maint-at" value="03:00">
+                </span>
+                <label for="dev-maint-min">for</label>
                 <input type="number" id="dev-maint-min" value="120" min="1" max="43200"> minutes
                 <input type="text" id="dev-maint-note" placeholder="optional note" maxlength="500">
-                <button type="submit">Start window</button>
+                <button type="submit" id="dev-maint-go">Start window</button>
                 <span id="maint-dev-msg" class="muted small"></span>
             </form>
             <form id="grouping-form" class="row" data-can="device.group">
@@ -847,6 +937,16 @@
                        autocomplete="off" maxlength="120">
                 <button type="submit">Save</button>
                 <span id="grouping-msg" class="muted small"></span>
+            </form>
+            <!-- Slice 64: notes - the operator's free text about the device,
+                 for what no poll can know. Shown to every role on the page
+                 above the cards; edited here with the grouping right. -->
+            <form id="notes-form" class="row" data-can="device.group">
+                <label for="dev-notes">notes</label>
+                <textarea id="dev-notes" class="grow notes-edit" rows="4" maxlength="2000"
+                          placeholder="owner, who to call, asset tag, warranty, where it sits - anything worth knowing at 3am"></textarea>
+                <button type="submit">Save notes</button>
+                <span id="notes-msg" class="muted small"></span>
             </form>
             <!-- Slice 25 quiet 2: the transient declaration, beside grouping
                  because it is the same posture - a fact about the device an
@@ -887,6 +987,29 @@
                     utilization are unchanged. Saves when toggled.</span>
                 <span id="linkdown-msg" class="small"></span>
             </div>
+            <!-- Restart alerts (slice 62): off by default, on here for this
+                 device or with the button for every device. The rule is an
+                 override row like link-down's, so the Thresholds list shows
+                 it too. -->
+            <div class="row" data-can="alertrule.write">
+                <label class="small"><input type="checkbox" id="dev-restart-alerts"> restart alerts</label>
+                <span class="muted small">a warn when the device or its SNMP agent restarts, open
+                    for 30 minutes and cleared without an email. Never for a restart inside a
+                    maintenance window, or for a transient device. Saves when toggled.</span>
+                <button type="button" id="dev-restart-fleet"></button>
+                <span id="restart-msg" class="small"></span>
+            </div>
+            <!-- Change from normal (slice 65): on by default for temperatures
+                 whose names say they follow the room. Off here takes this
+                 device's out; each card includes or excludes one sensor. -->
+            <div class="row hidden" id="dev-tempchange-row" data-can="alertrule.write">
+                <label class="small"><input type="checkbox" id="dev-tempchange"> temperature change alerts</label>
+                <span class="muted small">a warn when a temperature that follows the room runs well above
+                    its own last week, or several in its location do at once - a failed fan or a failed AC
+                    that every fixed threshold misses. Each card says whether it takes part. Saves when toggled.</span>
+                <button type="button" id="dev-tempchange-fleet"></button>
+                <span id="tempchange-msg" class="small"></span>
+            </div>
             </div>
             <!-- The device's own state, on the page about that device. The
                  roster showed down and this panel did not, so a dead device
@@ -894,6 +1017,14 @@
                  the readings. Blank when everything is up, per the same
                  blank-not-placeholder rule the roster follows. -->
             <div id="device-state" class="hints hidden"></div>
+            <!-- Slice 64: its notes, as written - hidden when there are none. -->
+            <div id="device-notes" class="hints hidden">
+                <div class="muted small">notes</div>
+                <div id="device-notes-text" class="notes-text"></div>
+            </div>
+            <!-- Its restarts (slice 62), newest first, from /api/device.
+                 Hidden when none is on record: blank, not placeholder. -->
+            <div id="device-restarts" class="hints hidden"></div>
             <!-- THE DEVICE'S OPEN ALERTS. The roster said "3 open alerts" and
                  the page they clicked into said nothing about them - the one
                  number that brought the operator here was the one thing the
@@ -921,10 +1052,47 @@
                     <button type="button" id="device-alerts-all" class="small">show them all on the Alerts page</button>
                 </div>
             </div>
+            <!-- THE TIMELINE (IDEAS-2026-10-15 item 4): what happened to this
+                 device, newest first - alerts, ping changes, restarts,
+                 maintenance, and for an admin the changes people made - each
+                 row with the logs it sent around that moment. Side by side on
+                 one time axis; the page never says one caused another. Shows
+                 the newest few and unfolds, so a busy month does not push the
+                 cards below off the screen. -->
+            <div id="device-timeline-wrap">
+                <!-- "N events in the last 24 hours" (2026-10-16, operator):
+                     not all of it is alerts, and the count belongs to the
+                     range chosen below it. -->
+                <h3><span id="timeline-title">Events</span> <span id="timeline-sub" class="muted small"></span></h3>
+                <div class="row">
+                    <select id="timeline-range">
+                        <option value="24" selected>24 hours</option>
+                        <option value="168">7 days</option>
+                        <option value="720">30 days</option>
+                    </select>
+                    <span id="timeline-msg" class="muted small"></span>
+                </div>
+                <div class="table-scroll">
+                    <table class="list" id="device-timeline">
+                        <thead><tr><th>when</th><th>what</th><th>detail</th><th></th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div id="timeline-more" class="row small hidden">
+                    <button type="button" id="timeline-all" class="small"></button>
+                </div>
+                <div id="timeline-empty" class="allquiet hidden"></div>
+            </div>
             <!-- Sensor cards (the sensors slice): current reading plus a bar,
                  above the interface table - the parent's layout, which the
                  operator named as the porting bar. -->
             <div id="sensor-cards" class="cards hidden"></div>
+            <!-- Shown when the device has an untracked sensor (2026-10-16,
+                 operator); remembered per browser. -->
+            <div id="sensor-tools" class="row hidden">
+                <span class="grow"></span>
+                <label class="small"><input type="checkbox" id="hide-untracked-sensors"> hide untracked sensors</label>
+            </div>
             <!-- SERVICE CHECKS (slice 58): what RSCanvas fetches or connects
                  to on this device's behalf - an https page, a JSON health
                  endpoint, a TCP port - each a card with its last outcome,
@@ -1109,7 +1277,11 @@
                         <th>interface</th><th>description</th><th class="num">speed</th><th>state</th>
                         <th class="num">in</th><th class="num">out</th>
                         <th class="num">errors/s</th><th class="num">discards/s</th>
-                        <th>last reading</th><th></th>
+                        <th>last reading</th>
+                        <!-- Above the track buttons, shown when the device has
+                             an untracked interface (2026-10-16, operator). -->
+                        <th><label id="hide-untracked-ifs-label" class="small hidden"><input type="checkbox"
+                            id="hide-untracked-ifs"> hide untracked</label></th>
                     </tr></thead>
                     <tbody></tbody>
                 </table>
@@ -1126,9 +1298,11 @@
             <p class="muted small">A window withholds notification for a named set until it
                ends. The alerts still raise, stay on every page and the wall marked
                "in maintenance", and anything still active when the window closes is
-               delivered on the next pass. The watchdog is never suppressed.</p>
+               delivered on the next pass. The watchdog is never suppressed. A
+               repeating window - a nightly backup, a daily reboot - opens at its local
+               time on its days and closes after its minutes, every time.</p>
             <table id="maint-table" class="hidden">
-                <thead><tr><th></th><th>covers</th><th>starts</th><th>ends</th>
+                <thead><tr><th></th><th>covers</th><th>when</th><th>until</th>
                        <th>note</th><th>by</th><th></th></tr></thead>
                 <tbody></tbody>
             </table>
@@ -1143,10 +1317,27 @@
                 <input type="text" id="maint-target" placeholder="target name" autocomplete="off" maxlength="120"
                        list="maint-targets">
                 <datalist id="maint-targets"></datalist>
+                <select id="maint-repeat" aria-label="repeat">
+                    <option value="">once, from now</option>
+                    <option value="1,2,3,4,5,6,7">every day</option>
+                    <option value="1,2,3,4,5">weekdays</option>
+                    <option value="6,7">weekends</option>
+                    <option value="1">Mondays</option>
+                    <option value="2">Tuesdays</option>
+                    <option value="3">Wednesdays</option>
+                    <option value="4">Thursdays</option>
+                    <option value="5">Fridays</option>
+                    <option value="6">Saturdays</option>
+                    <option value="7">Sundays</option>
+                </select>
+                <span id="maint-at-wrap" class="hidden">
+                    <label for="maint-at">at</label>
+                    <input type="time" id="maint-at" value="03:00">
+                </span>
                 <label for="maint-min">for</label>
                 <input type="number" id="maint-min" value="120" min="1" max="43200"> minutes
                 <input type="text" id="maint-note" placeholder="optional note" maxlength="500">
-                <button type="submit">Open window</button>
+                <button type="submit" id="maint-go">Open window</button>
                 <span id="maint-msg" class="muted small"></span>
             </form>
         </div>

@@ -218,6 +218,17 @@ table.list td.mid, table.list th.mid { text-align: center; }
 .chart-grid-line { stroke: var(--se-border); stroke-width: 1; }
 .chart-axis-label { fill: var(--se-txt-dim); font-size: 10px; }
 .chart-cursor { stroke: var(--se-txt-dim); stroke-width: 1; stroke-dasharray: 3 3; }
+/* The timeline on a chart (IDEAS-2026-10-15 item 4). A marker is a thin
+   stroke with a SHAPE as well as a colour (suite rule 5): dotted for what
+   the device did (a restart, ping lost or back), dashed for what an alert
+   did. Maintenance is a faint band behind the lines it explains. */
+.chart-marker { stroke-width: 1.4; }
+.chart-marker-restart { stroke: var(--se-warn); stroke-dasharray: 1 3; }
+.chart-marker-down { stroke: var(--se-down); stroke-dasharray: 1 3; }
+.chart-marker-up { stroke: var(--se-up); stroke-dasharray: 1 3; }
+.chart-marker-raise { stroke: var(--se-down); stroke-dasharray: 5 3; }
+.chart-marker-clear { stroke: var(--se-up); stroke-dasharray: 5 3; }
+.chart-band-maint { fill: var(--se-txt-dim); opacity: .12; }
 /* a/b are the TRAFFIC pair - accent and the out-series colour, the same two
    the product uses for in/out everywhere. c/d are the TROUBLE pair, and
    they borrow the severity palette the tables already speak: errors take
@@ -361,6 +372,13 @@ tr.maint-row td { opacity: .82; }
    but dotted where a window is dashed, because "who declared this" and "when
    does it end" are different next questions. */
 .badge.policy { color: var(--se-txt-dim); border-color: var(--se-txt-dim); border-style: dotted; }
+/* Slice 62: acknowledged - someone is on it. Dim like the quiet badges, and
+   SOLID, because nothing about the alert is withheld: it is still open. */
+.badge.ack { color: var(--se-txt-dim); border-color: var(--se-txt-dim); }
+/* Slice 64: a device's notes keep the lines and spacing they were written
+   with - an owner on one line, an asset tag on the next. */
+.notes-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.notes-edit { min-height: 5em; resize: vertical; }
 .badge.warn { color: var(--se-warn); border-color: var(--se-warn); }
 /* Aged-out facts: a ghost interface, an unrated speed. Warn-coloured because
    the row deserves an eye, DASHED because nothing is alarming right now -
@@ -470,6 +488,9 @@ th.clickable:hover { text-decoration: underline; }
 /* threshold control on a sensor card (SLICE-THRESHOLDS-PLAN) */
 .card-gear { float: right; background: none; border: none; cursor: pointer; opacity: .45; font-size: .9em; padding: 0 .2em; }
 .card-gear:hover { opacity: 1; }
+/* Something is set for this sensor or its device under the cog (2026-10-16):
+   the card's settings fold away, so the cog says there is something there. */
+.card-gear.set { opacity: .9; color: var(--se-warn); }
 /* In an interface row the gear sits between untrack and unmute, not floated
    to the far edge of the cell where it reads as belonging to nothing. */
 #entities .card-gear { float: none; }
@@ -515,6 +536,11 @@ table.list td.clip { max-width: 190px; overflow: hidden; text-overflow: ellipsis
 .panel h2.device-head .head-spacer { flex: 1; }
 .panel h2.device-head button { font-size: 12px; font-weight: normal; padding: 2px 10px; }
 .device-grouping { font-weight: normal; display: inline-flex; gap: 12px; flex-wrap: wrap; }
+/* The polled address, first after the name (2026-10-16): plain weight, full
+   strength - it is the one fact here people copy. */
+.device-address { font-weight: normal; }
+/* The interface table's "hide untracked", in its header row (2026-10-16). */
+#hide-untracked-ifs-label { font-weight: normal; cursor: pointer; }
 /* The folded edit block, set off from the readings below it when open. */
 .device-edit {
     border: 1px dashed var(--se-border);

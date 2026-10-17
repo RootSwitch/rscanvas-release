@@ -173,6 +173,27 @@ export function render(container, opts) {
         if (lineParts.length) svg.appendChild(svgEl('path', { class: `chart-line-${s.cls}`, d: lineParts.join('') }));
     }
 
+    // THE TIMELINE ON THE CHART (IDEAS-2026-10-15 item 4). Bands first, so a
+    // maintenance window shades behind the lines it explains; markers are a
+    // vertical stroke each - a restart, a ping change, an alert - styled by
+    // a class this module chooses from a fixed set, never by data. Only what
+    // falls inside the chart's window is drawn, and the hover names them.
+    const inside = (t) => t >= from && t <= to;
+    const bands = (opts.bands || []).filter((b) => b.to >= from && b.from <= to);
+    for (const b of bands) {
+        const x0 = x(Math.max(from, b.from));
+        const x1 = x(Math.min(to, b.to));
+        svg.insertBefore(svgEl('rect', {
+            class: 'chart-band-maint', x: x0, y: PAD.t, width: Math.max(1, x1 - x0), height: H - PAD.t - PAD.b,
+        }), svg.firstChild);
+    }
+    const MARKER_CLS = new Set(['restart', 'down', 'up', 'raise', 'clear']);
+    const markers = (opts.markers || []).filter((m) => inside(m.t) && MARKER_CLS.has(m.cls));
+    for (const m of markers) {
+        const xx = x(m.t);
+        svg.appendChild(svgEl('line', { class: `chart-marker chart-marker-${m.cls}`, x1: xx, y1: PAD.t, x2: xx, y2: H - PAD.b }));
+    }
+
     const cursor = svgEl('line', { class: 'chart-cursor', x1: -10, y1: PAD.t, x2: -10, y2: H - PAD.b });
     svg.appendChild(cursor);
     container.style.position = 'relative';
@@ -230,6 +251,20 @@ export function render(container, opts) {
                 line += ` (${bits})`;
             }
             tip.appendChild(document.createTextNode(line));
+        }
+        // What the timeline says happened near the cursor: markers within a
+        // bucket and a half, and any band the cursor is inside. Text nodes,
+        // because labels carry device names and notes.
+        const near = Math.max(bucketSec * 1.5, (to - from) / 150);
+        const said = [
+            ...bands.filter((b) => t >= b.from && t <= b.to).map((b) => b.label),
+            ...markers.filter((m) => Math.abs(m.t - t) <= near).map((m) => `${fmtTime(m.t, 0)} ${m.label}`),
+        ];
+        for (const s of said.slice(0, 6)) {
+            tip.appendChild(document.createElement('br'));
+            const em = document.createElement('em');
+            em.textContent = s;
+            tip.appendChild(em);
         }
         const left = ev.clientX - rect.left;
         tip.style.left = `${Math.min(left + 12, rect.width - tip.offsetWidth - 4)}px`;

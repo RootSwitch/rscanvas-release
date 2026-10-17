@@ -116,6 +116,8 @@ function fmtValue(v, unit) {
 let alertData = { open: [], recentCleared: [], raiseScans: null, clearScans: null };
 // Active and upcoming maintenance windows (slice 22), refreshed with the rest.
 let maintData = [];
+// Repeating windows (slice 61), each with its occurrence open now or next.
+let maintSchedules = [];
 let currentAlert = null;
 
 const ALERT_SCOPES = {
@@ -136,6 +138,23 @@ function stateProgress(a) {
     if (a.state === 'pending' && raiseScans) return `${a.breach_count} of ${raiseScans}`;
     if (a.state === 'clearing' && clearScans) return `${a.clear_count} of ${clearScans}`;
     return '';
+}
+
+/**
+ * The state column, on the Alerts page and the device page alike. Active
+ * renders as nothing (the note above says why) unless someone acknowledged
+ * it (slice 62): then "acked", with who, when and the note in its title -
+ * the list answers "is anyone on this" without opening every row.
+ */
+function alertStateCell(a) {
+    if (a.state !== 'active') {
+        const progress = stateProgress(a);
+        return pill(progress === '' ? a.state : `${a.state} ${progress}`, `sev ${a.state}`);
+    }
+    if (!a.acked_ts) return cell('');
+    const td = pill('acked', 'badge ack');
+    td.title = `acknowledged by ${a.acked_by || 'someone'}, ${fmtAgo(a.acked_ts)}${a.ack_note ? ` - ${a.ack_note}` : ''}`;
+    return td;
 }
 
 /**
@@ -165,7 +184,7 @@ function deliveryCell(a) {
     if (a.under_policy) return pill('unpaged - policy', 'badge policy');
     // Slice 55: held under its group's alert, which names it. Same marker
     // discipline - withheld must be visible, and say by what.
-    if (a.in_group) return pill('held - group alert', 'badge policy');
+    if (a.in_group) return pill(a.kind === 'temp-change' ? 'held - room alert' : 'held - group alert', 'badge policy');
     // Slice 59: an outside check waiting to see whether it is alone.
     if (a.settling) return pill('held - settling', 'badge policy');
     return a.notify_attempts > 0
@@ -199,11 +218,9 @@ function renderAlerts(data) {
         const val = cell(fmtValue(a.value, a.unit), 'num');
         if (a.severity === 'crit') val.classList.add('cell-crit');
         else if (a.severity === 'warn') val.classList.add('cell-warn');
-        const progress = stateProgress(a);
         const row = rowEl([
             pill(a.severity, `sev ${a.severity}`),
-            a.state === 'active' ? cell('')
-                : pill(progress === '' ? a.state : `${a.state} ${progress}`, `sev ${a.state}`),
+            alertStateCell(a),
             cell(a.label),
             val,
             cell(fmtValue(a.peak_value, a.unit), 'num'),
@@ -324,6 +341,33 @@ function renderAlertDetail(a, history) {
         });
         d.lastChild.appendChild(link);
         facts.appendChild(d);
+        // LOGS AROUND IT (IDEAS-2026-10-15 item 4): what the device sent in
+        // the ten minutes before the raise, and around the clear when there
+        // is one - offered when the roster knows the device's address.
+        const addr = deviceAddress(a.host);
+        if (addr !== null && can('syslog.read')) {
+            const line = factLine('logs', '');
+            const v = line.lastChild;
+            const logsLink = (text, ms) => {
+                const l = document.createElement('a');
+                l.href = '#';
+                l.textContent = text;
+                l.title = `messages and traps from ${addr}, ten minutes before to five after`;
+                l.addEventListener('click', (ev) => {
+                    ev.preventDefault();
+                    openLogs(addr, ms - LOGS_BEFORE_MS, ms + LOGS_AFTER_MS);
+                });
+                return l;
+            };
+            v.appendChild(logsLink(a.raised_ts ? 'around the raise' : 'around the first breach',
+                Date.parse(a.raised_ts ?? a.first_breach_ts)));
+            if (a.cleared_ts) {
+                v.appendChild(document.createTextNode(', '));
+                v.appendChild(logsLink('around the clear', Date.parse(a.cleared_ts)));
+            }
+            v.appendChild(document.createTextNode(` - from ${addr}`));
+            facts.appendChild(line);
+        }
     } else {
         facts.appendChild(factLine('device', '(none)'));
     }
@@ -423,6 +467,10 @@ function renderAlertDetail(a, history) {
               + ' of the outside checks failing together. This alert is recorded and visible,'
               + ' and its email is held: the group\'s email names it. If it is still down once'
               + ' every outside check has run again after the group clears, it is emailed then.'
+            : a.kind === 'temp-change'
+            ? 'its location has an open room alert - several devices there warmer than their week'
+              + ' at once. This alert is recorded and visible, and its email is held: the room\'s'
+              + ' email stands for it. If it is still warm when the room alert clears, it is emailed then.'
             : 'its location or application has an open group alert - this alert is recorded'
               + ' and visible, and its email is held: the group\'s email names it. If it is'
               + ' still down when the group alert clears, it is emailed then.');
@@ -499,7 +547,28 @@ function renderAlertDetail(a, history) {
             + 'raise already went out and the incident never ended, so a bounce '
             + 'shows here as the counter resetting and never in the log below'));
     }
-    if (a.acked_ts) facts.appendChild(factLine('acknowledged', fmtAgo(a.acked_ts)));
+    // ACKNOWLEDGED (slice 62): who said they had it, when, and what they
+    // said. The note is the acknowledger's text, rendered as text.
+    if (a.acked_ts) {
+        facts.appendChild(factLine('acknowledged', `by ${a.acked_by || 'someone'}, ${fmtAgo(a.acked_ts)}`
+            + (a.ack_note ? ` - ${a.ack_note}` : '')
+            + (a.state !== 'cleared' ? ' (renotify stops; the alert stays open until it clears)' : '')));
+    }
+    {
+        // Offered on anything not yet cleared, to a role that may claim it.
+        // Re-acknowledging replaces the who and the note, so the form stays
+        // while acknowledged; the note box starts from the current note.
+        const open = can('alert.ack') && a.state !== 'cleared';
+        $('alert-ack-form').classList.toggle('hidden', !open);
+        $('alert-unack').classList.toggle('hidden', !open || !a.acked_ts);
+        $('alert-ack').textContent = a.acked_ts ? 'Acknowledge again' : 'Acknowledge';
+        // Filled once per alert shown, never under the operator's typing:
+        // this runs on every 10s refresh.
+        if (document.activeElement !== $('alert-ack-note') && a.id !== ackNoteFor) {
+            $('alert-ack-note').value = a.ack_note || '';
+            ackNoteFor = a.id;
+        }
+    }
     facts.appendChild(factLine('delivery',
         (a.state === 'pending' ? 'nothing owed yet - has not raised'
             : a.notified_raise ? 'raise settled' : 'raise OWED')
@@ -562,6 +631,10 @@ async function showAlert(id) {
     $('alert-history').querySelector('tbody').replaceChildren();
     $('alert-mute').classList.add('hidden');
     $('alert-mute-msg').textContent = '';
+    $('alert-ack-form').classList.add('hidden');
+    $('alert-ack-msg').textContent = '';
+    $('alert-ack-note').value = '';
+    ackNoteFor = null;
     const r = await api(`/api/alert?id=${encodeURIComponent(id)}`);
     if (r.status === 401) { showLogin(); return; }
     if (!r.ok) {
@@ -592,6 +665,28 @@ $('device-alerts-all').addEventListener('click', () => {
 // The alert the detail panel last rendered, for the mute button's handler:
 // renderAlertDetail runs on every refresh, the listener is wired once.
 let detailAlert = null;
+// Which alert's note the acknowledge box was last filled from (slice 62).
+let ackNoteFor = null;
+
+/** Acknowledge, or take it back, then re-render from the server's answer. */
+async function sendAck(path) {
+    const a = detailAlert;
+    if (!a) return;
+    const r = await api(path, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: a.id, note: $('alert-ack-note').value }),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    $('alert-ack-msg').textContent = r.detail || (r.ok ? 'saved' : `refused (${r.status})`);
+    const id = currentAlert;
+    const d = await api(`/api/alert?id=${encodeURIComponent(id)}`);
+    if (d.ok && currentAlert === id) { ackNoteFor = null; renderAlertDetail(d.alert, d.history || []); }
+    // The list carries the ack marker; refresh it rather than patch a row.
+    const all = await api('/api/alerts');
+    if (all.ok) renderAlerts(all);
+}
+$('alert-ack-form').addEventListener('submit', (ev) => { ev.preventDefault(); sendAck('/api/alerts/ack'); });
+$('alert-unack').addEventListener('click', () => sendAck('/api/alerts/unack'));
 $('alert-mute').addEventListener('click', async () => {
     const a = detailAlert;
     if (!a || !a.code) return;
@@ -1833,11 +1928,17 @@ async function openChart(entity) {
     const detail = entity.source === 'probe' ? svcDetail(entity) : null;
     $('chart-detail').textContent = detail ? detail.join('\n') : '';
     $('chart-detail').classList.toggle('hidden', detail === null);
-    const r = await api(`/api/entity/history?code=${encodeURIComponent(entity.code)}&hours=${hours}`);
+    // The device's timeline rides beside the history (IDEAS-2026-10-15 item
+    // 4), fetched at the same time so the chart waits on neither in turn.
+    const [r, tl] = await Promise.all([
+        api(`/api/entity/history?code=${encodeURIComponent(entity.code)}&hours=${hours}`),
+        chartTimeline(hours),
+    ]);
     // A late reply for a chart the operator has already navigated away from
     // must not overwrite the one they are looking at - and a late reply for
     // a range they have already left must not either (the gen check).
     if (chartEntity !== entity || gen !== chartGen) return;
+    const marks = chartMarks(tl, entity.code);
     if (!r.ok) { $('chart-sub').textContent = r.detail || 'no history'; return; }
     const spec = chartSpec(entity);
     const series = spec.series.map((s) => ({
@@ -1878,9 +1979,9 @@ async function openChart(entity) {
             : 'no readings in this window');
     Charts.render($('chart-body'), {
         series, from: r.from, to: r.to, unit: spec.unit,
-        yMax: spec.yMax, bucketSec: r.bucketSec,
+        yMax: spec.yMax, bucketSec: r.bucketSec, ...marks,
     });
-    renderErrorChart(entity, r);
+    renderErrorChart(entity, r, marks);
 }
 
 /** max of two nullable readings - null only when BOTH are missing, so a
@@ -1902,7 +2003,7 @@ function maxOrNull(a, b) {
  * is the same information stated honestly. Same rule as the roster's blank
  * cells and the alerts table's all-quiet.
  */
-function renderErrorChart(entity, r) {
+function renderErrorChart(entity, r, marks = {}) {
     const isIf = !entity.kind || entity.kind === 'if';
     const errs = isIf ? r.points.map((p) => [p[0], maxOrNull(p[3], p[4])]) : [];
     const disc = isIf ? r.points.map((p) => [p[0], maxOrNull(p[5], p[6])]) : [];
@@ -1920,7 +2021,7 @@ function renderErrorChart(entity, r) {
     }
     $('chart-errs-sub').textContent = 'own scale - the traffic chart above is Gb/s, this is counts per second';
     Charts.render($('chart-errs'), {
-        from: r.from, to: r.to, unit: 'pps', bucketSec: r.bucketSec,
+        from: r.from, to: r.to, unit: 'pps', bucketSec: r.bucketSec, ...marks,
         series: [
             // c and d, not a and b: the severity palette, because this
             // chart only exists when something is wrong and the traffic
@@ -1967,9 +2068,14 @@ async function openRttChart(name) {
     // series that is not on the chart.
     $('chart-title').textContent = `${name} - round-trip`;
     $('chart-sub').textContent = 'loading...';
-    const r = await api(`/api/device/rtt?name=${encodeURIComponent(name)}&hours=${hours}`);
+    const [r, tl] = await Promise.all([
+        api(`/api/device/rtt?name=${encodeURIComponent(name)}&hours=${hours}`),
+        chartTimeline(hours),
+    ]);
     if (chartEntity !== marker) return;
     if (r.status === 401) { showLogin(); return; }
+    // Device-level marks only: no entity is charted here.
+    const marks = chartMarks(tl, null);
     if (!r.ok) { $('chart-sub').textContent = r.detail || 'no history'; return; }
     const med = r.points.map((p) => [p[0], p[1]]);
     const worst = r.points.map((p) => [p[0], p[2]]);
@@ -2010,7 +2116,7 @@ async function openRttChart(name) {
                 ? (series.some((x) => x.label.startsWith('ping')) ? 'round-trip: SNMP and ping' : 'SNMP round-trip')
                 : 'ping latency');
     Charts.render($('chart-body'), {
-        from: r.from, to: r.to, unit: 'ms', bucketSec: r.bucketSec, series,
+        from: r.from, to: r.to, unit: 'ms', bucketSec: r.bucketSec, series, ...marks,
     });
 }
 
@@ -2114,6 +2220,7 @@ async function unmuteSensor(s) {
         : t.source === 'host override' ? `for ${kind} on this device`
         : `for ${kind} everywhere`;
     if (!window.confirm(`Remove the ${row.enabled ? 'override' : 'mute'} ${what}? The next tier or the default applies on the next scan.`)) return;
+    closeCardForms();
     const r = await api('/api/thresholds/delete', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: row.id }),
     });
@@ -2122,7 +2229,10 @@ async function unmuteSensor(s) {
     refresh();
 }
 
-function renderSensorCards(sensors) {
+function renderSensorCards(all) {
+    // HIDE UNTRACKED (2026-10-16, operator), as the interface table's.
+    $('sensor-tools').classList.toggle('hidden', !all.some((s) => !s.tracked));
+    const sensors = $('hide-untracked-sensors').checked ? all.filter((s) => s.tracked) : all;
     const wrap = $('sensor-cards');
     wrap.replaceChildren();
     wrap.classList.toggle('hidden', sensors.length === 0);
@@ -2165,15 +2275,43 @@ function renderSensorCards(sensors) {
         // The threshold control lives on the card because that is where the
         // decision is made: looking at the reading and saying "this is fine
         // here". Built only for a role that can write rules (alertrule.write).
+        let gear = null;
         if (can('alertrule.write') && s.code) {
             const dev = currentDevice === null ? null : lastDevices.find((d) => d.name === currentDevice);
-            const g = thresholdControl(s, dev);
-            head.appendChild(g);
+            gear = thresholdControl(s, dev);
+            head.appendChild(gear);
         }
         const val = document.createElement('div');
         val.className = 'card-value';
         val.textContent = s.tracked ? p.value : 'not watched';
         card.append(head, val);
+        if (p.sub) {
+            const sub = document.createElement('div');
+            sub.className = 'card-sub';
+            sub.textContent = p.sub;
+            card.appendChild(sub);
+        }
+        if (p.pct !== null && p.pct !== undefined && Number.isFinite(Number(p.pct))) {
+            const bar = document.createElement('div');
+            bar.className = 'bar';
+            const fill = document.createElement('div');
+            fill.className = 'bar-fill';
+            fill.style.width = `${Math.max(0, Math.min(100, Number(p.pct)))}%`;
+            bar.appendChild(fill);
+            card.appendChild(bar);
+        }
+        // THE CARD'S SETTINGS, FOLDED BEHIND ITS COG (2026-10-16, operator:
+        // the cards had got busy). The rule line below and a temperature's
+        // change-from-normal line open with the threshold form and close
+        // with it. Folded is not invisible - the 2026-08-27 lesson below
+        // still stands - so a cog with something set for THIS sensor or
+        // THIS device is marked, and its tooltip says what. A rule set for
+        // every sensor of the kind is the fleet's policy, not news about
+        // this card, and does not mark it. A role with no cog keeps both
+        // lines open: it has no other way to read them.
+        const details = document.createElement('div');
+        details.className = 'card-details';
+        const own = [];
         // Provenance ON the card (2026-08-27): a muted sensor looked
         // identical to a watched one, and the answer lived pages away in a
         // table of bare codes. A line appears only when something differs
@@ -2202,26 +2340,193 @@ function renderSensorCards(sensors) {
             } else {
                 th.textContent = `warn ${s.threshold.warn ?? 'off'} / crit ${s.threshold.crit ?? 'off'} (${srcLabel})`;
             }
-            card.appendChild(th);
+            details.appendChild(th);
+            if (s.threshold.source === 'override' || s.threshold.source === 'host override') {
+                own.push(`${s.threshold.muted ? 'alerts muted' : 'its own thresholds'} (${srcLabel})`);
+            }
         }
-        if (p.sub) {
-            const sub = document.createElement('div');
-            sub.className = 'card-sub';
-            sub.textContent = p.sub;
-            card.appendChild(sub);
+        if (s.kind === 'temp' && s.tracked && s.change) {
+            details.appendChild(changeLine(s));
+            if (s.change.why === 'this sensor' || s.change.why === 'this device') {
+                own.push(`change from normal ${s.change.on ? 'on' : 'off'} (${s.change.why})`);
+            }
         }
-        if (p.pct !== null && p.pct !== undefined && Number.isFinite(Number(p.pct))) {
-            const bar = document.createElement('div');
-            bar.className = 'bar';
-            const fill = document.createElement('div');
-            fill.className = 'bar-fill';
-            fill.style.width = `${Math.max(0, Math.min(100, Number(p.pct)))}%`;
-            bar.appendChild(fill);
-            card.appendChild(bar);
+        if (details.childElementCount > 0) {
+            if (gear !== null) {
+                details.classList.toggle('hidden', !openCardSettings.has(s.code));
+                if (own.length > 0) {
+                    gear.classList.add('set');
+                    gear.title = `${own.join('; ')} - click for this sensor's settings`;
+                }
+            }
+            card.appendChild(details);
         }
         wrap.appendChild(card);
     }
 }
+
+// The two "hide untracked" boxes (2026-10-16): per browser, like Modify's
+// fold. Storage can be absent, and then both start unticked.
+const HIDE_KEYS = { 'hide-untracked-ifs': 'rscanvas.hideUntrackedIfs', 'hide-untracked-sensors': 'rscanvas.hideUntrackedSensors' };
+for (const [id, key] of Object.entries(HIDE_KEYS)) {
+    try { $(id).checked = localStorage.getItem(key) === '1'; } catch { /* per-browser nicety only */ }
+    $(id).addEventListener('change', () => {
+        try { localStorage.setItem(key, $(id).checked ? '1' : '0'); } catch { /* per-browser nicety only */ }
+        renderEntities(null);
+    });
+}
+
+// The sensor cards whose settings are open, by code. Kept across the 10 s
+// redraw, so an unmute or an include made from inside them is seen where it
+// was made rather than folding the card shut under the click.
+const openCardSettings = new Set();
+
+/** Close any open threshold form so the redraw an action asks for is not
+ *  skipped (renderEntities waits while a form is live); the card's settings
+ *  stay open. */
+function closeCardForms() {
+    for (const f of document.querySelectorAll('#sensor-cards .th-form')) f.remove();
+}
+
+// --- change from normal on a temperature's card (slice 65) ------------------------
+//
+// What the detector makes of this sensor: whether it takes part and what said
+// so, its week, and where it stands against it now. The include/exclude
+// button writes this sensor's own 'temp-change' row - or drops it when it
+// would only repeat what the name says, so the Thresholds list holds only
+// the sensors someone actually decided about.
+const CHANGE_CLASS_WORDS = {
+    board: 'a motherboard sensor', nic: 'a network card', disk: 'a spinning disk', dimm: 'a memory module',
+    switch: "a switch's chip", ambient: 'an air sensor',
+};
+
+function changeLine(s) {
+    const c = s.change;
+    const el = document.createElement('div');
+    el.className = 'muted small change-line';
+    const minH = lastTempChange?.minHours ?? 72;
+    let text;
+    if (!c.on) {
+        text = c.why === 'this sensor' ? 'change from normal: off for this sensor'
+            : c.why === 'this device' ? 'change from normal: off for this device'
+                : 'change from normal: not watched - by its name it follows work (CPU, GPU, NVMe, chipset), or is a name RSCanvas does not know';
+    } else {
+        text = `change from normal: ${c.why === 'this sensor' ? 'on for this sensor' : `on - follows the room (${CHANGE_CLASS_WORDS[c.cls] ?? 'by name'})`}`;
+    }
+    if (c.hours === null || c.hours === undefined) {
+        if (c.on) text += ', no week recorded yet';
+    } else if (c.hours < minH) {
+        text += `, learning its week (${c.hours} of ${minH} h)`;
+    } else if (c.med !== null) {
+        const spread = Math.max(0, (c.q3 ?? c.med) - (c.q1 ?? c.med));
+        text += `; its week ${Number(c.med).toFixed(1)} C, spread ${spread.toFixed(1)}`;
+        if (s.lv_v0 !== null && s.lv_v0 !== undefined) {
+            const d = Number(s.lv_v0) - Number(c.med);
+            text += `, now ${d >= 0 ? '+' : ''}${d.toFixed(1)}`;
+        }
+    }
+    el.textContent = `${text} `;
+    el.title = 'Change from normal raises when a sensor runs well above its own last week: one sensor past '
+        + 'three times its usual spread or 8 C for 20 minutes, or three devices in one location past 3 C '
+        + 'together for 10 minutes (every device, in a location with fewer). Upward only.';
+    if (can('alertrule.write') && s.code) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'small';
+        b.textContent = c.on ? 'exclude' : 'include';
+        b.title = c.on ? 'Leave this sensor out of change from normal (one sensor and its room)'
+            : 'Watch this sensor for change from normal, whatever its name says';
+        b.addEventListener('click', (ev) => { ev.stopPropagation(); setSensorChange(s, !c.on); });
+        el.appendChild(b);
+    }
+    return el;
+}
+
+async function setSensorChange(s, want) {
+    const c = s.change;
+    closeCardForms();
+    // The name's own verdict with this sensor's row gone - a device turned
+    // off still outranks the name, so only drop the row when nothing would.
+    const byName = c.cls !== null && c.cls !== undefined && lastTempChange?.deviceOff !== true;
+    const r = want === byName && c.rowId
+        ? await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: c.rowId }),
+        })
+        : await saveThreshold({ kind: 'temp-change', host: null, code: s.code, warn: null, crit: null,
+            enabled: want, note: want ? 'change from normal: included' : 'change from normal: excluded' });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { window.alert(r.detail || `refused (${r.status})`); return; }
+    await showDevice(currentDevice);
+}
+
+// The device's row: the checkbox is THIS device (off takes every sensor of
+// it out of both rules); the button is the fleet's two switches together -
+// one sensor and a room - since "change from normal" is one idea to an
+// operator, and two kinds only so each alert can say which rule raised it.
+function syncTempChangeControl() {
+    const tc = lastTempChange;
+    const temps = (lastEntities || []).some((e) => e.kind === 'temp');
+    $('dev-tempchange-row').classList.toggle('hidden', tc === null || !temps);
+    const box = $('dev-tempchange');
+    box.checked = tc !== null && !tc.deviceOff;
+    box.disabled = tc === null;
+    const fleetOn = tc !== null && (tc.singleOn || tc.roomOn);
+    $('dev-tempchange-fleet').textContent = fleetOn ? 'turn off for every device' : 'turn on for every device';
+    if (tc !== null && !tc.singleOn && tc.roomOn) $('tempchange-msg').textContent = 'one-sensor alerts are off fleet-wide; rooms are on';
+    else if (tc !== null && tc.singleOn && !tc.roomOn) $('tempchange-msg').textContent = 'room alerts are off fleet-wide; one-sensor alerts are on';
+}
+
+$('dev-tempchange').addEventListener('change', async () => {
+    if (currentDevice === null || lastTempChange === null) return;
+    const box = $('dev-tempchange');
+    const want = box.checked;
+    const tc = lastTempChange;
+    // On is the default, so turning it back on drops the device's row.
+    const r = want
+        ? (tc.deviceRowId
+            ? await api('/api/thresholds/delete', {
+                method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: tc.deviceRowId }),
+            })
+            : { ok: true })
+        : await saveThreshold({ kind: 'temp-change', host: currentDevice, code: null, warn: null, crit: null,
+            enabled: false, note: 'change from normal off for this device' });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        box.checked = !want;
+        $('tempchange-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('tempchange-msg').textContent = want
+        ? 'ON - its room-following temperatures are judged against their week from the next scan'
+        : 'OFF - its temperatures take no part, alone or in its room; a sensor included on its card still does';
+    await showDevice(currentDevice);
+});
+
+$('dev-tempchange-fleet').addEventListener('click', async () => {
+    if (currentDevice === null || lastTempChange === null) return;
+    const tc = lastTempChange;
+    const want = !(tc.singleOn || tc.roomOn);
+    if (!window.confirm(want
+        ? 'Turn change from normal on for every device - one sensor against its week, and rooms together?'
+        : 'Turn change from normal off for every device - one sensor and rooms? A sensor or device given its own setting keeps it.')) return;
+    // On is the default: on drops the fleet rows; off writes them.
+    const steps = want
+        ? [tc.singleRowId, tc.roomRowId].filter((id) => id).map((id) => () => api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
+        }))
+        : ['temp-change', 'temp-room'].map((kind) => () => saveThreshold({ kind, host: null, code: null, warn: null, crit: null,
+            enabled: false, note: 'change from normal off for every device' }));
+    let r = { ok: true };
+    for (const step of steps) {
+        r = await step();
+        if (r.status === 401) { showLogin(); return; }
+        if (!r.ok) break;
+    }
+    $('tempchange-msg').textContent = r.ok
+        ? (want ? 'ON for every device without its own setting' : 'OFF for every device without its own setting')
+        : (r.detail || `refused (${r.status})`);
+    await showDevice(currentDevice);
+});
 
 let lastSnmpRtt = null;
 let lastAvailability = null;
@@ -2735,6 +3040,15 @@ let lastIfRuleDefaults = null;
 // The device's own link-down setting, from /api/device (2026-10-02):
 // { source, muted, deviceRowId }, null when the server could not resolve it.
 let lastLinkDown = null;
+// Slice 62, from /api/device: whether restart alerts are on for the device
+// on screen ({ on, source, fleetOn, deviceRowId, fleetRowId }, null when the
+// server could not resolve it), and its restarts, newest first.
+let lastRestartAlerts = null;
+let lastRestarts = null;
+// Slice 65, from /api/device: the device's change-from-normal row and the
+// fleet's two switches ({ deviceOff, deviceRowId, singleOn, roomOn,
+// singleRowId, roomRowId, minHours }, null when unresolved).
+let lastTempChange = null;
 
 /** Manual link-down: this device's own row mutes link down for every port
  *  without one, and a port alerts only once turned on. */
@@ -2993,11 +3307,9 @@ function renderDeviceAlerts() {
         const val = cell(fmtValue(a.value, a.unit), 'num');
         if (a.severity === 'crit') val.classList.add('cell-crit');
         else if (a.severity === 'warn') val.classList.add('cell-warn');
-        const progress = stateProgress(a);
         const row = rowEl([
             pill(a.severity, `sev ${a.severity}`),
-            a.state === 'active' ? cell('')
-                : pill(progress === '' ? a.state : `${a.state} ${progress}`, `sev ${a.state}`),
+            alertStateCell(a),
             cell(a.label),
             val,
             cell(fmtValue(a.threshold, a.unit), 'num'),
@@ -3017,7 +3329,9 @@ function renderEntities(data) {
     // half-typed edit - so the cycle is skipped, not the edit. The next
     // cycle lands after the form is gone. This also covers the threshold
     // gear, which had the same latent wipe since it shipped.
-    if (document.querySelector('#entities input, #sensor-cards .th-form')) return;
+    // The table BODY's inputs (a speed being typed): the header's "hide
+    // untracked" box is an input too, and is not an edit in progress.
+    if (document.querySelector('#entities tbody input, #sensor-cards .th-form')) return;
     if (data) {
         lastEntities = data.entities || [];
         lastEntitiesCapped = data.entitiesCapped === true;
@@ -3027,6 +3341,12 @@ function renderEntities(data) {
         lastIfRuleDefaults = data.ifRuleDefaults ?? null;
         lastLinkDown = data.linkDown ?? null;
         syncLinkDownControl();
+        lastRestartAlerts = data.restartAlerts ?? null;
+        lastRestarts = data.restarts ?? null;
+        syncRestartControl();
+        renderRestarts();
+        lastTempChange = data.tempChange ?? null;
+        syncTempChangeControl();
     }
 
     // THE SPLIT on kind (sensors slice): sensors become the cards above the
@@ -3042,7 +3362,12 @@ function renderEntities(data) {
 
     const canTrack = can('device.track');
     const q = $('entity-filter').value.trim().toLowerCase();
-    const rows = lastEntities.filter((e) => !e.kind || e.kind === 'if').filter((e) => q === ''
+    // HIDE UNTRACKED (2026-10-16, operator): offered when there is one to
+    // hide, remembered per browser, and counted below like the filter is.
+    const ifs = lastEntities.filter((e) => !e.kind || e.kind === 'if');
+    $('hide-untracked-ifs-label').classList.toggle('hidden', !ifs.some((e) => !e.tracked));
+    const hideIfs = $('hide-untracked-ifs').checked;
+    const rows = ifs.filter((e) => !hideIfs || e.tracked).filter((e) => q === ''
         || String(e.name ?? '').toLowerCase().includes(q)
         || String(e.alias ?? '').toLowerCase().includes(q)
         || String(e.descr ?? '').toLowerCase().includes(q));
@@ -3404,6 +3729,15 @@ function renderDeviceHeader() {
         m.title = 'alerts muted: down, interfaces and sensors raise nothing on this device - its syslog and trap rules still alert';
         badges.appendChild(m);
     }
+    // The address it is polled and pinged at (2026-10-16): the port only
+    // when SNMP is on and it is not 161 - the lab's mock fleets share one
+    // address and differ by port alone.
+    const addr = $('device-address');
+    addr.textContent = !d?.host ? ''
+        : d.snmp_enabled !== false && d.snmp_port && d.snmp_port !== 161 ? `${d.host}:${d.snmp_port}` : d.host;
+    addr.title = d?.snmp_enabled === false ? 'the address RSCanvas pings (SNMP is off for this device)'
+        : 'the address RSCanvas polls and pings';
+    $('device-logs').classList.toggle('hidden', !d?.host || !can('syslog.read'));
     const grp = $('device-grouping');
     grp.replaceChildren();
     for (const [label, value] of [['location', d?.location], ['application', d?.application]]) {
@@ -3460,6 +3794,10 @@ async function showDevice(name) {
     const known = lastDevices.find((d) => d.name === name);
     $('dev-location').value = known?.location ?? '';
     $('dev-application').value = known?.application ?? '';
+    // Slice 64: the notes box starts from what is saved, on arrival only -
+    // the 10s refresh never writes over what someone is typing.
+    if (arriving) { $('dev-notes').value = known?.notes ?? ''; $('notes-msg').textContent = ''; }
+    renderDeviceNotes();
     $('dev-transient').checked = known?.transient === true;
     $('transient-msg').textContent = '';
     $('dev-muted').checked = known?.alerts_muted === true;
@@ -3468,6 +3806,12 @@ async function showDevice(name) {
     // unknown, not the previous device's. Its message survives a refresh of
     // the same device, which is what follows a toggle.
     if (arriving) { lastLinkDown = null; $('linkdown-msg').textContent = ''; syncLinkDownControl(); }
+    if (arriving) {
+        lastRestartAlerts = null; lastRestarts = null; $('restart-msg').textContent = '';
+        syncRestartControl(); renderRestarts();
+        lastTempChange = null; $('tempchange-msg').textContent = ''; syncTempChangeControl();
+        openCardSettings.clear();
+    }
     if (arriving) setDeviceEditOpen(deviceEditRemembered());
     renderDeviceHeader();
     $('grouping-msg').textContent = '';
@@ -3495,6 +3839,14 @@ async function showDevice(name) {
     renderDeviceMaint();
     renderDeviceAlerts();
     freshenShown();
+    // The timeline is the device's own: a new device starts from its own
+    // newest rows, folded, never under the last device's.
+    if (arriving) {
+        lastTimeline = null;
+        timelineAll = false;
+        renderTimeline();
+        loadTimeline(true).catch(() => {});
+    }
     const r = await api(`/api/device?name=${encodeURIComponent(name)}`);
     if (r.status === 401) { showLogin(); return; }
     if (currentDevice !== name) return;
@@ -3615,6 +3967,37 @@ $('grouping-form').addEventListener('submit', async (e) => {
     }
 });
 
+// --- notes (slice 64) -------------------------------------------------------------
+//
+// The operator's free text about the device on screen, from its roster row,
+// as written: textContent into a pre-wrap block, so lines and spacing stay
+// and nothing in it is markup.
+function renderDeviceNotes() {
+    const known = currentDevice === null ? null : lastDevices.find((d) => d.name === currentDevice);
+    const notes = known?.notes ?? '';
+    $('device-notes').classList.toggle('hidden', notes === '');
+    $('device-notes-text').textContent = notes;
+}
+
+$('notes-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (currentDevice === null) return;
+    const name = currentDevice;
+    const r = await api('/api/device/notes', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, notes: $('dev-notes').value }),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('notes-msg').textContent = r.detail || `refused (${r.status})`; return; }
+    // The server's text, not the box's: it trims the end and folds line
+    // endings, and the box should hold what is stored.
+    if (currentDevice === name) $('dev-notes').value = r.notes ?? '';
+    $('notes-msg').textContent = r.notes ? 'saved' : 'cleared';
+    const d = await api('/api/devices');
+    if (d.ok) renderDevices(d);
+    renderDeviceNotes();
+});
+
 // Slice 25 quiet 2: the transient declaration, saved the moment it is made.
 // A checkbox with a separate Save button invites the half-saved state; the
 // change event IS the declaration. Flipping it on an alerting device is the
@@ -3707,6 +4090,257 @@ $('dev-linkdown-manual').addEventListener('change', async () => {
     await showDevice(currentDevice);
 });
 
+// RESTART ALERTS for the device on screen (slice 62): the checkbox is what
+// applies to THIS device; the button is the fleet-wide rule. Both are
+// override rows, saved on toggle like the boxes above, and the device's own
+// row is dropped rather than kept when it would only repeat the fleet's.
+function syncRestartControl() {
+    const ra = lastRestartAlerts;
+    const box = $('dev-restart-alerts');
+    box.checked = ra?.on === true;
+    box.disabled = ra === null;
+    const fleet = $('dev-restart-fleet');
+    fleet.classList.toggle('hidden', ra === null);
+    fleet.textContent = ra?.fleetOn ? 'turn off for every device' : 'turn on for every device';
+    const known = lastDevices.find((d) => d.name === currentDevice);
+    if (ra !== null && known?.transient === true) {
+        $('restart-msg').textContent = 'this device is transient - its restarts are listed, and never raise';
+    }
+}
+
+/** The device's restarts, newest first; hidden when there are none. */
+function renderRestarts() {
+    const el = $('device-restarts');
+    el.replaceChildren();
+    const list = lastRestarts || [];
+    el.classList.toggle('hidden', list.length === 0);
+    if (list.length === 0) return;
+    const head = document.createElement('div');
+    head.className = 'muted';
+    head.textContent = `restarts of the device or its SNMP agent, newest first (${list.length} shown):`;
+    el.appendChild(head);
+    for (const r of list) {
+        // "At least": the uptime is what the last poll before it read, and
+        // the device ran on for some part of the gap after that.
+        el.appendChild(factLine(fmtWhen(r.boot_ts), `${fmtAgo(r.boot_ts)}, after at least ${fmtRuntime(r.up_before_s)} up`
+            + (r.planned ? ' - inside a maintenance window, so it raised nothing' : '')));
+    }
+}
+
+$('dev-restart-alerts').addEventListener('change', async () => {
+    if (currentDevice === null || lastRestartAlerts === null) return;
+    const box = $('dev-restart-alerts');
+    const want = box.checked;
+    const ra = lastRestartAlerts;
+    let r;
+    if (want === ra.fleetOn) {
+        // The fleet already says this: this device's own row would only
+        // repeat it, so drop it (or there is nothing to do).
+        r = ra.deviceRowId
+            ? await api('/api/thresholds/delete', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id: ra.deviceRowId }),
+            })
+            : { ok: true };
+    } else {
+        r = await saveThreshold({ kind: 'reboot', host: currentDevice, code: null, warn: null, crit: null,
+            enabled: want, note: want ? 'restart alerts on' : 'restart alerts off' });
+    }
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        box.checked = !want;   // the change did not take
+        $('restart-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('restart-msg').textContent = want
+        ? 'ON - a restart from now on raises a warn for 30 minutes'
+        : 'OFF - restarts are still recorded and listed, and raise nothing';
+    await showDevice(currentDevice);
+});
+
+$('dev-restart-fleet').addEventListener('click', async () => {
+    if (currentDevice === null || lastRestartAlerts === null) return;
+    const ra = lastRestartAlerts;
+    const want = !ra.fleetOn;
+    if (!window.confirm(want
+        ? 'Turn restart alerts on for every device? A device given its own setting here keeps it.'
+        : 'Turn restart alerts off for every device? A device turned on here keeps its own setting.')) return;
+    const r = !want && ra.fleetRowId
+        ? await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: ra.fleetRowId }),
+        })
+        : await saveThreshold({ kind: 'reboot', host: null, code: null, warn: null, crit: null,
+            enabled: want, note: want ? 'restart alerts on for every device' : 'restart alerts off for every device' });
+    if (r.status === 401) { showLogin(); return; }
+    $('restart-msg').textContent = r.ok
+        ? (want ? 'ON for every device without its own setting' : 'OFF for every device without its own setting')
+        : (r.detail || `refused (${r.status})`);
+    await showDevice(currentDevice);
+});
+
+// --- the device timeline (IDEAS-2026-10-15 item 4) ------------------------------
+//
+// What happened to the device on screen, newest first, from /api/device/
+// timeline: its alerts, ping changes, restarts and maintenance, and for an
+// admin the changes people made. Each row opens the logs the device sent
+// around that moment. Rows sit side by side; the page never says one caused
+// another - "a config change, then the link went down forty seconds later"
+// is the operator's sentence to write, and this is where they read it.
+
+/** The answer for the device on screen, when it was fetched, and whether
+ *  the list is unfolded past its newest TIMELINE_SHOWN rows. */
+let lastTimeline = null;
+let timelineAt = 0;
+let timelineAll = false;
+const TIMELINE_SHOWN = 15;
+const TIMELINE_REFRESH_MS = 60_000;
+
+async function loadTimeline(force = false) {
+    const name = currentDevice;
+    if (name === null) return;
+    const hours = Number($('timeline-range').value) || 24;
+    if (!force && lastTimeline?.device === name && lastTimeline?.hours === hours
+        && Date.now() - timelineAt < TIMELINE_REFRESH_MS) return;
+    timelineAt = Date.now();
+    const r = await api(`/api/device/timeline?name=${encodeURIComponent(name)}&hours=${hours}`);
+    // A late answer for a device or a range already left is dropped.
+    if (currentDevice !== name || (Number($('timeline-range').value) || 24) !== hours) return;
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { $('timeline-msg').textContent = r.detail || `could not load (${r.status})`; return; }
+    $('timeline-msg').textContent = '';
+    lastTimeline = r;
+    renderTimeline();
+}
+
+/** One row's two phrases - what happened, and the detail - as text. */
+function timelineWords(e) {
+    const d = e.data || {};
+    switch (e.kind) {
+        case 'alert-raise': return [`${e.severity || ''} raised`, e.text || ''];
+        case 'alert-escalate': return ['escalated to crit', e.text || ''];
+        case 'alert-clear': return ['cleared', `${e.text || ''}${d.reason ? ` (${d.reason})` : ''}`];
+        case 'alert-ack': return ['acknowledged', `${e.text || ''} - by ${d.by || 'someone'}${d.note ? `: ${d.note}` : ''}`];
+        case 'reach': return [`ping ${d.from} to ${d.to}`, d.rtt != null ? `${Number(d.rtt).toFixed(1)} ms` : ''];
+        case 'restart': return ['restarted', `the device or its SNMP agent, after at least ${fmtRuntime(d.upBefore)} up`
+            + (d.planned ? ' - inside a maintenance window, so it raised nothing' : '')];
+        case 'maintenance': return [d.repeating ? 'repeating window' : 'maintenance window',
+            `until ${fmtWhen(e.until)}`
+            + (d.scope && d.scope !== 'device' ? ` (${d.scope === 'all' ? 'everything' : `${d.scope} ${d.target}`})` : '')
+            + (e.text ? ` - ${e.text}` : '') + (d.by ? `, by ${d.by}` : '')];
+        case 'audit': return [String(d.action || 'change'), `${e.text || ''}${d.by ? ` - by ${d.by}` : ''}`];
+        default: return [e.kind, e.text || ''];
+    }
+}
+
+function renderTimeline() {
+    const tbody = $('device-timeline').querySelector('tbody');
+    tbody.replaceChildren();
+    const tl = lastTimeline;
+    const events = tl?.events || [];
+    const shown = timelineAll ? events : events.slice(0, TIMELINE_SHOWN);
+    const addr = currentDevice === null ? null : deviceAddress(currentDevice);
+    const logsOk = addr !== null && can('syslog.read');
+    for (const e of shown) {
+        const [what, detail] = timelineWords(e);
+        const ms = Date.parse(e.ts);
+        const when = cell(fmtWhen(e.ts));
+        when.title = fmtAgo(e.ts);
+        const whatCell = e.kind === 'alert-raise' ? pill(what, `sev ${e.severity}`) : cell(what);
+        const logsCell = cell('');
+        if (logsOk) {
+            const l = document.createElement('a');
+            l.href = '#';
+            l.textContent = 'logs';
+            l.title = `messages and traps from ${addr} around this`;
+            // A window's logs run its whole length; any other row's, the
+            // ten minutes before it and five after.
+            const endMs = e.kind === 'maintenance' && e.until ? Date.parse(e.until) : ms;
+            l.addEventListener('click', (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                openLogs(addr, ms - LOGS_BEFORE_MS, Math.min(Date.now(), endMs + LOGS_AFTER_MS));
+            });
+            logsCell.appendChild(l);
+        }
+        const row = rowEl([when, whatCell, cell(detail), logsCell]);
+        // An alert's row opens the alert, which carries the rest of it.
+        if (e.kind.startsWith('alert-') && e.ref) {
+            row.className = 'clickable';
+            row.title = 'open this alert';
+            row.addEventListener('click', () => { showSection('alerts'); showAlert(e.ref); });
+        }
+        tbody.appendChild(row);
+    }
+    const loaded = tl !== null && tl.device === currentDevice;
+    $('device-timeline').classList.toggle('hidden', events.length === 0);
+    const range = $('timeline-range').selectedOptions[0]?.textContent ?? '';
+    $('timeline-empty').classList.toggle('hidden', !loaded || events.length > 0);
+    $('timeline-empty').textContent = loaded && events.length === 0
+        ? `nothing recorded for this device in the last ${range} - no alerts, ping changes, restarts or maintenance` : '';
+    // "2 events in the last 24 hours" (2026-10-16, operator): not all of
+    // them are alerts, and the count is of the range chosen just below.
+    $('timeline-title').textContent = !loaded ? `Events in the last ${range}`
+        : `${events.length} event${events.length === 1 ? '' : 's'} in the last ${range}`;
+    $('timeline-sub').textContent = !loaded ? 'loading...'
+        : (tl.capped ? '(the newest only)' : '')
+            + (tl.audit ? '' : `${tl.capped ? ' - ' : ''}changes people made show to admins`);
+    const more = events.length - TIMELINE_SHOWN;
+    $('timeline-more').classList.toggle('hidden', more <= 0);
+    $('timeline-all').textContent = timelineAll ? 'show the newest only' : `show all ${events.length}`;
+}
+
+$('timeline-range').addEventListener('change', () => {
+    timelineAll = false;
+    lastTimeline = null;
+    renderTimeline();
+    loadTimeline(true).catch(() => {});
+});
+$('timeline-all').addEventListener('click', () => { timelineAll = !timelineAll; renderTimeline(); });
+$('device-logs').addEventListener('click', () => {
+    const addr = currentDevice === null ? null : deviceAddress(currentDevice);
+    if (addr !== null) openLogs(addr);
+});
+
+/**
+ * The timeline drawn on a chart: restarts and ping changes as dotted
+ * markers, the charted entity's own alerts and the device-level ones
+ * (device down, restart) as dashed, maintenance as a band. Other entities'
+ * alerts stay off - an interface chart that marks every sensor's breach
+ * says nothing about the interface.
+ */
+const DEVICE_LEVEL_ALERTS = new Set(['device-down', 'reboot']);
+function chartMarks(tl, code) {
+    const markers = [];
+    const bands = [];
+    if (!tl || !tl.ok) return { markers, bands };
+    for (const e of tl.events || []) {
+        const t = Date.parse(e.ts) / 1000;
+        const d = e.data || {};
+        if (e.kind === 'restart') {
+            markers.push({ t, cls: 'restart', label: 'restarted (device or SNMP agent)' });
+        } else if (e.kind === 'reach' && (d.to === 'down' || d.to === 'up')) {
+            markers.push({ t, cls: d.to, label: `ping ${d.from} to ${d.to}` });
+        } else if ((e.kind === 'alert-raise' || e.kind === 'alert-clear')
+            && ((code && d.code === code) || DEVICE_LEVEL_ALERTS.has(d.alertKind))) {
+            markers.push({ t, cls: e.kind === 'alert-raise' ? 'raise' : 'clear',
+                label: `${e.kind === 'alert-raise' ? 'raised' : 'cleared'}: ${e.text || ''}` });
+        } else if (e.kind === 'maintenance' && e.until) {
+            bands.push({ from: t, to: Date.parse(e.until) / 1000,
+                label: d.repeating ? 'in a repeating maintenance window' : 'in a maintenance window' });
+        }
+    }
+    return { markers, bands };
+}
+
+/** The device's timeline for a chart's range, or null - garnish: a chart
+ *  never waits on it failing. */
+function chartTimeline(hours) {
+    if (currentDevice === null) return Promise.resolve(null);
+    return api(`/api/device/timeline?name=${encodeURIComponent(currentDevice)}&hours=${Math.min(720, hours)}`)
+        .catch(() => null);
+}
+
 $('device-back').addEventListener('click', showRoster);
 $('device-filter').addEventListener('input', () => renderDevices(null));
 $('device-scope').addEventListener('change', () => { deviceSort = null; renderDevices(null); });
@@ -3780,8 +4414,36 @@ function renderMaint() {
             c,
         ]));
     }
-    $('no-maint').classList.toggle('hidden', maintData.length > 0);
-    $('maint-table').classList.toggle('hidden', maintData.length === 0);
+    // Repeating windows: the sentence that names one, in its own zone, and
+    // the occurrence open now (until when) or the next one.
+    for (const s of maintSchedules) {
+        const c = cell('');
+        if (can('alert.suppress')) {
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.textContent = 'Remove';
+            remove.addEventListener('click', async () => {
+                const r = await api(`/api/maintenance?schedule=${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+                $('maint-msg').textContent = r.ok
+                    ? 'repeating window removed - suppressed alerts still active are delivered on the next pass'
+                    : (r.detail || `refused (${r.status})`);
+                refresh();
+            });
+            c.appendChild(remove);
+        }
+        tbody.appendChild(rowEl([
+            pill(s.active ? 'active' : 'repeats', s.active ? 'badge maint' : 'badge'),
+            cell(`${s.scope}: ${s.target}`),
+            cell(`${s.summary} (${s.tz})`),
+            cell(s.next_starts === null ? '' : s.active ? fmtWhen(s.next_ends) : `next ${fmtWhen(s.next_starts)}`),
+            cell(s.note ?? '', 'muted'),
+            cell(s.created_by ?? '', 'muted'),
+            c,
+        ]));
+    }
+    const none = maintData.length === 0 && maintSchedules.length === 0;
+    $('no-maint').classList.toggle('hidden', !none);
+    $('maint-table').classList.toggle('hidden', none);
     renderDeviceMaint();
 }
 
@@ -3790,6 +4452,7 @@ function renderDeviceMaint() {
     const box = $('dev-maint');
     const d = lastDevices.find((x) => x.name === currentDevice);
     const mine = d ? maintData.filter((w) => windowMatches(w, d)) : [];
+    const repeating = d ? maintSchedules.filter((s) => windowMatches(s, d)) : [];
     box.replaceChildren();
     for (const w of mine) {
         const line = document.createElement('div');
@@ -3798,7 +4461,15 @@ function renderDeviceMaint() {
             + ` (${what}) until ${fmtWhen(w.ends_ts)}${w.note ? ` - ${w.note}` : ''}`;
         box.appendChild(line);
     }
-    box.classList.toggle('hidden', mine.length === 0);
+    for (const s of repeating) {
+        const line = document.createElement('div');
+        const note = s.note ? ` - ${s.note}` : '';
+        line.textContent = s.active
+            ? `IN MAINTENANCE (${s.scope} ${s.target}, ${s.summary}) until ${fmtWhen(s.next_ends)}${note}`
+            : `maintenance repeats (${s.scope} ${s.target}): ${s.summary}, ${s.tz}${note}`;
+        box.appendChild(line);
+    }
+    box.classList.toggle('hidden', mine.length === 0 && repeating.length === 0);
 }
 
 // The verbatim-typing complaint (2026-08-27): group fields now SUGGEST the
@@ -3911,20 +4582,44 @@ $('policy-form').addEventListener('submit', async (e) => {
     if (r.ok) { $('policy-target').value = ''; $('policy-note').value = ''; refresh(); }
 });
 
+// The repeat choice (slice 61): '' is a one-shot window from now; anything
+// else is the weekdays of a repeating one, opened at a local time in the
+// browser's own zone - the clock the operator is reading when they type it.
+function repeatPayload(selectId, atId, minutes) {
+    const days = $(selectId).value;
+    if (days === '') return undefined;
+    return {
+        days: days.split(',').map(Number), at: $(atId).value, minutes,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    };
+}
+function wireRepeat(selectId, wrapId, buttonId, onceLabel) {
+    const sync = () => {
+        const repeating = $(selectId).value !== '';
+        $(wrapId).classList.toggle('hidden', !repeating);
+        $(buttonId).textContent = repeating ? 'Add repeating window' : onceLabel;
+    };
+    $(selectId).addEventListener('change', sync);
+    sync();
+}
+wireRepeat('maint-repeat', 'maint-at-wrap', 'maint-go', 'Open window');
+wireRepeat('dev-maint-repeat', 'dev-maint-at-wrap', 'dev-maint-go', 'Start window');
+
 $('maint-dev-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (currentDevice === null) return;
     const minutes = Number($('dev-maint-min').value);
     const note = $('dev-maint-note').value.trim();
+    const repeat = repeatPayload('dev-maint-repeat', 'dev-maint-at', minutes);
     const r = await api('/api/maintenance', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ scope: 'device', target: currentDevice, minutes,
+        body: JSON.stringify({ scope: 'device', target: currentDevice, minutes, repeat,
             note: note === '' ? undefined : note }),
     });
     if (r.status === 401) { showLogin(); return; }
-    $('maint-dev-msg').textContent = r.ok
-        ? `window open until ${fmtWhen(r.ends)} - alerts raise but do not page`
-        : (r.detail || `refused (${r.status})`);
+    $('maint-dev-msg').textContent = !r.ok ? (r.detail || `refused (${r.status})`)
+        : r.schedule ? `repeating window added: ${r.summary} (${r.tz}) - alerts raise but do not page while it is open`
+            : `window open until ${fmtWhen(r.ends)} - alerts raise but do not page`;
     if (r.ok) { $('dev-maint-note').value = ''; refresh(); }
 });
 
@@ -3934,15 +4629,16 @@ $('maint-form').addEventListener('submit', async (e) => {
     const target = $('maint-target').value.trim();
     const minutes = Number($('maint-min').value);
     const note = $('maint-note').value.trim();
+    const repeat = repeatPayload('maint-repeat', 'maint-at', minutes);
     const r = await api('/api/maintenance', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ scope, target: scope === 'all' ? undefined : target,
-            minutes, note: note === '' ? undefined : note }),
+            minutes, repeat, note: note === '' ? undefined : note }),
     });
     if (r.status === 401) { showLogin(); return; }
-    $('maint-msg').textContent = r.ok
-        ? `window open until ${fmtWhen(r.ends)}`
-        : (r.detail || `refused (${r.status})`);
+    $('maint-msg').textContent = !r.ok ? (r.detail || `refused (${r.status})`)
+        : r.schedule ? `repeating window added: ${r.summary} (${r.tz})`
+            : `window open until ${fmtWhen(r.ends)}`;
     if (r.ok) { $('maint-target').value = ''; $('maint-note').value = ''; refresh(); }
 });
 
@@ -4347,6 +5043,53 @@ async function runSearch(ev) {
 }
 
 $('search-form').addEventListener('submit', runSearch);
+
+/** A datetime-local value for an instant, in the browser's own zone. */
+function localInput(ms) {
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
+ * LOGS FOR A DEVICE AROUND A MOMENT (IDEAS-2026-10-15 item 4). Section 3 of
+ * the digest designed search around exactly this - an alert "roughly knows
+ * when and usually knows which device" - and until now that was typed by
+ * hand. BY SOURCE ADDRESS, not by host: the address is the device's own
+ * and indexed beside the time (messages_source_ip_idx), where the host is
+ * whatever the sender calls itself. The filter lands in the field panel,
+ * where the note under it says it is active, so a device that logs from
+ * another address is one edit away. fromMs null means the last hour.
+ *
+ * The search starts BEFORE the section shows: showSection('search') opens
+ * on the newest messages until someone has searched, and this is a search.
+ */
+function openLogs(address, fromMs = null, toMs = null) {
+    $('q').value = '';
+    for (const [id] of FIELDS) $(id).value = '';
+    $('f-ip').value = address;
+    if (fromMs === null || toMs === null) {
+        $('hours').value = '1';
+    } else {
+        $('hours').value = 'custom';
+        $('from').value = localInput(fromMs);
+        // Rounded UP to the minute: datetime-local has no seconds here, and
+        // cutting the end short would drop the last moments asked for.
+        $('to').value = localInput(toMs + 59_999);
+    }
+    $('custom-window').classList.toggle('hidden', $('hours').value !== 'custom');
+    fieldsNote();
+    runSearch();
+    showSection('search');
+}
+
+/** The address a device's logs arrive from, when the roster knows it. */
+function deviceAddress(name) {
+    return lastDevices.find((d) => d.name === name)?.host ?? null;
+}
+/** "Around" a moment: ten minutes before, five after - what led up to it. */
+const LOGS_BEFORE_MS = 10 * 60_000;
+const LOGS_AFTER_MS = 5 * 60_000;
 
 // --- export -------------------------------------------------------------------
 //
@@ -4923,9 +5666,16 @@ function showSection(name) {
         renderDashAlerts();
         loadDashGroups();
         loadDashServices();
+        if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
+    }
+    // Reports (2026-10-16): the interface report's device list and chips,
+    // and the service checks the services report picks from - the same
+    // list the Dashboard's service health reads, fetched here too because
+    // a deep link can open the page without the Dashboard ever showing.
+    if (name === 'reports') {
         fillReportDevices();
         syncReportControls();
-        if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
+        loadDashServices();
     }
     // The rules live on System now; re-read them on each visit so an edit
     // made in another tab, or a rule the ingest worker disarmed, shows up.
@@ -5774,6 +6524,122 @@ $('svc-report-run').addEventListener('click', async () => {
         : `${r.from} to ${r.to} (${r.tz})${through ? `, complete hours through ${through}` : ''}`
             + `${(r.missing || []).length ? ` - ${r.missing.length} check(s) had nothing in range` : ''}`;
 });
+
+// --- the availability report (IDEAS-2026-10-15 item 8) --------------------------
+//
+// Every device probed in the period, or pooled by location or application,
+// worst first, from /api/report/availability (src/reports/availability.ts
+// holds the arithmetic and says what each column measures).
+
+function availRange() {
+    return periodRange('avail-period', 'avail-from', 'avail-to');
+}
+
+function availQuery(format) {
+    const range = availRange();
+    if (range === null) return null;
+    const q = new URLSearchParams({
+        group: $('avail-group').value, from: range[0], to: range[1],
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    });
+    if (format) q.set('format', format);
+    return q.toString();
+}
+
+function syncAvailControls() {
+    const custom = $('avail-period').value === 'custom';
+    $('avail-from').classList.toggle('hidden', !custom);
+    $('avail-to').classList.toggle('hidden', !custom);
+    const q = availQuery('csv');
+    const link = $('avail-csv');
+    link.classList.toggle('hidden', q === null);
+    if (q !== null) {
+        link.href = `/api/report/availability?${q}`;
+        const range = availRange();
+        link.download = `rscanvas-availability-${$('avail-group').value}-${range[0]}-to-${range[1]}.csv`;
+    }
+}
+for (const id of ['avail-group', 'avail-period', 'avail-from', 'avail-to']) {
+    $(id).addEventListener('change', syncAvailControls);
+}
+
+/** A share to the precision that tells availabilities apart: 99.931%, not 99.9%. */
+function fmtAvail(p) {
+    if (p === null || p === undefined) return '';
+    if (p >= 100) return '100%';
+    return `${p.toFixed(p >= 99 ? 3 : 1)}%`;
+}
+/** A duration; blank for none, so a quiet column stays quiet. */
+function fmtDown(s) {
+    if (!s || s <= 0) return '';
+    return s < 60 ? `${Math.round(s)}s` : fmtRuntime(s);
+}
+
+$('avail-run').addEventListener('click', async () => {
+    const q = availQuery(null);
+    const msg = $('avail-msg');
+    if (q === null) { msg.textContent = 'choose both dates'; return; }
+    msg.textContent = 'running...';
+    const r = await api(`/api/report/availability?${q}`);
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { msg.textContent = r.detail || `refused (${r.status})`; return; }
+    const byDevice = r.group === 'device';
+    const head = $('avail-table').querySelector('thead tr');
+    head.replaceChildren();
+    const cols = [
+        ...(byDevice ? [['device', false], ['location', false], ['application', false]]
+            : [[r.group, false], ['devices', true]]),
+        ['availability', true], ['measured', true], ['outages', true], ['longest', true],
+        ['down', true], ['blips', true], ['in maintenance', true],
+    ];
+    for (const [label, isNum] of cols) {
+        const th = document.createElement('th');
+        th.textContent = label;
+        if (isNum) th.className = 'num';
+        head.appendChild(th);
+    }
+    const tbody = $('avail-table').querySelector('tbody');
+    tbody.replaceChildren();
+    for (const l of r.lines || []) {
+        // Under 99.9% a month is about 45 minutes down; under 99% seven
+        // hours. Marked, never hidden - every device is on the list.
+        const pct = cell(fmtAvail(l.pct), 'num');
+        if (l.pct !== null && l.pct < 99) pct.classList.add('cell-crit');
+        else if (l.pct !== null && l.pct < 99.9) pct.classList.add('cell-warn');
+        const measured = cell(l.measuredPct === null ? '' : `${l.measuredPct.toFixed(l.measuredPct >= 99.95 ? 0 : 1)}%`, 'num');
+        if (l.measuredPct !== null && l.measuredPct < 95) measured.title = 'RSCanvas was not probing for part of this period';
+        const maint = cell(fmtDown(l.plannedDownS), 'num');
+        if (l.plannedProbes > 0) maint.title = `${l.plannedProbes} ping(s) in maintenance, left out of the availability`;
+        const cells = [
+            ...(byDevice ? [cell(l.name), cell(l.location ?? ''), cell(l.application ?? '')]
+                : [cell(l.name), cell(String(l.devices), 'num')]),
+            pct, measured,
+            cell(l.outages ? String(l.outages) : '', 'num'),
+            cell(fmtDown(l.longestS), 'num'),
+            cell(fmtDown(l.downS), 'num'),
+            cell(l.blips ? String(l.blips) : '', 'num'),
+            maint,
+        ];
+        const tr = rowEl(cells);
+        if (byDevice) {
+            tr.className = 'clickable';
+            tr.title = 'open this device';
+            tr.addEventListener('click', () => { showSection('devices'); showDevice(l.name); });
+        }
+        tbody.appendChild(tr);
+    }
+    const n = (r.lines || []).length;
+    $('avail-table').classList.toggle('hidden', n === 0);
+    const through = r.through ? new Date(r.through).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+    msg.textContent = r.through === null
+        ? 'the ping history has not been rolled up yet - the first roll-up runs within five minutes of starting'
+        : n === 0 ? 'no device was pinged in this period'
+            : `${r.from} to ${r.to} (${r.tz}), complete hours through ${through} - ${n} `
+                + `${byDevice ? 'device' : r.group}${n === 1 ? '' : 's'}, worst first`
+                + ((r.transient || []).length > 0
+                    ? `; left out as transient (off is their state): ${r.transient.join(', ')}` : '');
+});
+syncAvailControls();
 
 function fillReportDevices() {
     const dl = $('report-devices');
@@ -6780,7 +7646,17 @@ function thresholdControl(s, dev) {
         ev.stopPropagation();   // the card itself opens the history chart
         const card = btn.closest('.card');
         const old = card.querySelector('.th-form');
-        if (old) { old.remove(); return; }
+        const details = card.querySelector('.card-details');
+        // The cog opens and closes the card's settings as one: the rule
+        // line, a temperature's change line, and this form.
+        if (old || openCardSettings.has(s.code)) {
+            old?.remove();
+            details?.classList.add('hidden');
+            openCardSettings.delete(s.code);
+            return;
+        }
+        openCardSettings.add(s.code);
+        details?.classList.remove('hidden');
         const f = document.createElement('form');
         f.className = 'th-form row';
         f.addEventListener('click', (e) => e.stopPropagation());
@@ -7126,7 +8002,7 @@ async function refreshRound(opts) {
     }
     if (devices?.ok) { devicesFetchedAt = now; renderDevices(devices); }
     if (reachEv.ok) renderReachEvents(reachEv);
-    if (maint.ok) { maintData = maint.windows || []; renderMaint(); }
+    if (maint.ok) { maintData = maint.windows || []; maintSchedules = maint.schedules || []; renderMaint(); }
     if (pol.ok) { policyData = pol.policies || []; renderPolicies(); }
     // A drill-down that stops updating while you read it is a screenshot. The
     // roster keeps its data current underneath, and the open device refetches
@@ -7141,6 +8017,8 @@ async function refreshRound(opts) {
         // The mute box follows server truth the same way.
         const mbox = $('dev-muted');
         if (document.activeElement !== mbox && known) mbox.checked = known.alerts_muted === true;
+        // The shown notes follow it too; the edit box does not (see showDevice).
+        renderDeviceNotes();
         // Captured, then re-checked: navigating to another device while this
         // fetch is in flight must not render the old device's interfaces
         // under the new device's title - the same rule showDevice and
@@ -7148,6 +8026,9 @@ async function refreshRound(opts) {
         const name = currentDevice;
         const d = await api(`/api/device?name=${encodeURIComponent(name)}`);
         if (d.ok && gen === refreshGen && currentDevice === name) renderEntities(d);
+        // The timeline rides the refresh at its own pace - once a minute,
+        // not every ten seconds (loadTimeline holds the throttle).
+        loadTimeline().catch(() => {});
     }
     // The same for an open alert - and it matters more here, because the
     // whole point of the counters is watching them move. An alert bouncing

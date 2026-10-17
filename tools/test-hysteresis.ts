@@ -72,15 +72,18 @@ eq('if-discards has NO band, deliberately', insideClearBand('if-discards', 0.1, 
 {
     const want: Record<string, number> = {
         temp: 2, cpu: 5, mem: 3, disk: 3, util: 5, 'if-util': 5, fan: 200, battery: 5,
+        // Slice 65: a sensor's rise over its week, judged against its gate.
+        'temp-change': 1,
     };
     const got = Object.fromEntries(Object.entries(CLEAR_BAND).sort());
-    eq('the band table is EXACTLY its eight decisions, no more and no fewer',
+    eq('the band table is EXACTLY its nine decisions, no more and no fewer',
         got, Object.fromEntries(Object.entries(want).sort()));
     // Kinds the rules emit that carry NO band, each on purpose:
     // device-down / if-down are booleans (a band over true/false is
     // meaningless); if-errors / if-discards are spiky rates awaiting the
-    // flap report's field evidence; event kinds clear by TTL, not by value.
-    for (const kind of ['device-down', 'if-down', 'if-errors', 'if-discards', 'event']) {
+    // flap report's field evidence; event kinds clear by TTL, not by value;
+    // a room's change alert (slice 65) has no single gate to hold a band to.
+    for (const kind of ['device-down', 'if-down', 'if-errors', 'if-discards', 'event', 'temp-room']) {
         eq(`${kind} is a deliberate zero`, insideClearBand(kind, 1, 2), false);
     }
 }

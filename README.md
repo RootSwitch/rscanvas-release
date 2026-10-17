@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.8).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.9).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -97,10 +97,10 @@ so they show the page as the code now draws it.
   CPU and memory, over 6 hours, 24 hours or 7 days, each with its change
   against the window before. Service health by site: the last voice and
   throughput tests against the run before and the day's lowest, and every
-  web and TCP check. An interface traffic report gives GB in and out per
-  day with peaks and coverage, and a services report each check's average,
-  worst and standard deviation per day and over the period - on the page or
-  as CSV.
+  web and TCP check. On the Reports tab, an interface traffic report gives
+  GB in and out per day with peaks and coverage, and a services report each
+  check's average, worst and standard deviation per day and over the
+  period - on the page or as CSV.
 - **Boards and the wall.** Boards generated from the device list by location
   or application - one group, several, or the whole fleet - laid out
   automatically to fit each screen, on a wall display with capability

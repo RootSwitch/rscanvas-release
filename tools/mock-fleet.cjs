@@ -38,6 +38,14 @@
 //                                       (default 10)
 //   SENSOR_STEP_AFTER_S                 seconds after boot before the step
 //                                       (default 300)
+//   SENSOR_STEP_C                       how far a step jumps, in C (default
+//                                       30, the dead fan; 5 is a closet whose
+//                                       AC failed, every sensor in it at once)
+//   TEMP_NAMES    comma-separated names for the temperature rows, cycled
+//                 (default coretemp's "Core N"). Change from normal (slice 65)
+//                 decides by name which sensors follow the room, and every
+//                 coretemp core follows work - so a fleet that is to exercise
+//                 it serves names like SYSTIN or mlx5-pci-0100:sensor0.
 //   SHIFT_INDEXES N   every ifIndex is offset by N while ifName stays put -
 //                     a PCIe re-enumeration. Seed a fleet at 0, restart at N:
 //                     Gi0/1 that was ifIndex 1 now arrives on ifIndex 1+N.
@@ -92,6 +100,8 @@ const SENSOR_MODE = (process.env.SENSOR_MODE || 'drift').toLowerCase();
 const STEP_PCT = int(process.env.SENSOR_STEP_PCT, 10);
 const FLAP_PCT = int(process.env.SENSOR_FLAP_PCT, 10);
 const STEP_AFTER_MS = int(process.env.SENSOR_STEP_AFTER_S, 300) * 1000;
+const STEP_C = int(process.env.SENSOR_STEP_C, 30);
+const TEMP_NAMES = (process.env.TEMP_NAMES || '').split(',').map((x) => x.trim()).filter((x) => x !== '');
 if (!['drift', 'step', 'flap'].includes(SENSOR_MODE)) {
     console.error(`SENSOR_MODE must be drift, step or flap - got ${JSON.stringify(SENSOR_MODE)}`);
     process.exit(2);
@@ -332,7 +342,8 @@ function buildDevice(i) {
             const g = i * TEMPS + t;
             const misbehaves = pct > 0 && (Math.floor(g * pct / 100) !== Math.floor((g - 1) * pct / 100) || (g === 0 && pct > 0));
             temps.push({ idx: t + 1, base, misbehaves, stepped: false });
-            mib.addTableRow('lmTempSensorsTable', [t + 1, `coretemp-isa-0000 Core ${t}`, base * 1000]);
+            const name = TEMP_NAMES.length > 0 ? TEMP_NAMES[t % TEMP_NAMES.length] : `coretemp-isa-0000 Core ${t}`;
+            mib.addTableRow('lmTempSensorsTable', [t + 1, name, base * 1000]);
         }
     }
 
@@ -395,7 +406,7 @@ setInterval(() => {
             let c;
             if (t.misbehaves && SENSOR_MODE === 'step') {
                 if (!t.stepped && sinceStart >= STEP_AFTER_MS) t.stepped = true;
-                c = t.stepped ? t.base + 30 : t.base;
+                c = t.stepped ? t.base + STEP_C : t.base;
             } else if (t.misbehaves && SENSOR_MODE === 'flap') {
                 c = (Math.floor(now / TICK_MS / 3) % 2 === 0) ? 43 : 47;
             } else {
@@ -414,7 +425,7 @@ if (TEMPS > 0) {
     // selection rule - it reads the same list the fleet used.
     const bad = [];
     for (const d of devices) for (const t of d.temps) if (t.misbehaves) bad.push(`${d.port}:${t.idx}`);
-    console.log(`sensor mode: ${SENSOR_MODE}${SENSOR_MODE === 'step' ? ` (+30C at +${STEP_AFTER_MS / 1000}s)` : SENSOR_MODE === 'flap' ? ' (43/47C across warn 45)' : ' (32..40C, never alarms)'}`);
+    console.log(`sensor mode: ${SENSOR_MODE}${SENSOR_MODE === 'step' ? ` (+${STEP_C}C at +${STEP_AFTER_MS / 1000}s)` : SENSOR_MODE === 'flap' ? ' (43/47C across warn 45)' : ' (32..40C, never alarms)'}`);
     // The WHOLE list, one line, however long: this is an answer key and a
     // truncated key scored a harness at 19 misses that were never in it.
     if (bad.length > 0) console.log(`misbehaving sensors (${bad.length}, port:index): ${bad.join(' ')}`);

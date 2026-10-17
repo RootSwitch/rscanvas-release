@@ -147,6 +147,8 @@ console.log('');
         const DEPARTS: Record<string, string> = {
             'device-down/raise': 'the parent said "unreachable or powered off" of a box that still answered '
                 + 'ping (2026-09-28 notification drill); the fork says what failed - the SNMP poll',
+            'reboot/raise': 'the parent said "recently rebooted"; sysUpTime is the AGENT\'s uptime, so the fork '
+                + 'says what is known - the device or its SNMP agent restarted (slice 62)',
         };
         const withoutDetail = (s: string): string => s.split('|').filter((_, i) => i !== 11).join('|');
         let mismatches = 0;

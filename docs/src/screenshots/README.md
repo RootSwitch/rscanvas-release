@@ -12,6 +12,26 @@ its API from `fixture/`, dressed by `dress.mjs` as it is loaded, then photograph
 relative times and window labels read the same on every run. No sign-in is
 involved: the page is told it is an admin and every write is refused.
 
+## Moving to the demo network (2026-10-09)
+
+The next round of pictures comes from the demo network - Canvas Suite's
+company, polled by a real RSCanvas for the online demo - so the README shows
+the NOC board divided by location and the service checks live. Captured by
+rendering the shots THROUGH that instance:
+
+    NODE_TLS_REJECT_UNAUTHORIZED=0 node tools/make-screenshots.mjs --capture https://<instance>:18080
+
+which saves every answer the shots ask for, scrubbed, to `recording/`
+(tools/screenshot-recording.mjs: any private address outside the demo's own
+ranges refuses the capture, and the lab's own names are rewritten by the
+uncommitted tools/screenshots.local.mjs). Once `recording/` exists a plain
+run renders from it, and fails on any request it has no answer for. Eight
+pictures: the Dashboard, its service health, the services report (Branch 2's
+voice test), the GPU server's page, the device list, the traffic report, the
+NOC board and the health page. `--recording DIR` and `--out DIR` render a
+preview elsewhere. Until then, the lab's fixture below still makes the six
+pictures the README has.
+
 ## The fixture
 
 A snapshot of the web API's answers from the 30,000-entity load-test lab,

@@ -454,6 +454,84 @@ export async function dispatchEvent(
     return delivered;
 }
 
+/** An alert as OPS.getAlert reads it: the row and its live gates. */
+export type GatedAlert = AlertRecord & {
+    in_maintenance: boolean; under_policy: boolean; in_group: boolean;
+    group_overlap: boolean; settling: boolean;
+};
+
+/** Why a queued event is not sent, or 'send'. */
+export type QueuedEventVerdict =
+    'send' | 'already-sent' | 'maintenance' | 'policy' | 'group' | 'settling' | 'group-overlap';
+
+/**
+ * Should a QUEUED scan event still go out, given the alert as it stands
+ * NOW? The notify pass (workers/jobs.ts alertNotify) asks this of every
+ * event it drains, before dispatchEvent. Pure, so the whole matrix is
+ * asserted offline (tools/test-notify-orchestration.ts); it lived inline in
+ * the worker, where nothing could test it, until 2026-10-11.
+ *
+ * ALREADY SENT (2026-10-11). The event queue only buys promptness - the
+ * owed queues are the record of what is owed - and an event can be stale
+ * by the time it is drained. The 30-second timer pass and the scan's kick
+ * collide ("alerts:notify: still running from the last tick, skipping"):
+ * the running pass had drained the queue just BEFORE the scan pushed five
+ * clears, its retryPass then delivered those clears from alertsOwingClear,
+ * and the next pass drained the five stale events and sent every clear a
+ * second time - nine duplicate emails on production on 2026-10-10, single
+ * ones going back weeks, and the occasional duplicate raise the same way.
+ * A debt the row already shows as paid is not paid again.
+ *
+ * THE SECOND HALF OF THE MAINTENANCE GATE (slice 22), and the drill
+ * that shipped the first half could not see this one: it inserted
+ * alerts by SQL, so every delivery went through the owed queues,
+ * which are gated in ops.ts. A LIVE raise arrives here first -
+ * dispatched immediately at its true type, before retryPass runs -
+ * and without this check a window suppressed the queue while the
+ * scan's own event stream paged anyway. Skipping leaves every debt
+ * unsettled, and since ruling 1 that sentence covers ESCALATES too:
+ * escalated_ts and notified_escalate open a debt the moment the
+ * scan's batch write records the transition, and
+ * alertsOwingEscalate delivers it when the window closes. SO DO NOT
+ * "FIX" THIS SKIP - dispatching an escalate inside the window is
+ * the one edit that would defeat the gate for exactly the event
+ * type ruling 1 made safe to skip. (Two earlier versions of this
+ * comment were each wrong in turn: the first claimed the scan
+ * re-emits escalates - it never did - and the second claimed a
+ * skipped escalate is lost forever, which ruling 1 had already
+ * fixed by the time the comment landed; AUDIT-2026-09-01 finding 2
+ * called the second "a comment describing a hazard the code no
+ * longer has ... worse than a stale comment, because it argues for
+ * reintroducing it". Renotify has its generator now too, opt-in
+ * via ALERT_RENOTIFY_H.)
+ *
+ * under_policy rides the same gate for the same reason (slice 25):
+ * the live-raise path must consult every filter the owed queues
+ * apply, or a policy quiets the queue while the scan's own event
+ * stream pages anyway.
+ *
+ * And the group gate (slice 55), in both of its forms. A member's
+ * raise (or escalate) while its group alert is open is held - the
+ * owed queue delivers it if the member is still down when the group
+ * clears. A member's CLEAR whose raise was never told, under or
+ * across a group outage, is not told either: settleGroupCoveredClears
+ * waives it on this same pass, and dispatching it here first would
+ * send "resolved" for an incident only the group email named.
+ *
+ * An outside check settling (slice 59) is held the same way: the
+ * owed queue sends it if no outside-services alert forms to name it.
+ */
+export function queuedEventGate(type: 'raise' | 'escalate' | 'clear', a: GatedAlert): QueuedEventVerdict {
+    if ((type === 'raise' && a.notified_raise) || (type === 'escalate' && a.notified_escalate)
+        || (type === 'clear' && a.notified_clear)) return 'already-sent';
+    if (a.in_maintenance) return 'maintenance';
+    if (a.under_policy) return 'policy';
+    if (type !== 'clear' && a.in_group) return 'group';
+    if (type !== 'clear' && a.settling) return 'settling';
+    if (type === 'clear' && !a.notified_raise && a.group_overlap) return 'group-overlap';
+    return 'send';
+}
+
 /** The parent's curve: 60s doubling per failure, capped at 15 minutes. */
 export const backoffS = (attempts: number): number =>
     Math.min(60 * 2 ** Math.max(0, attempts - 1), 900);

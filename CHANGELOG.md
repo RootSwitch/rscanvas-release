@@ -1,5 +1,182 @@
 # Changelog
 
+## 0.1.0-alpha.9 - 2026-10-17
+
+The week the data started answering more of the questions an operator
+asks. RSCanvas notices restarts - from the uptime against the time between
+polls, so even one quicker than a poll is caught - and an alert can be
+acknowledged with a note. A device's page carries its timeline and its
+address, and is a click from its logs; there is an availability report by
+ping, notes on a device, and the reports have a tab of their own.
+Temperatures that follow the room are judged against their own last week,
+alone and as a room, on by default - the rules chosen by replaying a
+production network's own history before any of it was built. Maintenance
+windows can repeat. Built from the public tree on a fresh Linux clone, and
+an alpha.8 install upgraded to it in one step.
+
+### Upgrading
+
+Six schema changes (`sql/slice60.sql` to `sql/slice65.sql`, all
+additive: five tables, three functions and seven columns), applied by the
+installer as usual. After the upgrade:
+- History left by devices deleted before it is found and removed by
+  itself in the hours after - one month of rollup an hour, starting once
+  the rollup is two hours past the upgrade.
+- Restart alerts arrive switched off; the restarts themselves are recorded
+  from the first poll.
+- The availability report's history is built from the month of pings
+  already on disk, four days of them every five minutes, so the report
+  covers that month within the first hour.
+- Change from normal is on from the start. Each temperature's last week is
+  read from the hourly history already kept, a quarter of a minute after
+  the service starts and hourly after, so a sensor with three days of
+  history is judged at once.
+
+### Added
+
+- **Maintenance windows that repeat.** A nightly backup or a daily reboot
+  no longer needs a window made every day: on the device page or on
+  System, choose every day, weekdays, weekends or one weekday, a local time
+  and a length - "every day at 03:00 for 10 min". While an occurrence is
+  open it does what any window does: alerts still raise and show "in
+  maintenance", nobody is paged, and anything still active when it closes
+  is delivered. Each schedule keeps the time zone it was made in, so 03:00
+  stays 03:00 across daylight saving. An occurrence may last up to 12 hours,
+  and a repeating window names a device, location or application, never
+  everything.
+- **Restarts are noticed.** Each poll compares the device's uptime with the
+  last one plus the time between, so a restart is seen even when it was
+  quicker than a poll and never missed a ping, and even when the device was
+  away for an hour and came back with more uptime than before. The device
+  page lists its restarts - when it came back and how long it had been up -
+  and marks one inside a maintenance window. The uptime is the SNMP
+  agent's, so the page and the email say "the device or its SNMP agent".
+  Uptime's own wrap after 497 days is not mistaken for a restart.
+- **Restart alerts, off until you want them.** On the device page, turn
+  them on for that device or for every device. A restart then raises a
+  warn that stays on the Alerts page and walls for 30 minutes and clears
+  without an email. Never for a restart inside a maintenance window, and
+  never for a transient device.
+- **Acknowledging an alert.** On the alert's page, an operator or admin can
+  say "I am on this", with a note - a ticket number, who has it. The alert
+  stays open and visible and clears on its own; what stops is its
+  reminder emails (renotify). The Alerts list and the device page mark it
+  "acked", with who and the note on hover. It can be taken back, every
+  change is in the audit log, and the next incident under the same alert
+  starts unacknowledged. An escalation from warn to crit is still emailed.
+- **A device's timeline.** The device page lists what happened to it,
+  newest first, over the last day, week or month:
+  - its alerts raised, escalated, acknowledged and cleared;
+  - ping lost and back;
+  - restarts;
+  - the maintenance windows and repeating occurrences that covered it;
+  - for an admin, the changes people made to it - thresholds, mutes,
+    renames.
+
+  Alert rows open the alert. The device's charts carry the same moments:
+  restarts and ping changes as dotted lines, the charted item's own alerts
+  and the device's as dashed ones, maintenance as a shaded band, each named
+  on hover.
+- **Logs in one click.** An alert's page links to the logs its device sent
+  in the ten minutes before it was raised, and around its clear. Every
+  timeline row has a link to the logs around it, and the device page opens
+  its last hour. The search is by the device's address, set as a filter
+  you can see and change on the Logs page.
+- **An availability report.** On the Reports tab, for this month, last month,
+  the last 7 or 30 days, or any dates: every device, or pooled by location
+  or application, worst first, on the page or as CSV. By ping alone:
+  - availability is the share of the once-a-minute pings answered, with
+    pings inside a maintenance window left out;
+  - measured says how much of the period RSCanvas was looking;
+  - outages come from the ten-second sweep - down a minute or more is an
+    outage, less is a blip, and time down inside maintenance is counted
+    apart.
+
+  The pings are kept by the hour from now on, so a month stays reportable
+  after the minute-by-minute pings expire. Transient devices are left out
+  and named, since off is their state.
+- **Notes on a device.** Free text on the device page - owner, who to call,
+  asset tag, warranty, where it sits - edited under Modify by operators and
+  admins, shown to everyone, kept as written. The device list's filter box
+  finds a device by its notes, so an asset tag or an owner's name turns it
+  up. Notes never appear on a wall.
+- **A Reports tab.** The interface traffic, services and availability
+  reports moved off the bottom of the Dashboard to a tab of their own,
+  left of System; the Dashboard is what is wrong now and what the fleet
+  did, and ends there.
+- **Quieter sensor cards.** A card's rule line ("alerts MUTED", its own
+  warn and crit) and a temperature's change-from-normal line now fold
+  behind its cog and open with the threshold form. A cog with something
+  set for that sensor or its device is marked, and its tooltip says what;
+  a rule for every sensor of the kind does not mark it. Roles that cannot
+  change rules have no cog and still see both lines.
+- **The device page, tidier.** The address RSCanvas polls and pings now
+  follows the device's name (with its port when that is not 161), instead
+  of only inside Modify. "Logs from this device" moved up beside Modify.
+  The timeline's heading says what it counts - "8 events in the last 24
+  hours" - above its range. And "hide untracked" boxes for the interface
+  table (in its header, above the track buttons) and the sensor cards
+  (above Services), shown when there is something to hide and remembered
+  per browser.
+- **Change from normal, for temperatures - on by default.** A temperature
+  that follows the room is judged against its own last week, not a fixed
+  number, so the failures every threshold misses are seen:
+  - **one sensor** more than three times its usual spread, and at least
+    8 C, above its week's median for 20 minutes raises a warn - a network
+    card whose fan died, 20 C hotter and still under any limit anyone
+    would set for it;
+  - **a room**: three devices in one location (both, in a location of two)
+    each more than 3 C above their week for 10 minutes raise one warn for
+    the location - a closet whose AC failed while every switch in it
+    stayed inside its own limits. The devices' own alerts are held under
+    it, as a group alert holds its members, and a maintenance window or
+    policy on the location covers it.
+
+  Which temperatures follow the room is read from their names: a
+  motherboard sensor, a network card, a spinning disk, a memory module, a
+  switch's chip, an inlet or ambient sensor, a UPS's probes. CPUs, GPUs,
+  NVMe drives and the chipset follow the work instead and take no part.
+  Each temperature's card says which it is, its week and where it stands
+  now, with a button to include or exclude it; the device page turns it
+  off for that device or for every device. A sensor is judged once it has
+  three days of history, and only upward. Replayed over a production
+  network's two weeks, it raised nothing false in eight days and would
+  have seen a dead fan in 14 minutes and a failed AC in 14 to 38.
+
+### Fixed
+
+- **A deleted device's hourly history goes with it.** The hourly rollup
+  has no link to the devices it describes, and unlike raw samples it is
+  never aged out - so a deleted device, a removed service check, or a
+  pruned interface duplicate left its hourly rows forever, unreadable and
+  uncounted. Four switches deleted and re-added on the demo network left
+  2,712. Every delete now queues those rows, and the background jobs
+  remove them once the rollup has passed the hour of the delete - within
+  a few hours. Raw samples still age out on the retention horizon as
+  before.
+- **The delete confirmation says what happens to each kind of history.** It
+  said a deleted device's history "ages out on the retention horizon",
+  which was true of raw samples and false of the hourly rollup. It now
+  names both.
+- **A deleted device leaves the Dashboard at once.** The Dashboard's lists
+  are kept for the rollup hour, so a deleted device stayed in them for up
+  to an hour under a name that no longer opened anything. A delete now
+  clears them, and the next visit computes them again.
+- **An alert's email is sent once.** When several alerts changed in the
+  same moment, a raise or a clear could be emailed twice, half a minute
+  apart: the prompt "send it now" path and the catch-up of anything still
+  owed both delivered it. Seen on a production network when a host and its
+  four VMs restarted twice in an evening - nine clears sent twice - and
+  now and then for weeks before. The prompt path now skips anything
+  already sent.
+- **No false traffic spike after a restart.** A device without 64-bit
+  counters (Windows Server's own agent among them) restarts with its
+  counters at zero, and the poll after read that as one full lap of the
+  counter - a spike of traffic that never happened, under the interface's
+  speed limit often enough to be charted. A poll that finds a restart now
+  leaves that interval's rates blank, on every interface, and the next poll
+  is measured as usual.
+
 ## 0.1.0-alpha.8 - 2026-10-08
 
 A small alpha the same day as the seventh. Virtual machines keep their VM

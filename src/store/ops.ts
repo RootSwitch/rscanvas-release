@@ -20,6 +20,7 @@ import { copyChunks, copyLine, stripNul } from './copy.ts';
 import { measurement, smallint, int4, int8, boundedJson } from './bounds.ts';
 import type { Clause } from '../search/grammar.ts';
 import { DOWN_OUTCOMES, OUTCOME, type OutcomeName } from '../checks/model.ts';
+import { SINGLE_WINDOW_S } from '../alerts/tempchange.ts';
 
 // --- service checks in SQL (slices 58, 59) ------------------------------------
 //
@@ -1198,6 +1199,10 @@ export const OPS = {
         /** The CPU model the last inventory read stored - the stencil guess
          *  needs it on every poll, and only inventory polls read it. */
         cpu_model: string | null;
+        /** Slice 62: the last good poll's uptime and its age by THIS clock,
+         *  for the restart judgement (collector/restart.ts). */
+        uptime_s: number | null;
+        since_seen_s: number | null;
     }>('collector', `
         -- host(), NOT host::text. Casting an inet to text keeps the netmask,
         -- so a device stored as 127.0.0.1 comes back "127.0.0.1/32" and every
@@ -1209,7 +1214,12 @@ export const OPS = {
                -- One more column on a row already being read, so the caller
                -- can decide whether the inventory refresh is due.
                inventory_ts,
-               cpu_model
+               cpu_model,
+               -- Slice 62. The age is POSTGRES's, against the now() that
+               -- stamped last_seen_ts: the collector adds its own monotonic
+               -- time to it and never compares its wall clock with ours.
+               uptime_s,
+               extract(epoch FROM now() - last_seen_ts)::float8 AS since_seen_s
           FROM devices
          WHERE enabled = true
            -- Slice 35: a ping-only device has no agent, so polling it buys
@@ -1313,9 +1323,33 @@ export const OPS = {
         // (src/collector/schedule.ts). A caller that has none stamps now(),
         // which is the old finish-anchored behaviour.
         pollAnchor: Date | null = null,
+        // Slice 62: set when collector/restart.ts judged that the device
+        // restarted since its last good poll - the uptime that poll read.
+        restartUpBeforeS: number | null = null,
     ) => laneQuery('collector', `
+        -- THE RESTART, in the statement that stores the uptime it was judged
+        -- from (sql/slice62.sql). A data-modifying CTE runs whether or not
+        -- the UPDATE reads it, and inserts nothing unless a restart was
+        -- judged. PLANNED is decided now, against the device's windows and
+        -- schedules at this moment - slice62.sql says why not at delivery.
+        WITH restart AS (
+            INSERT INTO reboot_events (device_id, boot_ts, up_before_s, planned)
+            SELECT d.id, now() - make_interval(secs => $10::float8), $16::float8,
+                   EXISTS (SELECT 1 FROM maintenance_active(now()) w
+                            WHERE w.scope = 'all'
+                               OR (w.scope = 'device' AND w.target = d.name)
+                               OR (w.scope = 'location' AND w.target = d.location)
+                               OR (w.scope = 'application' AND w.target = d.application))
+              FROM devices d
+             WHERE d.id = $1::bigint AND $2 AND $16::float8 IS NOT NULL AND $10::float8 IS NOT NULL
+            RETURNING boot_ts, up_before_s, planned
+        )
         UPDATE devices
            SET last_poll_ts = now(),
+               reboot_seen_ts     = CASE WHEN EXISTS (SELECT 1 FROM restart) THEN now() ELSE reboot_seen_ts END,
+               reboot_boot_ts     = coalesce((SELECT boot_ts FROM restart), reboot_boot_ts),
+               reboot_up_before_s = coalesce((SELECT up_before_s FROM restart), reboot_up_before_s),
+               reboot_planned     = coalesce((SELECT planned FROM restart), reboot_planned),
                poll_anchor_ts = coalesce($15::timestamptz, now()),
                poll_lag_ms  = $8,
                cpu_pct       = CASE WHEN $9::jsonb IS NULL THEN cpu_pct ELSE ($9::jsonb->>'cpu_pct')::real END,
@@ -1359,7 +1393,7 @@ export const OPS = {
         // device as DOWN (review F16).
         [id, ok, sysName, sysDescr, sysLocation, inventoryTried, cpuModel, measurement(pollLagMs),
             summary === null ? null : boundedJson(summary), measurement(uptimeS), int4(cpuCores), int8(ramKb),
-            measurement(snmpRttMs), stencil, pollAnchor]),
+            measurement(snmpRttMs), stencil, pollAnchor, measurement(restartUpBeforeS)]),
 
     /**
      * A poll that could not be RECORDED (2026-10-06): it failed on the
@@ -1645,11 +1679,111 @@ export const OPS = {
          WHERE d.name = $1 AND p.ts > now() - make_interval(hours => $2::int)`,
         [name, hours]),
 
+    // NEVER AHEAD OF THE ROLL-UP (slice 63): a probe leaves only once its
+    // hour is in ping_hourly, the availability report's history. Until the
+    // ping roll-up has run at all nothing goes - the samples retention rule
+    // (guard 5) applied to probes.
     prunePingSamples: (days: number) => laneQuery<{ n: string }>('jobs', `
         WITH gone AS (
-            DELETE FROM ping_samples WHERE ts < now() - make_interval(days => $1::int)
+            DELETE FROM ping_samples
+             WHERE ts < least(now() - make_interval(days => $1::int),
+                              coalesce((SELECT through_ts FROM job_state WHERE job = 'rollup:ping'),
+                                       '-infinity'::timestamptz))
             RETURNING 1
         ) SELECT count(*)::text AS n FROM gone`, [days]),
+
+    /** One bounded chunk of the ping roll-up (sql/slice63.sql). */
+    rollUpPingChunk: (maxHours: number, settleMinutes: number) => laneQuery<{
+        hours_written: string; rows_written: string; from_ts: Date | null; to_ts: Date | null;
+        caught_up: boolean; locked: boolean;
+    }>('jobs', 'SELECT * FROM roll_up_ping_chunk($1::int, $2::int)', [maxHours, settleMinutes]),
+
+    /** How far the ping roll-up has reached - where the availability report stops. */
+    pingRollupFrontier: () => laneQuery<{ through_ts: Date | null }>('interactive', `
+        SELECT through_ts FROM job_state WHERE job = 'rollup:ping'`),
+
+    /**
+     * THE AVAILABILITY REPORT'S SUMS (IDEAS-2026-10-15 item 8), one row per
+     * device probed in the period; the arithmetic is src/reports/
+     * availability.ts. Local days in the caller's zone, the period ending at
+     * the ping roll-up's frontier ($4) so a partial hour is never counted.
+     *
+     *   probes      ping_hourly over the period (sql/slice63.sql), and how
+     *               many hours had any, against the hours since the device
+     *               was first probed.
+     *   down spans  from reachability_events: the state at the period's
+     *               start (the last transition before it) and every
+     *               transition inside, each lasting until the next. A span
+     *               "down" that began inside maintenance - by
+     *               maintenance_active() at its start - is planned.
+     */
+    availabilityReport: (fromDay: string, toDay: string, tz: string, frontier: Date) => laneQuery<{
+        device: string; location: string | null; application: string | null; address: string | null;
+        transient: boolean;
+        probes: string; misses: string; planned_probes: string; planned_misses: string;
+        hours_measured: number; hours_total: number; outages: number; blips: number;
+        longest_s: number; down_s: number; planned_down_s: number;
+    }>('interactive', `
+        WITH b AS (
+            SELECT ($1::date)::timestamp AT TIME ZONE $3 AS lo,
+                   least(($2::date + 1)::timestamp AT TIME ZONE $3, $4::timestamptz) AS hi
+        ), per AS (
+            SELECT h.device_id,
+                   sum(h.probes)::bigint AS probes, sum(h.misses)::bigint AS misses,
+                   sum(h.planned_probes)::bigint AS planned_probes, sum(h.planned_misses)::bigint AS planned_misses,
+                   count(*)::int AS hours_measured
+              FROM ping_hourly h, b
+             WHERE h.hour_ts >= b.lo AND h.hour_ts < b.hi
+             GROUP BY 1
+        ), first_seen AS (
+            SELECT h.device_id, min(h.hour_ts) AS first_h
+              FROM ping_hourly h WHERE h.device_id IN (SELECT device_id FROM per) GROUP BY 1
+        ), ev AS (
+            SELECT e.device_id, e.ts, e.to_state
+              FROM reachability_events e, b
+             WHERE e.ts >= b.lo AND e.ts < b.hi AND e.device_id IN (SELECT device_id FROM per)
+            UNION ALL
+            SELECT p.device_id, b.lo, x.to_state
+              FROM per p, b
+              CROSS JOIN LATERAL (SELECT e.to_state FROM reachability_events e
+                                   WHERE e.device_id = p.device_id AND e.ts < b.lo
+                                   ORDER BY e.ts DESC LIMIT 1) x
+        ), spans AS (
+            SELECT ev.device_id, ev.ts AS s, ev.to_state,
+                   coalesce(lead(ev.ts) OVER (PARTITION BY ev.device_id ORDER BY ev.ts), (SELECT hi FROM b)) AS f
+              FROM ev
+        ), down AS (
+            SELECT s.device_id, extract(epoch FROM s.f - s.s)::float8 AS secs,
+                   EXISTS (SELECT 1 FROM devices d, maintenance_active(s.s) w
+                            WHERE d.id = s.device_id
+                              AND (w.scope = 'all' OR (w.scope = 'device' AND w.target = d.name)
+                                   OR (w.scope = 'location' AND w.target = d.location)
+                                   OR (w.scope = 'application' AND w.target = d.application))) AS planned
+              FROM spans s
+             WHERE s.to_state = 'down' AND s.f > s.s
+        ), dsum AS (
+            SELECT device_id,
+                   count(*) FILTER (WHERE NOT planned AND secs >= 60)::int AS outages,
+                   count(*) FILTER (WHERE NOT planned AND secs < 60)::int AS blips,
+                   coalesce(max(secs) FILTER (WHERE NOT planned), 0) AS longest_s,
+                   coalesce(sum(secs) FILTER (WHERE NOT planned), 0) AS down_s,
+                   coalesce(sum(secs) FILTER (WHERE planned), 0) AS planned_down_s
+              FROM down GROUP BY 1
+        )
+        SELECT d.name AS device, d.location, d.application, host(d.host) AS address, d.transient,
+               p.probes::text AS probes, p.misses::text AS misses,
+               p.planned_probes::text AS planned_probes, p.planned_misses::text AS planned_misses,
+               p.hours_measured,
+               greatest(1, ceil(extract(epoch FROM b.hi - greatest(b.lo, fs.first_h)) / 3600))::int AS hours_total,
+               coalesce(ds.outages, 0) AS outages, coalesce(ds.blips, 0) AS blips,
+               coalesce(ds.longest_s, 0)::float8 AS longest_s, coalesce(ds.down_s, 0)::float8 AS down_s,
+               coalesce(ds.planned_down_s, 0)::float8 AS planned_down_s
+          FROM per p
+          JOIN devices d ON d.id = p.device_id
+          JOIN first_seen fs ON fs.device_id = p.device_id
+          CROSS JOIN b
+          LEFT JOIN dsum ds ON ds.device_id = p.device_id
+         ORDER BY d.name`, [fromDay, toDay, tz, frontier]),
 
     /**
      * The database's own health, one query, interactive lane. Feeds the
@@ -1812,14 +1946,20 @@ export const OPS = {
         RETURNING code, kind`, [deviceId, code, name, extra]),
 
     /**
-     * Remove a check. Its samples stay and age out under raw retention, as a
-     * removed device's do (samples.entity_id carries no FK), and an open
-     * alert goes missing and retires as source-removed.
+     * Remove a check. Its raw samples stay and age out under raw retention,
+     * as a removed device's do (samples.entity_id carries no FK); its hourly
+     * rows are queued for the rollup purge in the same statement
+     * (sql/slice60.sql); an open alert goes missing and retires as
+     * source-removed.
      */
     deleteCheck: (deviceId: string, code: string) => laneQuery<{ name: string; kind: string }>('interactive', `
-        DELETE FROM entities
-         WHERE device_id = $1::bigint AND code = $2 AND source = 'probe'
-        RETURNING name, kind`, [deviceId, code]),
+        WITH gone AS (
+            DELETE FROM entities
+             WHERE device_id = $1::bigint AND code = $2 AND source = 'probe'
+            RETURNING id, name, kind
+        ), purge AS (
+            INSERT INTO rollup_purge (entity_id) SELECT id FROM gone ON CONFLICT (entity_id) DO NOTHING
+        ) SELECT name, kind FROM gone`, [deviceId, code]),
 
     /** Does this device have ANY sensor entities yet? One count, asked at
      *  the inventory cadence, never per poll - it gates the backfill.
@@ -2526,6 +2666,44 @@ export const OPS = {
         hours_written: string; done: boolean; through: Date | null; until: Date | null; locked: boolean;
     }>('jobs', 'SELECT * FROM roll_up_checks_backfill($1::int)', [maxHours]),
 
+    /**
+     * Purge the hourly rows of up to `limit` deleted entities: one bounded
+     * transaction, the rows and their queue entries together (sql/slice60.sql).
+     *
+     * Only ids queued an hour or more before the rollup frontier - the
+     * rollup reads raw samples without joining entities, so a purge ahead of
+     * it would be written straight back. The ids go in as ONE array, so each
+     * partition is read through its (entity_id, hour_ts) key rather than
+     * scanned for a semi-join - and the ::int[] is load-bearing: without it
+     * `= ANY ((SELECT ...))` is the SUBQUERY form, which compares an int to
+     * the array and is refused (int = int[]), measured on lab-5 2026-10-09.
+     * A queued id that is somehow a living entity leaves the queue with its
+     * rows untouched.
+     */
+    purgeRollupBatch: (limit: number) => laneQuery<{ entities: number; rows: string; queued: number }>('jobs', `
+        WITH f AS (SELECT through_ts FROM job_state WHERE job = 'rollup'),
+             batch AS (
+                SELECT q.entity_id FROM rollup_purge q, f
+                 WHERE q.queued_ts < f.through_ts - interval '1 hour'
+                 ORDER BY q.queued_ts, q.entity_id
+                 LIMIT $1::int),
+             doomed AS (
+                SELECT array_agg(b.entity_id) AS ids FROM batch b
+                 WHERE NOT EXISTS (SELECT 1 FROM entities e WHERE e.id = b.entity_id)),
+             hourly AS (
+                DELETE FROM samples_hourly h WHERE h.entity_id = ANY ((SELECT ids FROM doomed)::int[]) RETURNING 1),
+             done AS (
+                DELETE FROM rollup_purge q WHERE q.entity_id IN (SELECT entity_id FROM batch) RETURNING 1)
+        SELECT (SELECT count(*) FROM done)::int AS entities,
+               (SELECT count(*) FROM hourly)::text AS rows,
+               ((SELECT count(*) FROM rollup_purge) - (SELECT count(*) FROM done))::int AS queued`, [limit]),
+
+    /** One step of the once-per-database census of rows deleted before the
+     *  queue existed (sql/slice60.sql rollup_purge_census): one partition. */
+    rollupPurgeCensus: () => laneQuery<{
+        part: string | null; queued: string; parts_left: number | null; waiting: boolean; locked: boolean;
+    }>('jobs', 'SELECT * FROM rollup_purge_census()'),
+
     /** The rollup frontier and job bookkeeping, for /api/health. */
     /** How many devices there are and when the first was added: the young-
      *  database signal for isFrontierHealthy. A two-row-scan-cheap stand-in
@@ -2904,6 +3082,10 @@ export const OPS = {
      * than reporting a number. That is the more useful answer as well as the
      * cheaper one: "2.3M samples" invites the reading that disk comes back
      * today, and it does not.
+     *
+     * The HOURLY rollup is different: it is kept, so its rows would never
+     * age out. deleteDevices queues them and the jobs worker purges them
+     * (sql/slice60.sql), and the gate says that too.
      */
     previewDeviceRemoval: (names: string[]) => laneQuery<{
         name: string; exists: boolean; enabled: boolean; entities: string; shapes: string;
@@ -2951,11 +3133,16 @@ export const OPS = {
      * forced. A CTE keeps it atomic - a half-deleted device whose entities
      * went but whose row stayed would be polled forever against nothing.
      *
-     * Samples are deliberately untouched; see previewDeviceRemoval.
+     * Raw samples are deliberately untouched; see previewDeviceRemoval. The
+     * entities' HOURLY rows are queued for the jobs worker's purge in the
+     * same statement (sql/slice60.sql) - queued, not deleted here, because a
+     * big device's year of rollup would not fit this lane's two seconds, and
+     * the delete would fail whole.
      */
     deleteDevices: (names: string[]) => laneQuery<{ name: string }>('interactive', `
         WITH target AS (SELECT id, name FROM devices WHERE name = ANY($1::text[])),
-             gone AS (DELETE FROM entities WHERE device_id IN (SELECT id FROM target) RETURNING 1)
+             gone AS (DELETE FROM entities WHERE device_id IN (SELECT id FROM target) RETURNING id),
+             purge AS (INSERT INTO rollup_purge (entity_id) SELECT id FROM gone ON CONFLICT (entity_id) DO NOTHING)
         DELETE FROM devices WHERE id IN (SELECT id FROM target) RETURNING name`, [names]),
 
     /** Delete a board. Its tokens cascade, which revokes its displays. */
@@ -3147,6 +3334,12 @@ export const OPS = {
             UPDATE maintenance_windows SET target = $2
              WHERE scope = 'device' AND target = $1 AND EXISTS (SELECT 1 FROM d)
             RETURNING 1
+        ), s AS (
+            -- Repeating windows (slice 61): left behind, the 03:00 backup
+            -- window would silently stop applying after a rename.
+            UPDATE maintenance_schedules SET target = $2
+             WHERE scope = 'device' AND target = $1 AND EXISTS (SELECT 1 FROM d)
+            RETURNING 1
         ), p AS (
             UPDATE notify_policy SET target = $2
              WHERE scope = 'device' AND target = $1 AND EXISTS (SELECT 1 FROM d)
@@ -3173,7 +3366,7 @@ export const OPS = {
         SELECT (SELECT count(*) FROM d)::int AS renamed,
                (SELECT count(*) FROM a)::int AS alerts,
                (SELECT count(*) FROM t)::int AS overrides,
-               (SELECT count(*) FROM w)::int AS windows,
+               ((SELECT count(*) FROM w) + (SELECT count(*) FROM s))::int AS windows,
                (SELECT count(*) FROM p)::int AS policies,
                (SELECT count(*) FROM b)::int AS boards`, [from, to]),
 
@@ -3211,6 +3404,18 @@ export const OPS = {
                application = NULLIF(btrim(COALESCE($3, '')), '')
          WHERE name = $1
         RETURNING name`, [name, location, application]),
+
+    /** Slice 64: the device's notes - blank stored as NULL, so "none" is one
+     *  state, not two. The route bounds the length. */
+    setDeviceNotes: (name: string, notes: string | null) => laneQuery<{ name: string }>('interactive', `
+        -- Trailing whitespace of every kind goes (btrim's default is spaces
+        -- only, and a textarea ends in newlines); leading stays - it can be
+        -- the indentation someone meant.
+        UPDATE devices
+           SET notes = CASE WHEN btrim(COALESCE($2, ''), E' \\t\\r\\n') = '' THEN NULL
+                            ELSE rtrim($2, E' \\t\\r\\n') END
+         WHERE name = $1
+        RETURNING name`, [name, notes]),
 
     /**
      * Distinct values for one axis, with how many devices carry each.
@@ -3720,9 +3925,8 @@ export const OPS = {
                        -- thing the design refused to be. NULL (stripped)
                        -- when the shape is unbound.
                        'maintenance', CASE WHEN d.name IS NULL THEN NULL ELSE EXISTS (
-                           SELECT 1 FROM maintenance_windows w
-                            WHERE now() >= w.starts_ts AND now() < w.ends_ts
-                              AND (w.scope = 'all'
+                           SELECT 1 FROM maintenance_active(now()) w
+                            WHERE (w.scope = 'all'
                                    OR (w.scope = 'device' AND w.target = d.name)
                                    OR (w.scope = 'location' AND w.target = d.location)
                                    OR (w.scope = 'application' AND w.target = d.application))) END,
@@ -4548,6 +4752,67 @@ export const OPS = {
         DELETE FROM maintenance_windows WHERE id = $1::bigint
         RETURNING scope, target, starts_ts, ends_ts, note`, [id]),
 
+    // --- repeating windows (slice 61) -----------------------------------------
+    //
+    // Matched by every reader through maintenance_active(), so nothing below
+    // the drain knows a schedule from a window. These three are the CRUD.
+
+    /**
+     * Make a schedule - but only in a zone PostgreSQL knows. A zone it did
+     * not would make maintenance_active() fail, and with it every owed
+     * query: one bad row would stop all notification. So the insert is
+     * conditional on pg_timezone_names, and no row back means the zone was
+     * refused (the route has already checked it against Intl).
+     */
+    createMaintenanceSchedule: (
+        scope: string, target: string, days: number[], startTime: string, minutes: number,
+        tz: string, note: string | null, createdBy: string,
+    ) => laneQuery<{ id: string }>('interactive', `
+        INSERT INTO maintenance_schedules (scope, target, days, start_time, minutes, tz, note, created_by)
+        SELECT $1, $2, $3::smallint[], $4::time, $5::int, $6, $7, $8
+         WHERE EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = $6)
+        RETURNING id::text AS id`,
+        [scope, target, days, startTime, minutes, tz, note, createdBy]),
+
+    /**
+     * Every schedule, with its occurrence open now or next: the first one,
+     * over the coming eight local days, that has not yet ended. `active`
+     * when that one has begun. Computed here rather than in the browser so
+     * the page and the drain read the same clock in the same zone.
+     */
+    maintenanceSchedules: () => laneQuery<{
+        id: string; scope: string; target: string; days: number[]; start_time: string;
+        minutes: number; tz: string; note: string | null; created_by: string | null;
+        next_starts: Date | null; next_ends: Date | null; active: boolean;
+    }>('interactive', `
+        SELECT s.id::text AS id, s.scope, s.target, s.days::int[] AS days,
+               to_char(s.start_time, 'HH24:MI') AS start_time, s.minutes, s.tz,
+               s.note, s.created_by, n.starts AS next_starts,
+               n.starts + make_interval(mins => s.minutes) AS next_ends,
+               COALESCE(n.starts <= now(), false) AS active
+          FROM maintenance_schedules s
+          LEFT JOIN LATERAL (
+              SELECT o.starts
+                FROM generate_series(-1, 7) AS k(k)
+               CROSS JOIN LATERAL (
+                   SELECT (now() AT TIME ZONE s.tz)::date + k.k AS day) d
+               CROSS JOIN LATERAL (
+                   SELECT (d.day + s.start_time) AT TIME ZONE s.tz AS starts) o
+               WHERE extract(isodow FROM d.day)::smallint = ANY (s.days)
+                 AND o.starts + make_interval(mins => s.minutes) > now()
+               ORDER BY o.starts
+               LIMIT 1
+          ) n ON true
+         ORDER BY s.scope, s.target, s.start_time, s.id`),
+
+    cancelMaintenanceSchedule: (id: string) => laneQuery<{
+        scope: string; target: string; days: number[]; start_time: string; minutes: number;
+        tz: string; note: string | null;
+    }>('interactive', `
+        DELETE FROM maintenance_schedules WHERE id = $1::bigint
+        RETURNING scope, target, days::int[] AS days, to_char(start_time, 'HH24:MI') AS start_time,
+                  minutes, tz, note`, [id]),
+
     /** Route validation: does anything match this target TODAY? A typo'd
      *  location suppresses nothing, and the operator would learn that at
      *  02:10 from forty pages - refuse it up front with a 404 instead. */
@@ -4566,7 +4831,9 @@ export const OPS = {
      * clear would DELIVER once the window expired. Matched against the
      * window SPAN, not now(): a short window can expire between the clear
      * and the next drain pass, and the settlement must still apply. The
-     * alert row keeps both transitions; only the delivery is waived.
+     * alert row keeps both transitions; only the delivery is waived. A
+     * repeating window counts by the occurrence open at the clear (slice 61,
+     * maintenance_active at cleared_ts).
      */
     settleInWindowClears: () => laneQuery<{ n: string }>('jobs', `
         WITH settled AS (
@@ -4574,10 +4841,8 @@ export const OPS = {
              WHERE state = 'cleared' AND NOT notified_clear AND NOT notified_raise
                AND cleared_ts > now() - interval '1 day'
                AND ((alerts.host IS NOT NULL AND EXISTS (
-                   SELECT 1 FROM maintenance_windows w
-                    WHERE alerts.cleared_ts >= w.starts_ts
-                      AND alerts.cleared_ts < w.ends_ts
-                      AND (w.scope = 'all'
+                   SELECT 1 FROM maintenance_active(alerts.cleared_ts) w
+                    WHERE (w.scope = 'all'
                            OR (w.scope = 'device' AND w.target = alerts.host)
                            OR (w.scope IN ('location', 'application') AND EXISTS (
                                SELECT 1 FROM devices d
@@ -4586,10 +4851,12 @@ export const OPS = {
                                                               ELSE d.application END)))))
                  -- A group alert has no host; it is its group's (slice 55).
                  OR (alerts.kind = 'group-down' AND EXISTS (
-                   SELECT 1 FROM maintenance_windows w
-                    WHERE alerts.cleared_ts >= w.starts_ts
-                      AND alerts.cleared_ts < w.ends_ts
-                      AND (w.scope = 'all' OR alerts.alert_key = 'group:' || w.scope || ':' || w.target))))
+                   SELECT 1 FROM maintenance_active(alerts.cleared_ts) w
+                    WHERE (w.scope = 'all' OR alerts.alert_key = 'group:' || w.scope || ':' || w.target)))
+                 -- ...and so has a room's change alert (slice 65).
+                 OR (alerts.kind = 'temp-room' AND EXISTS (
+                   SELECT 1 FROM maintenance_active(alerts.cleared_ts) w
+                    WHERE (w.scope = 'all' OR alerts.alert_key = 'temp-room:' || w.scope || ':' || w.target))))
             RETURNING 1
         ) SELECT count(*)::text AS n FROM settled`),
 
@@ -4880,7 +5147,8 @@ export const OPS = {
      *   this job, which removes clones, not history.
      *
      * samples.entity_id carries no FK, so a corpse's readings are not
-     * cascaded - they age out under raw retention like everything else.
+     * cascaded - they age out under raw retention like everything else -
+     * and its hourly rows are queued for the rollup purge (sql/slice60.sql).
      */
     pruneCorpseInterfaces: (days: number) => laneQuery<{ n: string }>('jobs', `
         WITH gone AS (
@@ -4902,7 +5170,9 @@ export const OPS = {
                               AND l.name = e.name AND l.id <> e.id
                               AND l.lv_stale_since IS NULL
                               AND l.lv_ts IS NOT NULL)
-            RETURNING 1
+            RETURNING e.id
+        ), purge AS (
+            INSERT INTO rollup_purge (entity_id) SELECT id FROM gone ON CONFLICT (entity_id) DO NOTHING
         ) SELECT count(*)::text AS n FROM gone`, [days]),
 
     /** Cleared-alert retention. Notifications go with their alert (CASCADE). */
@@ -5020,6 +5290,153 @@ export const OPS = {
           FROM alerts WHERE id = $1::bigint`, [id]),
 
     /**
+     * ACKNOWLEDGE an incident (slice 62): who is on it, with an optional
+     * note. It changes who is working the alert and nothing about the
+     * alert: the row stays active, on every page and wall, and clears when
+     * its condition does. What it stops is renotify, which has excluded
+     * acked_ts since DECISIONS-2026-09-01 ruling 2. Escalation still
+     * notifies: a warn that went crit is news even to the person on it.
+     *
+     * Not on a cleared row - that is history, and nobody is "on" it. A
+     * second acknowledgement replaces the first: the latest person to say
+     * "mine" is the one to ask. RETURNING names the alert for the audit line.
+     */
+    ackAlert: (id: string, by: string, note: string | null) => laneQuery<{ id: string; label: string }>(
+        'interactive', `
+        UPDATE alerts SET acked_ts = now(), acked_by = $2, ack_note = $3
+         WHERE id = $1::bigint AND state != 'cleared'
+        RETURNING id::text AS id, label`, [id, by, note]),
+
+    /** Take an acknowledgement back - the wrong alert, or handed back. */
+    unackAlert: (id: string) => laneQuery<{ id: string; label: string }>('interactive', `
+        UPDATE alerts SET acked_ts = NULL, acked_by = NULL, ack_note = NULL
+         WHERE id = $1::bigint AND state != 'cleared' AND acked_ts IS NOT NULL
+        RETURNING id::text AS id, label`, [id]),
+
+    /**
+     * A RESTART ALERT'S CLEAR IS NOT NEWS (slice 62). The alert is the
+     * restart; it holds for a while so a wall and the Alerts page show it,
+     * then clears because time passed, not because anything recovered. An
+     * email saying so is noise, so the scan settles those clears as it makes
+     * them - before the notify job reads the queue - and only those: by id,
+     * kind and state, never a sweep.
+     */
+    settleRestartClears: (ids: string[]) => laneQuery<{ id: string }>('alerts', `
+        UPDATE alerts SET notified_clear = true
+         WHERE id = ANY($1::bigint[]) AND kind = 'reboot' AND state = 'cleared' AND NOT notified_clear
+        RETURNING id::text AS id`, [ids]),
+
+    /**
+     * ONE DEVICE'S TIMELINE (IDEAS-2026-10-15 item 4): what happened to it,
+     * newest first, read from the tables that already record each kind, in
+     * ONE statement - the page pays one query however busy the device was.
+     *
+     *   alert-*      each moment of an incident on the device: raised,
+     *                escalated, cleared (with its reason), acknowledged
+     *                (who, the note). Pending alerts never raised and are not
+     *                moments. Matched by host, which the scan sets to the
+     *                device's name for every kind it raises.
+     *   reach        ping transitions (slice 12).
+     *   restart      at the time it came back, with how long it had been up
+     *                and whether a window covered it (slice 62).
+     *   maintenance  one-shot windows and each OCCURRENCE of a repeating one
+     *                that covered the device in the window, by the rule
+     *                maintenance_active() uses (sql/slice61.sql): the local
+     *                date plus the start time, in the schedule's own zone.
+     *   audit        changes people made to it - only when the caller may
+     *                read the audit trail ($3), which is admin. Matched by
+     *                the targets device actions use (its name, "name/kind",
+     *                "device:name", its location or application, one of its
+     *                entity codes) and by the names a bulk action lists.
+     *                Acknowledgements are left to the alert rows above.
+     *
+     * Nothing here claims a cause: rows sit side by side on one time axis,
+     * and the reader draws the line. Every text column is device- or
+     * person-controlled and the page renders it as text.
+     */
+    deviceTimeline: (name: string, hours: number, withAudit: boolean, limit: number) => laneQuery<{
+        ts: Date; kind: string; severity: string | null; text: string | null; ref: string | null;
+        until: Date | null; data: Record<string, unknown> | null;
+    }>('interactive', `
+        WITH d AS (SELECT id, name, location, application FROM devices WHERE name = $1),
+             w AS (SELECT now() - make_interval(hours => $2::int) AS lo, now() AS hi),
+             -- The audit targets that name one of its entities, built ONCE.
+             -- As a subquery inside the audit match it ran per audit row:
+             -- 10,600 rows of a month on the lab box, 2.1 s (EXPLAIN,
+             -- 2026-10-16).
+             codes AS (SELECT coalesce(array_agg('code ' || e.code), '{}') AS c
+                         FROM d JOIN entities e ON e.device_id = d.id WHERE e.code IS NOT NULL),
+             ev AS (
+                SELECT e.ts, 'alert-' || e.what AS kind, a.severity, a.label AS text, a.id::text AS ref,
+                       NULL::timestamptz AS until,
+                       jsonb_build_object('alertKind', a.kind, 'code', a.code, 'state', a.state,
+                                          'reason', CASE WHEN e.what = 'clear' THEN a.clear_reason END,
+                                          'by', CASE WHEN e.what = 'ack' THEN a.acked_by END,
+                                          'note', CASE WHEN e.what = 'ack' THEN a.ack_note END) AS data
+                  FROM d, w, alerts a
+                  CROSS JOIN LATERAL (VALUES (a.raised_ts, 'raise'), (a.escalated_ts, 'escalate'),
+                                             (a.cleared_ts, 'clear'), (a.acked_ts, 'ack')) AS e(ts, what)
+                 WHERE a.host = d.name AND e.ts IS NOT NULL AND e.ts >= w.lo
+                UNION ALL
+                SELECT r.ts, 'reach', NULL, NULL, NULL, NULL,
+                       jsonb_build_object('from', r.from_state, 'to', r.to_state, 'rtt', r.rtt_ms)
+                  FROM d, w, reachability_events r
+                 WHERE r.device_id = d.id AND r.ts >= w.lo
+                UNION ALL
+                SELECT r.boot_ts, 'restart', NULL, NULL, NULL, NULL,
+                       jsonb_build_object('upBefore', r.up_before_s, 'planned', r.planned, 'seen', r.ts)
+                  FROM d, w, reboot_events r
+                 WHERE r.device_id = d.id AND r.ts >= w.lo
+                UNION ALL
+                SELECT mw.starts_ts, 'maintenance', NULL, mw.note, mw.id::text, mw.ends_ts,
+                       jsonb_build_object('scope', mw.scope, 'target', mw.target, 'by', mw.created_by, 'repeating', false)
+                  FROM d, w, maintenance_windows mw
+                 WHERE mw.ends_ts >= w.lo AND mw.starts_ts <= w.hi
+                   AND (mw.scope = 'all' OR (mw.scope = 'device' AND mw.target = d.name)
+                        OR (mw.scope = 'location' AND mw.target = d.location)
+                        OR (mw.scope = 'application' AND mw.target = d.application))
+                UNION ALL
+                SELECT o.starts, 'maintenance', NULL, s.note, s.id::text, o.starts + make_interval(mins => s.minutes),
+                       jsonb_build_object('scope', s.scope, 'target', s.target, 'by', s.created_by, 'repeating', true)
+                  FROM d, w, maintenance_schedules s
+                  CROSS JOIN LATERAL generate_series((w.lo AT TIME ZONE s.tz)::date - 1,
+                                                     (w.hi AT TIME ZONE s.tz)::date, interval '1 day') AS g(day)
+                  CROSS JOIN LATERAL (SELECT (g.day::date + s.start_time) AT TIME ZONE s.tz AS starts) o
+                 WHERE ((s.scope = 'device' AND s.target = d.name)
+                        OR (s.scope = 'location' AND s.target = d.location)
+                        OR (s.scope = 'application' AND s.target = d.application))
+                   AND extract(isodow FROM g.day)::smallint = ANY (s.days)
+                   AND o.starts <= w.hi AND o.starts + make_interval(mins => s.minutes) >= w.lo
+                UNION ALL
+                SELECT au.ts, 'audit', NULL, au.target, NULL, NULL,
+                       jsonb_build_object('action', au.action, 'by', au.actor_username, 'detail', au.detail)
+                  FROM d, w, codes, audit au
+                 WHERE $3 AND au.ts >= w.lo AND au.action NOT IN ('alert.ack', 'alert.unack')
+                   AND (au.target = d.name
+                        OR left(au.target, length(d.name) + 1) = d.name || '/'
+                        OR au.target = 'device:' || d.name
+                        OR (d.location IS NOT NULL AND au.target = 'location:' || d.location)
+                        OR (d.application IS NOT NULL AND au.target = 'application:' || d.application)
+                        OR au.detail->>'host' = d.name
+                        OR au.detail->>'to' = d.name
+                        OR (jsonb_typeof(au.detail->'names') = 'array' AND au.detail->'names' ? d.name)
+                        OR au.target = ANY (codes.c))
+             )
+        SELECT ts, kind, severity, text, ref, until, data FROM ev
+         ORDER BY ts DESC
+         LIMIT $4`, [name, hours, withAudit, Math.min(Math.max(1, limit), 1000)]),
+
+    /** One device's restarts, newest first (slice 62). Bounded, rule 3. */
+    deviceRestarts: (name: string, limit: number) => laneQuery<{
+        ts: Date; boot_ts: Date; up_before_s: number; planned: boolean;
+    }>('interactive', `
+        SELECT r.ts, r.boot_ts, r.up_before_s, r.planned
+          FROM reboot_events r JOIN devices d ON d.id = r.device_id
+         WHERE d.name = $1
+         ORDER BY r.ts DESC
+         LIMIT $2`, [name, Math.min(Math.max(1, limit), 50)]),
+
+    /**
      * Does this device report BOTH a battery and a filesystem?
      *
      * The shape of a laptop on battery - and, identically, of a server whose
@@ -5085,6 +5502,8 @@ export const OPS = {
         lv_v0: number | null; lv_v1: number | null; lv_v2: number | null;
         lv_v3: number | null; lv_v4: number | null; lv_v5: number | null;
         lv_stale_since: Date | null; source: string; lv_peer: string | null; outside: boolean | null;
+        base_hours: number | null; base_med: number | null; base_q1: number | null; base_q3: number | null;
+        stencil: string | null;
     }>('interactive', `
         -- kind and extra travel to the client since the sensors slice: the
         -- drill-down SPLITS on kind - sensors render as cards above the
@@ -5107,9 +5526,14 @@ export const OPS = {
                e.lv_stale_since,
                -- Slice 58: a service check renders as its own card, and
                -- says which address its last run reached.
-               e.source, e.lv_peer, e.outside
+               e.source, e.lv_peer, e.outside,
+               -- Slice 65: a temperature's week, and the stencil its class
+               -- is read beside.
+               tb.hours AS base_hours, tb.med AS base_med, tb.q1 AS base_q1, tb.q3 AS base_q3,
+               coalesce(d.stencil_override, d.stencil) AS stencil
           FROM entities e
           JOIN devices d ON d.id = e.device_id
+          LEFT JOIN temp_baselines tb ON tb.entity_id = e.id
          WHERE d.name = $1
          -- SENSORS FIRST, THEN INTERFACES BY NUMBER (2026-09-30). snmp_index
          -- is text, so the old ORDER BY listed 1, 10, 100, 101 ... 11, 110 ...
@@ -5445,9 +5869,13 @@ export const OPS = {
         poll_lag_ms: number | null; ping_rtt_ms: number | null;
         snmp_rtt_ms: number | null;
         credential_ref: string; snmp_enabled: boolean;
+        /** The device page's name line shows it when it is not 161 (2026-10-16). */
+        snmp_port: number;
         entities: number; tracked_ifs: number; tracked_sensors: number;
         open_alerts: number; worst: string | null;
         location: string | null; application: string | null;
+        /** Slice 64: the operator's free text about the device. */
+        notes: string | null;
         transient: boolean; alerts_muted: boolean;
         // The aggregate columns (SLICE-ROSTER-COLUMNS-PLAN): null means no
         // fresh reading of that kind, never zero.
@@ -5481,7 +5909,7 @@ export const OPS = {
                -- Slice 35: ONE definition of status, shared with the alert
                -- scan and the wall - a ping-only device's comes from reach.
                ${deviceStatusSql('d')} AS status,
-               d.snmp_enabled,
+               d.snmp_enabled, d.snmp_port,
                d.last_poll_ts,
                d.last_seen_ts, d.poll_interval_s,
                -- Reachability rides the same row read as the grouping columns
@@ -5512,6 +5940,10 @@ export const OPS = {
                -- so they add no join, no scan and no per-device work. The
                -- query budget test pins that claim.
                d.location, d.application,
+               -- Slice 64: the notes ride the row too, so the device page
+               -- needs no fetch for them and the roster's filter can find a
+               -- device by its owner or asset tag.
+               d.notes,
                d.transient, d.alerts_muted,
                -- THE SUMMARY COLUMNS (slice 20), written by the collector at
                -- poll time and read here as plain columns: the aggregate form
@@ -5589,6 +6021,8 @@ export const OPS = {
         name: string; host: string; status: string; transient: boolean;
         alerts_muted: boolean; snmp_enabled: boolean;
         poll_age_s: number; poll_interval_s: number;
+        /** Slice 62: the last restart, aged by the same clock as poll_age_s. */
+        reboot_age_s: number | null; reboot_up_before_s: number | null; reboot_planned: boolean | null;
     }>('alerts', `
         -- EFFECTIVE status merges both instruments (slice 9): ICMP-down wins
         -- over SNMP-up because ping notices in seconds what the 30s poll
@@ -5612,7 +6046,9 @@ export const OPS = {
                -- dead collector reads fresh). The database's clock is the one
                -- both sides can see.
                extract(epoch FROM now() - last_poll_ts)::int AS poll_age_s,
-               poll_interval_s
+               poll_interval_s,
+               extract(epoch FROM now() - reboot_seen_ts)::int AS reboot_age_s,
+               reboot_up_before_s, reboot_planned
           FROM devices
          WHERE enabled = true
            -- Slice 35: last_poll_ts is the SNMP poll's stamp, so gating on it
@@ -5741,6 +6177,90 @@ export const OPS = {
            AND d.enabled = true AND d.last_poll_ts IS NOT NULL`),
 
     /**
+     * CHANGE FROM NORMAL (slice 65): every tracked temperature with a
+     * baseline, and what the scan needs to decide whether it takes part -
+     * its name and its device's stencil for the classifier, the device's
+     * state, location and poll interval. No readings: those are read for the
+     * ones taking part only (tempChangeRecent), so a fleet's CPUs and GPUs
+     * never cost the scan a samples read.
+     */
+    tempChangeSensors: () => laneQuery<{
+        id: number; code: string; name: string; device_name: string; location: string | null;
+        stencil: string | null; status: string; transient: boolean; alerts_muted: boolean;
+        poll_interval_s: number; hours: number; med: number; q1: number; q3: number;
+    }>('alerts', `
+        SELECT e.id, e.code, e.name, d.name AS device_name, d.location,
+               coalesce(d.stencil_override, d.stencil) AS stencil,
+               d.status, d.transient, d.alerts_muted, d.poll_interval_s,
+               t.hours, t.med, t.q1, t.q3
+          FROM temp_baselines t
+          JOIN entities e ON e.id = t.entity_id
+          JOIN devices d ON d.id = e.device_id
+         WHERE e.kind = 'temp' AND e.source = 'snmp' AND e.tracked = true AND e.code IS NOT NULL
+           AND d.enabled = true AND d.last_poll_ts IS NOT NULL`),
+
+    /**
+     * The last ROOM_WINDOW_S and SINGLE_WINDOW_S of readings of the given
+     * sensors, as a median and a count each - one index range per sensor on
+     * the raw samples' (entity_id, ts) key, and the partition pruning that
+     * ts > now() - 20 minutes gives. Counted over v0 not rows, so a poll
+     * that read nothing is not a reading.
+     */
+    tempChangeRecent: (ids: number[], roomS: number, singleS: number) => laneQuery<{
+        id: number; r10: number | null; n10: number; r20: number | null; n20: number;
+    }>('alerts', `
+        SELECT x.id, r.r10, r.n10, r.r20, r.n20
+          FROM unnest($1::int[]) AS x(id)
+         CROSS JOIN LATERAL (
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY s.v0)
+                       FILTER (WHERE s.ts > now() - make_interval(secs => $2)) AS r10,
+                   (count(s.v0) FILTER (WHERE s.ts > now() - make_interval(secs => $2)))::int AS n10,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY s.v0) AS r20,
+                   count(s.v0)::int AS n20
+              FROM samples s
+             WHERE s.entity_id = x.id AND s.ts > now() - make_interval(secs => $3)) r`,
+    [ids, roomS, singleS]),
+
+    /**
+     * THE WEEK, for every tracked temperature (slice 65): the median and
+     * quartiles of its hourly means over the seven days before the current
+     * hour, and how many hours had one. One statement: upsert what has
+     * hours, drop the rows of sensors that have none or stopped being
+     * tracked temperatures. Every tracked temperature, not just the ones
+     * taking part, so including one on its card counts from the next scan.
+     * Read from the rollup's (entity_id, hour_ts) key, one range per sensor.
+     */
+    refreshTempBaselines: (days: number) => laneQuery<{ kept: number; dropped: number }>('jobs', `
+        WITH cand AS (
+            SELECT e.id FROM entities e JOIN devices d ON d.id = e.device_id
+             WHERE e.kind = 'temp' AND e.source = 'snmp' AND e.tracked = true AND d.enabled = true
+        ), wk AS (
+            SELECT date_trunc('hour', now()) AS hi
+        ), b AS (
+            SELECT h.entity_id, count(*)::int AS hours,
+                   percentile_cont(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY h.a0) AS q
+              FROM cand c
+              JOIN samples_hourly h ON h.entity_id = c.id
+              CROSS JOIN wk
+             WHERE h.hour_ts >= wk.hi - make_interval(days => $1) AND h.hour_ts < wk.hi
+               AND h.a0 IS NOT NULL
+             GROUP BY h.entity_id
+        ), up AS (
+            INSERT INTO temp_baselines (entity_id, base_ts, hours, med, q1, q3)
+            SELECT b.entity_id, wk.hi, b.hours, b.q[2], b.q[1], b.q[3] FROM b CROSS JOIN wk
+            ON CONFLICT (entity_id) DO UPDATE
+               SET base_ts = EXCLUDED.base_ts, hours = EXCLUDED.hours,
+                   med = EXCLUDED.med, q1 = EXCLUDED.q1, q3 = EXCLUDED.q3
+            RETURNING 1
+        ), gone AS (
+            DELETE FROM temp_baselines t
+             WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.entity_id = t.entity_id)
+            RETURNING 1
+        )
+        SELECT (SELECT count(*) FROM up)::int AS kept, (SELECT count(*) FROM gone)::int AS dropped`,
+    [days]),
+
+    /**
      * The service checks for the scan (slice 58): every tracked probe entity
      * on an enabled device, with what its last run said.
      *
@@ -5814,6 +6334,9 @@ export interface AlertRecord {
     last_seen_ts: Date;
     renotified_ts: Date | null;
     acked_ts: Date | null;
+    /** Slice 62: who acknowledged it, and what they said. */
+    acked_by: string | null;
+    ack_note: string | null;
     clear_reason: string | null;
     notified_raise: boolean;
     notified_clear: boolean;
@@ -5834,6 +6357,7 @@ export interface NotificationRecord {
 const ALERT_COLUMNS = `id::text AS id, alert_key, state, severity, kind, host, code, label,
     value, peak_value, threshold, unit, breach_count, clear_count, missing_count,
     first_breach_ts, raised_ts, escalated_ts, cleared_ts, last_seen_ts, renotified_ts, acked_ts,
+    acked_by, ack_note,
     clear_reason, notified_raise, notified_clear, notified_escalate, notify_attempts, last_attempt_ts`;
 
 /**
@@ -5851,11 +6375,14 @@ const ALERT_COLUMNS = `id::text AS id, alert_key, state, severity, kind, host, c
  * alerts (collector stalled, ingest stalled) carry no host, so no window of
  * any scope - 'all' included - can ever match one. If the monitor itself
  * dies at 02:30, the operator still hears about it.
+ *
+ * "Active" is maintenance_active(now()) (slice 61): one-shot windows and
+ * the open occurrence of every repeating one, decided in one SQL function
+ * that this predicate, the clear settlement and the wall all read.
  */
 const ALERT_IN_MAINTENANCE = `((alerts.host IS NOT NULL AND EXISTS (
-    SELECT 1 FROM maintenance_windows w
-     WHERE now() >= w.starts_ts AND now() < w.ends_ts
-       AND (w.scope = 'all'
+    SELECT 1 FROM maintenance_active(now()) w
+     WHERE (w.scope = 'all'
             OR (w.scope = 'device' AND w.target = alerts.host)
             OR (w.scope IN ('location', 'application') AND EXISTS (
                 SELECT 1 FROM devices d
@@ -5866,9 +6393,13 @@ const ALERT_IN_MAINTENANCE = `((alerts.host IS NOT NULL AND EXISTS (
   -- its location or application, so a window on that group - or on
   -- everything - holds it. Matched by its key, group:<scope>:<target>.
   OR (alerts.kind = 'group-down' AND EXISTS (
-    SELECT 1 FROM maintenance_windows w
-     WHERE now() >= w.starts_ts AND now() < w.ends_ts
-       AND (w.scope = 'all' OR alerts.alert_key = 'group:' || w.scope || ':' || w.target))))`;
+    SELECT 1 FROM maintenance_active(now()) w
+     WHERE (w.scope = 'all' OR alerts.alert_key = 'group:' || w.scope || ':' || w.target)))
+  -- A ROOM's change-from-normal alert (slice 65) is its location's the same
+  -- way, keyed temp-room:location:<location>.
+  OR (alerts.kind = 'temp-room' AND EXISTS (
+    SELECT 1 FROM maintenance_active(now()) w
+     WHERE (w.scope = 'all' OR alerts.alert_key = 'temp-room:' || w.scope || ':' || w.target))))`;
 
 // Quiet 1 (slice 25): a STANDING policy - the alert raises, shows, and is
 // never delivered while a covering row exists. Same shape as the window
@@ -5887,7 +6418,10 @@ const ALERT_UNDER_POLICY = `((alerts.host IS NOT NULL AND EXISTS (
                                            ELSE d.application END))))
   -- A group alert under a policy for its own group (slice 55).
   OR (alerts.kind = 'group-down' AND EXISTS (
-    SELECT 1 FROM notify_policy p WHERE alerts.alert_key = 'group:' || p.scope || ':' || p.target)))`;
+    SELECT 1 FROM notify_policy p WHERE alerts.alert_key = 'group:' || p.scope || ':' || p.target))
+  -- ...and a room's change-from-normal alert under its location's (slice 65).
+  OR (alerts.kind = 'temp-room' AND EXISTS (
+    SELECT 1 FROM notify_policy p WHERE alerts.alert_key = 'temp-room:' || p.scope || ':' || p.target)))`;
 
 /**
  * THE SETTLING WINDOW (slice 59, found by the operator's real outage on
@@ -5951,7 +6485,22 @@ const ALERT_IN_GROUP_OUTAGE = `((alerts.kind = 'device-down' AND alerts.host IS 
        -- this, each of those was emailed down and then up seconds apart
        -- (the race drill, 2026-10-05: eight messages for one recovery).
        AND (g.state IN ('pending', 'active', 'clearing')
-            OR (g.state = 'cleared' AND g.cleared_ts > now() - make_interval(secs => ${OUTSIDE_SETTLE_S}))))))`;
+            OR (g.state = 'cleared' AND g.cleared_ts > now() - make_interval(secs => ${OUTSIDE_SETTLE_S})))))
+  -- A sensor's change alert while its ROOM's is open (slice 65): a closet
+  -- whose AC failed warms every card in it, and the room's one message
+  -- stands for theirs - the group alert's hold, for the same reason.
+  OR (alerts.kind = 'temp-change' AND alerts.host IS NOT NULL AND EXISTS (
+    SELECT 1 FROM devices d
+      JOIN alerts g ON g.alert_key = 'temp-room:location:' || d.location
+     WHERE d.name = alerts.host AND g.kind = 'temp-room'
+       -- ...and for one sensor window AFTER it clears (the lab drill,
+       -- 2026-10-16): as a room cools, its 10-minute rule clears about five
+       -- minutes before its sensors' 20-minute one, and without this every
+       -- member still warm was owed - a raise each for sensors already
+       -- coming back, and a clear each after. One that is still hot when
+       -- the window ends is a fault of its own, and is sent then.
+       AND (g.state IN ('pending', 'active', 'clearing')
+            OR (g.state = 'cleared' AND g.cleared_ts > now() - make_interval(secs => ${SINGLE_WINDOW_S}))))))`;
 
 /**
  * Did this device-down alert's outage overlap a group alert of its group?
@@ -5974,5 +6523,12 @@ const ALERT_GROUP_OVERLAP = `((alerts.kind = 'device-down' AND alerts.host IS NO
   -- ...or it came and went inside its settling window (below): its raise was
   -- held to see whether it was alone, and it was over before that was known.
   OR (${outsideSettlingMember('alerts')} AND alerts.cleared_ts IS NOT NULL
-      AND alerts.cleared_ts <= alerts.first_breach_ts + make_interval(secs => ${OUTSIDE_SETTLE_S})))`;
+      AND alerts.cleared_ts <= alerts.first_breach_ts + make_interval(secs => ${OUTSIDE_SETTLE_S}))
+  -- A sensor's change alert that overlapped its room's (slice 65).
+  OR (alerts.kind = 'temp-change' AND alerts.host IS NOT NULL AND EXISTS (
+    SELECT 1 FROM devices d
+      JOIN alerts g ON g.alert_key = 'temp-room:location:' || d.location
+     WHERE d.name = alerts.host AND g.kind = 'temp-room'
+       AND g.first_breach_ts <= COALESCE(alerts.cleared_ts, now())
+       AND COALESCE(g.cleared_ts, now()) >= alerts.first_breach_ts)))`;
 

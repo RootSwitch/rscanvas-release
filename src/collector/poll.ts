@@ -9,6 +9,7 @@ import { summarizeReadings, type DeviceSummary, type IfReading, type SensorReadi
 import { SYS, HR, IF, IFX, DEFAULT_TRACKED_IFTYPES, defaultTracked } from './oids.ts';
 import { createSession, get, walk, walkMany, asNumber, asString, asCounter, SnmpError, type Target } from './snmp.ts';
 import { rate32 } from './counters.ts';
+import { judgeRestart, type RestartVerdict } from './restart.ts';
 import { credentialFields, sessionVersion, type Credential } from '../credentials/v3.ts';
 import { generateCode } from './codes.ts';
 import { discoverSensors } from './probe.ts';
@@ -61,6 +62,9 @@ export interface PollResult {
     cpuModel: string | null;
     /** sysUpTime in seconds, read on every successful poll (slice 21). */
     uptimeS: number | null;
+    /** Slice 62: that uptime judged against the last good poll's. A
+     *  restart voids this poll's rates and is recorded by the poll's write. */
+    restart: RestartVerdict;
     /** Inventory facts (slice 21): null when the agent does not expose HOST-RESOURCES. */
     cpuCores: number | null;
     ramKb: number | null;
@@ -115,6 +119,10 @@ export async function pollDevice(
         /** The stored CPU model, for the stencil guess on polls that do not
          *  read the inventory. */
         cpu_model?: string | null;
+        /** Slice 62: the uptime the last good poll stored, and the
+         *  database's age of that poll when this one was dispatched. */
+        uptime_s?: number | null;
+        since_seen_s?: number | null;
     },
     credential: Credential,
     takenCodes: Set<string>,
@@ -145,7 +153,7 @@ export async function pollDevice(
     const result: PollResult = {
         ok: false, summary: null, deviceId: device.id, rttMs: 0, samples: [], counters: [], lastValues: [],
         discovered: 0, speedConvictions: [], rekeyed: [], sysName: null, sysDescr: null, sysLocation: null,
-        cpuModel: null, uptimeS: null, cpuCores: null, ramKb: null, stencil: null,
+        cpuModel: null, uptimeS: null, restart: { kind: 'unknown' }, cpuCores: null, ramKb: null, stencil: null,
         inventoryTried: false, error: null, errorKind: null,
     };
 
@@ -158,6 +166,14 @@ export async function pollDevice(
         result.sysLocation = asString(sys.get(SYS.sysLocation) ?? null);
         const ticks = asNumber(sys.get(SYS.sysUpTime) ?? null);
         result.uptimeS = ticks === null || ticks < 0 ? null : Math.round(ticks / 100);
+        // Slice 62: judged here, before any counter is read, because a
+        // restart changes what this poll's deltas mean. The age is the
+        // database's at dispatch plus this poll's own time so far on the
+        // monotonic clock - one clock throughout (restart.ts says why).
+        result.restart = judgeRestart(
+            device.uptime_s,
+            device.since_seen_s == null ? null : device.since_seen_s + (performance.now() - t0) / 1000,
+            result.uptimeS);
 
         // THE INVENTORY READ, and it is deliberately fenced off from the poll.
         //
@@ -551,7 +567,16 @@ export async function pollDevice(
                 flippedNow ? null
                     : hasHc ? rate(nowC, prevC, elapsedS)
                     : rate32(nowC, prevC, elapsedS, clampBps);
-            const v: Array<number | null> = [
+            // A RESTART VOIDS THE INTERVAL (slice 62). Every counter started
+            // again from zero somewhere inside it, so no delta across it
+            // means anything: a 32-bit octet counter reads the reset as a
+            // wrap and charts nearly 2^32 octets of traffic that never
+            // happened (counters.ts, the limitation this closes), and any
+            // counter that climbed back past its old value reads a
+            // plausible, wrong rate. Blank for this one poll; the counters
+            // below are still saved, so the next poll's deltas are real.
+            const restarted = result.restart.kind === 'restarted';
+            const v: Array<number | null> = restarted ? [null, null, null, null, null, null] : [
                 octetsToBps(octRate(c[0] ?? null, prev[0] ?? null)),
                 octetsToBps(octRate(c[1] ?? null, prev[1] ?? null)),
                 rate(c[2] ?? null, prev[2] ?? null, elapsedS),

@@ -23,7 +23,8 @@ const devices = [
     { name: 'lab-node-16100', host: '198.18.50.1', location: 'HQ / Floor 2', application: 'PAM Prod', transient: true },
     { name: 'lab-node-16101', host: '198.18.50.1', location: 'Lab', application: 'PAM Dev', alerts_muted: true },
     { name: 'core-sw1', host: '192.0.2.1', location: '  lab ', application: null, transient: false, alerts_muted: false },
-    { name: 'nas', host: '192.0.2.9', location: null, application: 'Storage', transient: true, alerts_muted: true },
+    { name: 'nas', host: '192.0.2.9', location: null, application: 'Storage', transient: true, alerts_muted: true,
+        notes: 'Owner: Jordan Kim\nAsset tag 004417 - warranty to 2027' },
     { name: 'printer', host: '192.0.2.20', location: '', application: '' },
 ];
 const names = (text: string): string[] => {
@@ -61,6 +62,11 @@ eq('after a group too', names('location:HQ / Floor 2 transient:'), ['lab-node-16
 eq('case is ignored', names('MUTED:NO'), ['lab-node-16100', 'core-sw1', 'printer']);
 eq('an unknown value is just text, so it matches nothing', names('transient:maybe'), []);
 eq('glued to another word it is just text', parseDeviceFilter('xmuted:'), { kind: 'text', q: 'xmuted:', flags: {} });
+
+console.log('\nnotes (slice 64):');
+eq('a plain word finds a device by its notes - an asset tag', names('004417'), ['nas']);
+eq('or an owner, whatever the case', names('jordan'), ['nas']);
+eq('a group match does not look in notes', names('application:jordan'), []);
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
 if (fail === 0) process.exitCode = 0;

@@ -113,6 +113,12 @@ export interface RulesConfig {
     /** Service checks' yes/no rules (slice 58); their levelled ones live in
      *  thresholds under 'svc-ms' and 'svc-cert'. Absent means both on, crit. */
     services?: { down: BoolRule; content: BoolRule; pathDown?: BoolRule };
+    /** Restart alerts (slice 62). Absent means REBOOT_DEFAULT: off. */
+    reboot?: BoolRule;
+    /** Change from normal (slice 65): one temperature against its own week,
+     *  and a room's. Absent means TEMP_CHANGE_DEFAULT / TEMP_ROOM_DEFAULT: on. */
+    tempChange?: BoolRule;
+    tempRoom?: BoolRule;
     overrides?: Override[];
 }
 
@@ -125,6 +131,12 @@ export interface ScanDevice {
     /** Slice 54: the operator muted this device, so NOTHING of it raises -
      *  device-down, interfaces, sensors. Absent means false. */
     muted?: boolean | null;
+    /** Slice 62: seconds since the poll that recorded the last restart; how
+     *  long it had been up before; whether a maintenance window covered it
+     *  when it was recorded. Absent means no restart on record. */
+    rebootAgeS?: number | null;
+    rebootUpBeforeS?: number | null;
+    rebootPlanned?: boolean | null;
 }
 export interface ScanInterface {
     id?: string | null;
@@ -255,7 +267,7 @@ function resolveBoolInfo(
     return { rule: { severity: defaults.severity || 'crit' }, source: 'default', muted: false };
 }
 
-function resolveBool(
+export function resolveBool(
     idx: OverrideIndex, defaults: BoolRule | null | undefined,
     code: string | null, host: string | null, kind: string,
 ): { severity: Severity } | null {
@@ -268,7 +280,8 @@ export const IF_RULE_KINDS = ['if-down', 'if-errors', 'if-discards', 'if-util'] 
 /** The yes/no rules: no levels, so an override is on or off and nothing else.
  *  An ENABLED override of one is how a port alerts under a device-wide mute
  *  (manual link-down, 2026-10-02) - resolveBoolInfo already honoured it. */
-export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down', 'svc-down', 'svc-content', 'path-down']);
+export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down', 'svc-down', 'svc-content', 'path-down', 'reboot',
+    'temp-change', 'temp-room']);
 
 /** The four rules a service check carries (slice 58): two yes/no, two levelled. */
 export const SERVICE_RULE_KINDS = ['svc-down', 'svc-content', 'svc-ms', 'svc-cert'] as const;
@@ -284,6 +297,42 @@ const SERVICE_BOOL_DEFAULT: BoolRule = { enabled: true, severity: 'crit' };
  *  service - and the box it runs on has its own device-down alert, crit,
  *  if it is gone. */
 const PATH_DOWN_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
+
+/**
+ * RESTART ALERTS (slice 62) ship OFF, as temperature does and for the same
+ * kind of reason: whether a restart is news depends on the device. A
+ * server's unplanned restart is; a Wi-Fi controller rebooted nightly by its
+ * own schedule is not, and on by default would mail every one of those to
+ * an operator who never asked. On for one device, or every device, is an
+ * override row like any other - set from the device page. WARN: a restart
+ * is over by the time anyone reads about it; whatever it broke has its own
+ * alert.
+ */
+export const REBOOT_DEFAULT: BoolRule = { enabled: false, severity: 'warn' };
+
+/**
+ * CHANGE FROM NORMAL (slice 65) ships ON, where temperature thresholds ship
+ * off, and the difference is the reason it exists: no fixed number fits
+ * every device, and a sensor's own last week does. ON for the sensors whose
+ * names say they follow the room - src/alerts/tempchange.ts decides which -
+ * and the replay over production's history raised nothing in eight days.
+ * WARN: a room or a card warming is a thing to look at, not yet an outage.
+ */
+export const TEMP_CHANGE_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
+export const TEMP_ROOM_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
+
+/** How long a restart alert stays raised: long enough for a wall and the
+ *  Alerts page to show it between glances, then it clears without an email
+ *  (OPS.settleRestartClears) - nothing recovered, time passed. */
+export const REBOOT_HOLD_S = 30 * 60;
+
+/** "23d 4h", "5h 12m", "14m" - how long a device had been up. */
+function upFor(s: number): string {
+    const t = Math.max(0, Math.round(s));
+    if (t < 3600) return `${Math.floor(t / 60)}m`;
+    if (t < 86400) return `${Math.floor(t / 3600)}h ${Math.floor((t % 3600) / 60)}m`;
+    return `${Math.floor(t / 86400)}d ${Math.floor((t % 86400) / 3600)}h`;
+}
 
 /** What governs one target today: which tier, whether it is muted, and the
  *  levels when the kind has levels. */
@@ -316,6 +365,15 @@ export function resolveRuleInfo(
     }
     if (kind === 'path-down') {
         const b = resolveBoolInfo(idx, config.services?.pathDown ?? PATH_DOWN_DEFAULT, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'reboot') {
+        const b = resolveBoolInfo(idx, config.reboot ?? REBOOT_DEFAULT, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'temp-change' || kind === 'temp-room') {
+        const d = kind === 'temp-change' ? config.tempChange ?? TEMP_CHANGE_DEFAULT : config.tempRoom ?? TEMP_ROOM_DEFAULT;
+        const b = resolveBoolInfo(idx, d, code, host, kind);
         return { source: b.source, muted: b.muted, levels: null };
     }
     if (kind === 'svc-ms' || kind === 'svc-cert' || kind === 'path-loss' || kind === 'path-jitter' || kind === 'path-mos'
@@ -447,6 +505,35 @@ export function evaluate(doc: ScanDoc, config: RulesConfig): Condition[] {
     for (const i of doc.interfaces || []) {
         const d = i.device || {};
         deviceRule(d.name || String(i.id || '').split(':')[0], d.host, d.status, d.transient);
+    }
+
+    // --- restarts (slice 62) ---
+    //
+    // From the roster only: the interface-embedded device blocks carry no
+    // restart. One condition per device the rule covers, raised while the
+    // last restart is younger than REBOOT_HOLD_S and severity null after,
+    // so an open one clears through the ordinary counters - the same shape
+    // as device-down. Not for a muted device (nothing of it raises), not
+    // for a TRANSIENT one (a laptop's restarts are its declared life, as the
+    // flap report says of its docking), and not for a restart recorded
+    // inside a maintenance window - decided when it was recorded, which
+    // sql/slice62.sql explains. The label carries how long it had been up,
+    // fixed for the restart, so it does not change under an open alert.
+    for (const d of doc.devices || []) {
+        if (!d || !d.name || mutedDevices.has(d.name) || d.transient === true) continue;
+        const rule = resolveBool(idx, config.reboot ?? REBOOT_DEFAULT, null, d.name, 'reboot');
+        if (!rule) continue;
+        const age = d.rebootAgeS;
+        const recent = typeof age === 'number' && Number.isFinite(age) && age >= 0 && age < REBOOT_HOLD_S;
+        const up = d.rebootUpBeforeS;
+        out.push({
+            key: `reboot:${d.name}`,
+            severity: recent && d.rebootPlanned !== true ? rule.severity : null, frozen: false,
+            kind: 'reboot', host: d.name, code: null,
+            label: `${d.name} (${d.host || '?'}) restarted`
+                + (typeof up === 'number' && Number.isFinite(up) ? ` after ${upFor(up)} up` : ''),
+            value: null, threshold: null, unit: '',
+        });
     }
 
     // --- interfaces ---
@@ -735,6 +822,13 @@ export interface Reboot { code: string; host: string | null; from: number; to: n
  * sampling jitter, since the reading and its timestamp are not taken at the
  * same instant. Note that sysUpTime wraps at about 497 days, which is
  * indistinguishable from a reboot.
+ *
+ * THE PARENT'S, KEPT AS ITS PORT AND NOT WIRED. test-rules.ts holds it
+ * against the parent's own code, which is why it stays. Restarts are judged
+ * by src/collector/restart.ts instead (slice 62): this compares two readings,
+ * so a device that is gone for an hour and returns having restarted with a
+ * higher uptime than a short one before reads as running; that one compares
+ * against the last reading PLUS the time between, and tells a wrap apart.
  */
 export function detectReboots(prev: Map<string, number>, metrics: ScanMetric[]): Reboot[] {
     const out: Reboot[] = [];

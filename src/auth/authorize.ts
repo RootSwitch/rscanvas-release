@@ -126,6 +126,12 @@ export type Action =
     // Reversible, self-expiring shift work - the same family as
     // device.disable and device.track: operator and up, never viewer.
     | 'alert.suppress'
+    // Acknowledging an alert (slice 62) says "I am on this" and stops its
+    // renotify; it changes nothing about the alert itself, which stays active
+    // and visible and clears on its own. The shift's own act, beside
+    // alert.suppress: operator and up, never viewer - a viewer watches, and
+    // an acknowledgement is a claim that someone is working the problem.
+    | 'alert.ack'
     // Muting a device (2026-09-25, operator request) stops its polled alerts
     // from RAISING at all - device-down, interfaces, sensors - where
     // alert.suppress only withholds delivery. Untracking an interface is the
@@ -184,6 +190,7 @@ const BY_ROLE: Record<Role, ReadonlySet<Action>> = {
         'device.speed',
         'device.mute',
         'alert.suppress',
+        'alert.ack',
         // Tagging is the operator's job - they are the ones who know which
         // rack a switch is in and which application a server serves. A viewer
         // reads the grouping and cannot set it.
@@ -223,6 +230,7 @@ const BY_ROLE: Record<Role, ReadonlySet<Action>> = {
         'device.rename',
         'device.address',
         'alert.suppress',
+        'alert.ack',
         'alertrule.read',
         'alertrule.write',
         'credential.read',

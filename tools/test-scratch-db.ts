@@ -1,6 +1,6 @@
-// Three tests that need a real PostgreSQL, run against a SCRATCH database the
+// Tests that need a real PostgreSQL, run against a SCRATCH database the
 // caller has just built with the full schema (review 2026-09-01, section 5c
-// items 5, 10 and 11, owed until 2026-10-01):
+// items 5, 10 and 11, owed until 2026-10-01; 12 to 19 added since):
 //
 //   createdb rscanvas_test     (or tools/make-test-db.sh)
 //   DATABASE_URL=...rscanvas_test node src/db/apply-schema.ts --with-retention
@@ -23,9 +23,42 @@
 //      its count; the Dashboard's sensor query weights by that count - the
 //      unweighted mean of hourly means is a different, wrong number - and
 //      clamps an hour's coverage at one.
+//  13. THE ROLLUP PURGE (sql/slice60.sql). A device delete and a check's
+//      removal queue their entities in the same statement; the census finds
+//      what was deleted before the queue existed; the drain purges only what
+//      the rollup is an hour past, in batches, and never a living entity's.
+//  14. REPEATING MAINTENANCE WINDOWS (sql/slice61.sql). maintenance_active()
+//      opens an occurrence on its days at its local time for its minutes -
+//      past midnight, across daylight saving, in its own zone - and the
+//      owed query, the alert read and the clear settlement honour it.
+//  15. RESTARTS (sql/slice62.sql). The poll write that stores the uptime
+//      records a judged restart - the event, the device row, planned when a
+//      window is open - and nothing on a failed poll; the collector and the
+//      scan read back what they need; deleting the device takes them.
+//  16. ACKNOWLEDGEMENT (sql/slice62.sql). Who and the note, renotify skips
+//      it, again replaces, taken back restores, a cleared alert refuses it;
+//      and a restart alert's clear is settled without an email, alone.
+//  17. THE DEVICE TIMELINE (OPS.deviceTimeline). Every kind of row, the
+//      device's own only - not another device's, not a pending alert, not
+//      an acknowledgement's audit line - newest first; windows on its
+//      location and one occurrence of its application's schedule; audit
+//      only with the permission; the window and the limit respected.
+//  18. THE AVAILABILITY REPORT (sql/slice63.sql). The ping roll-up from the
+//      oldest probe, maintenance probes counted apart, idempotent over an
+//      hour; the report's probes, hours measured, outages carried in from
+//      before the period, blips, planned downtime; ping retention never
+//      ahead of the roll-up; the cascade on delete.
+//  19. NOTES (sql/slice64.sql). Stored as written, blank is none, on the roster.
+//  20. CHANGE FROM NORMAL (sql/slice65.sql). The week from the hourly rollup
+//      (the current hour and day eight left out, a stale row dropped), the
+//      last minutes from raw, the scan's judgement - one sensor, a room of
+//      four on three, a down witness, a mute, an include - the device page's
+//      read, the room's holds (a member, for a sensor window after the room
+//      clears, a window, a policy, an overlap), and the cascade on delete.
 
 import pg from 'pg';
 import { OPS, closeAll } from '../src/store/index.ts';
+import { changeScan, DEFAULT_RULES } from '../src/alerts/scan.ts';
 import { assertDestructiveTarget } from '../src/safety.ts';
 
 process.exitCode = 1;
@@ -279,6 +312,593 @@ console.log('\n10. event alerts: one open row per key, folding, sticky severity,
     const logged = await OPS.logNotifications([...ids, '999999999'], ['raise', 'raise', 'raise', 'raise'], 'email', true, 'in a digest of 4');
     const digestRows = Number((await q<{ n: string }>(`SELECT count(*) AS n FROM notifications WHERE detail = 'in a digest of 4' AND channel = 'email'`))[0]!.n);
     eq('a digest logs one row per listed alert, skipping one that no longer exists', [logged.ok, digestRows], [true, 3]);
+}
+
+// --- 13. the rollup purge (slice 60) -------------------------------------------
+console.log('\n13. a deleted entity\'s hourly rows are queued with the delete and purged behind the rollup:');
+{
+    const hourly = async (ids: number[]): Promise<number> => Number((await q<{ n: string }>(
+        'SELECT count(*) AS n FROM samples_hourly WHERE entity_id = ANY($1::int[])', [ids]))[0]!.n);
+    const queue = async (): Promise<number[]> => (await q<{ entity_id: number }>(
+        'SELECT entity_id FROM rollup_purge ORDER BY entity_id')).map((r) => r.entity_id);
+    const setFrontier = (sql: string) => q(`UPDATE job_state SET through_ts = ${sql} WHERE job = 'rollup'`);
+    const drainAll = async (): Promise<{ entities: number; rows: number }> => {
+        let entities = 0, rows = 0;
+        for (let i = 0; i < 20; i++) {
+            const r = await OPS.purgeRollupBatch(2);
+            if (!r.ok) throw new Error(`purgeRollupBatch refused: ${r.reason}`);
+            entities += r.rows[0]!.entities;
+            rows += Number(r.rows[0]!.rows);
+            if (r.rows[0]!.entities < 2) break;
+        }
+        return { entities, rows };
+    };
+
+    await setFrontier(`date_trunc('hour', now())`);
+    await q(`INSERT INTO devices (id, name, host) VALUES (990003, 'scratch-gone', '192.0.2.3')`);
+    await q(`INSERT INTO entities (id, device_id, kind, name, code, tracked, source) VALUES
+             (990031, 990003, 'cpu', 'CPU C', 'SCRP', true, 'snmp'),
+             (990032, 990003, 'svc-http', 'Intranet', 'SCRQ', true, 'probe')`);
+    // Three hours each for the two, and for 990098 - an entity deleted
+    // before the queue existed, which only the census can find.
+    await q(`INSERT INTO samples_hourly (entity_id, hour_ts, n)
+             SELECT e, date_trunc('hour', now()) - make_interval(hours => h), 1
+               FROM unnest(ARRAY[990031, 990032, 990098]) e, generate_series(3, 5) h`);
+
+    // The census, first call: it records its start and waits for the rollup.
+    const first = await OPS.rollupPurgeCensus();
+    if (!first.ok) throw new Error(`rollupPurgeCensus refused: ${first.reason}`);
+    eq('the census\'s first call records its partitions and waits for the rollup to pass its start',
+        [first.rows[0]!.waiting, (first.rows[0]!.parts_left ?? 0) > 0], [true, true]);
+    await q(`UPDATE job_state SET detail = jsonb_set(detail, '{since}', to_jsonb(now() - interval '3 hours'))
+              WHERE job = 'rollup:purge-census'`);
+    let steps = 0;
+    for (; steps < 20; steps++) {
+        const c = await OPS.rollupPurgeCensus();
+        if (!c.ok) throw new Error(`rollupPurgeCensus refused: ${c.reason}`);
+        if (c.rows[0]!.parts_left === 0) break;
+    }
+    eq('two hours on, it reads one partition a call and queues the entity with no row - and no living one',
+        await queue(), [990098]);
+
+    // The app's own deletes queue their ids in the same statement.
+    const check = await OPS.deleteCheck('990003', 'SCRQ');
+    eq('deleteCheck removes the check', check.ok && check.rows.map((r) => r.name), ['Intranet']);
+    const gone = await OPS.deleteDevices(['scratch-gone']);
+    eq('deleteDevices removes the device', gone.ok && gone.rows.map((r) => r.name), ['scratch-gone']);
+    eq('and both queued their entities', await queue(), [990031, 990032, 990098]);
+
+    // The drain: the census's find is an hour behind the frontier; the
+    // deletes made just now are not, and stay queued with their rows.
+    let d = await drainAll();
+    eq('the drain purges what the rollup has passed: 990098\'s three rows', [d.entities, d.rows], [1, 3]);
+    eq('and leaves the fresh deletes queued, rows and all, until the rollup is an hour past them',
+        [await queue(), await hourly([990031, 990032])], [[990031, 990032], 6]);
+    await setFrontier(`date_trunc('hour', now()) + interval '3 hours'`);
+    d = await drainAll();
+    eq('once it is, they go, in bounded batches', [d.entities, d.rows, await queue()], [2, 6, []]);
+    eq('nothing of the three is left', await hourly([990031, 990032, 990098]), 0);
+
+    // An id in the queue that is a living entity leaves it, its rows kept.
+    const living = await hourly([990011]);
+    await q(`INSERT INTO rollup_purge (entity_id, queued_ts) VALUES (990011, now() - interval '1 day')`);
+    d = await drainAll();
+    eq('a living id in the queue leaves it, and its rows stay', [d.entities, d.rows, await hourly([990011]), await queue()],
+        [1, 0, living, []]);
+    eq('(and it had rows to keep)', living > 0, true);
+    await setFrontier('now()');
+}
+
+// --- 14. repeating maintenance windows (slice 61) ---------------------------------
+console.log('\n14. a repeating window is open on its days, at its local time, for its minutes - and gates as a window does:');
+{
+    const DEV = 'scratch-backup';
+    await q(`INSERT INTO devices (id, name, host) VALUES (990004, $1, '192.0.2.4')`, [DEV]);
+    const make = async (days: number[], at: string, minutes: number, tz: string): Promise<string> => {
+        const r = await OPS.createMaintenanceSchedule('device', DEV, days, at, minutes, tz, 'scratch', 'test');
+        if (!r.ok || r.rows.length !== 1) throw new Error(`schedule refused: ${r.ok ? 'no row' : r.reason}`);
+        return r.rows[0]!.id;
+    };
+    // One at a time: a pg Client runs one query at once (pg warns, and pg 9
+    // refuses, on overlapping calls).
+    const openAt = async (...at: string[]): Promise<boolean[]> => {
+        const out: boolean[] = [];
+        for (const t of at) {
+            out.push(Number((await q<{ n: string }>(
+                `SELECT count(*) AS n FROM maintenance_active($1::timestamptz) WHERE target = $2`, [t, DEV]))[0]!.n) > 0);
+        }
+        return out;
+    };
+    const clear = () => q(`DELETE FROM maintenance_schedules WHERE target = $1`, [DEV]);
+    const DAILY = [1, 2, 3, 4, 5, 6, 7];
+
+    // The domain controller's, the case that asked for this: every day at 03:00 for 10 minutes.
+    await make(DAILY, '03:00', 10, 'America/Chicago');
+    eq('every day at 03:00 Chicago (CDT): open from 08:00Z for ten minutes, not a moment either side',
+        await openAt('2026-10-10 07:59:59Z', '2026-10-10 08:00Z', '2026-10-10 08:09:59Z', '2026-10-10 08:10Z'),
+        [false, true, true, false]);
+    eq('in January the same 03:00 is CST, 09:00Z', await openAt('2027-01-15 08:05Z', '2027-01-15 09:05Z'), [false, true]);
+    await clear();
+
+    // 2026-10-10 is a Saturday.
+    await make([1, 2, 3, 4, 5], '03:00', 10, 'America/Chicago');
+    eq('weekdays only: open Friday at 03:05, closed Saturday at 03:05', await openAt('2026-10-09 08:05Z', '2026-10-10 08:05Z'), [true, false]);
+    await clear();
+    await make([6], '23:30', 60, 'America/Chicago');
+    eq('Saturdays at 23:30 for an hour: open at 23:45, and past midnight at 00:15 Sunday',
+        await openAt('2026-10-11 04:45Z', '2026-10-11 05:15Z'), [true, true]);
+    eq('closed at 00:30 Sunday, and at 23:45 on Friday and on Sunday',
+        await openAt('2026-10-11 05:30Z', '2026-10-10 04:45Z', '2026-10-12 04:45Z'), [false, false, false]);
+    await clear();
+
+    // Daylight saving, as measured when the slice was written.
+    await make(DAILY, '02:30', 30, 'America/Chicago');
+    eq('2026-03-08, when 02:30 does not exist: open 08:30Z-09:00Z, which is 03:30-04:00 CDT',
+        await openAt('2026-03-08 08:15Z', '2026-03-08 08:45Z', '2026-03-08 09:00Z'), [false, true, false]);
+    await clear();
+    await make(DAILY, '01:30', 30, 'America/Chicago');
+    eq('2026-11-01, when 01:30 happens twice: open for the second (CST, 07:30Z), not the first (06:30Z)',
+        await openAt('2026-11-01 06:45Z', '2026-11-01 07:45Z'), [false, true]);
+    await clear();
+    await make(DAILY, '03:00', 10, 'Europe/London');
+    eq('the zone is the schedule\'s own: 03:00 in London (BST) is 02:00Z', await openAt('2026-10-10 02:05Z', '2026-10-10 08:05Z'), [true, false]);
+    await clear();
+
+    // What may be stored.
+    const unknown = await OPS.createMaintenanceSchedule('device', DEV, [1], '03:00', 10, 'Mars/Olympus', null, 'test');
+    eq('a zone the database does not know makes no row (one would break every reader)', unknown.ok && unknown.rows.length, 0);
+    let refused = '';
+    try {
+        await OPS.createMaintenanceSchedule('device', DEV, [1], '03:00', 721, 'UTC', null, 'test');
+    } catch (err) {
+        refused = (err as { code?: string }).code ?? 'threw';
+    }
+    eq('the table itself refuses an occurrence over 12 hours', refused, '23514');
+
+    // The gate, through the app's own statements, with an occurrence open now.
+    const startedAgo = (await q<{ t: string }>(
+        `SELECT to_char((now() AT TIME ZONE 'UTC') - interval '5 minutes', 'HH24:MI') AS t`))[0]!.t;
+    const sid = await make(DAILY, startedAgo, 30, 'UTC');
+    const listed = await OPS.maintenanceSchedules();
+    const mine = listed.ok ? listed.rows.find((r) => r.id === sid) : undefined;
+    // Started five minutes ago, to the minute: 24 or 25 minutes still to run.
+    const left = mine?.next_ends ? (mine.next_ends.getTime() - Date.now()) / 60_000 : -1;
+    eq('the list says it is open now, until its occurrence ends', [mine?.active, left > 23.5 && left <= 25.5], [true, true]);
+    const raise = async (): Promise<string> => (await q<{ id: string }>(
+        `INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, raised_ts, last_seen_ts)
+         VALUES ($1, 'active', 'crit', 'device-down', $2, 'not answering', now(), now(), now()) RETURNING id::text AS id`,
+        [`device:${DEV}`, DEV]))[0]!.id;
+    const owed = async (): Promise<boolean> => {
+        const r = await OPS.alertsOwingRaise();
+        if (!r.ok) throw new Error(`alertsOwingRaise refused: ${r.reason}`);
+        return r.rows.some((a) => a.host === DEV);
+    };
+    const first = await raise();
+    eq('a device-down raised while it is open is owed no page', await owed(), false);
+    const shown = await OPS.getAlert(first);
+    eq('and reads as in maintenance', shown.ok && shown.rows[0]?.in_maintenance, true);
+    await q(`UPDATE alerts SET state = 'cleared', cleared_ts = now(), clear_reason = 'recovered' WHERE id = $1::bigint`, [first]);
+    await OPS.settleInWindowClears();
+    eq('its clear, inside the occurrence and of a raise nobody was sent, is settled without a page',
+        (await q<{ c: boolean }>(`SELECT notified_clear AS c FROM alerts WHERE id = $1::bigint`, [first]))[0]?.c, true);
+    await raise();
+    eq('a second outage, still active...', await owed(), false);
+    const gone = await OPS.cancelMaintenanceSchedule(sid);
+    eq('...is owed its page the moment the schedule is removed', [gone.ok && gone.rows.length, await owed()], [1, true]);
+    await q(`DELETE FROM alerts WHERE host = $1`, [DEV]);
+}
+
+// --- 15. restarts (slice 62) ---------------------------------------------------
+console.log('\n15. a restart is recorded by the poll write that stores the uptime it was judged from:');
+{
+    const DEV = 'scratch-restart';
+    const ID = '990005';
+    await q(`INSERT INTO devices (id, name, host) VALUES ($1::bigint, $2, '192.0.2.5')`, [ID, DEV]);
+    const poll = (uptime: number, upBefore: number | null) => OPS.recordDevicePoll(
+        ID, true, null, null, null, false, null, null, null, uptime, null, null, null, null, null, upBefore);
+    const events = async () => q<{ up: number; planned: boolean; boot_age: number }>(
+        `SELECT up_before_s AS up, planned, extract(epoch FROM now() - boot_ts)::float8 AS boot_age
+           FROM reboot_events WHERE device_id = $1::bigint ORDER BY id`, [ID]);
+    const row = async () => (await q<{ seen: boolean; up: number | null; planned: boolean | null; uptime: number }>(
+        `SELECT reboot_seen_ts IS NOT NULL AS seen, reboot_up_before_s AS up, reboot_planned AS planned, uptime_s AS uptime
+           FROM devices WHERE id = $1::bigint`, [ID]))[0]!;
+
+    const first = await poll(86_400, null);
+    eq('an ordinary poll records no restart', [first.ok, (await events()).length, (await row()).seen], [true, 0, false]);
+    await poll(40, 86_400);
+    const ev = await events();
+    eq('a judged restart: one event, the uptime before, not planned', ev.map((e) => [e.up, e.planned]), [[86_400, false]]);
+    eq('its boot time is the write\'s now() less the new uptime', ev[0] !== undefined && ev[0].boot_age > 39 && ev[0].boot_age < 45, true);
+    eq('and the device row carries it, beside the new uptime', await row(), { seen: true, up: 86_400, planned: false, uptime: 40 });
+
+    // The judgement's inputs, as the collector receives them: the uptime and
+    // the DATABASE's age of the last good poll.
+    await q(`UPDATE devices SET last_poll_ts = now() - interval '1 hour', poll_anchor_ts = NULL,
+                                last_seen_ts = now() - interval '90 seconds' WHERE id = $1::bigint`, [ID]);
+    const due = await OPS.duePollTargets(1000, 'live', 3, []);
+    const mine = due.ok ? due.rows.find((d) => d.id === ID) : undefined;
+    eq('duePollTargets hands the collector the last uptime and its age by the database clock',
+        mine && [mine.uptime_s, mine.since_seen_s !== null && mine.since_seen_s >= 89 && mine.since_seen_s < 95], [40, true]);
+    const scan = await OPS.alertScanDevices();
+    const s = scan.ok ? scan.rows.find((d) => d.name === DEV) : undefined;
+    eq('the scan reads the restart\'s age and its uptime before',
+        s && [s.reboot_age_s !== null && s.reboot_age_s < 30, s.reboot_up_before_s, s.reboot_planned], [true, 86_400, false]);
+
+    // PLANNED is decided when the restart is recorded: a window open now.
+    const startedAgo = (await q<{ t: string }>(
+        `SELECT to_char((now() AT TIME ZONE 'UTC') - interval '5 minutes', 'HH24:MI') AS t`))[0]!.t;
+    const sched = await OPS.createMaintenanceSchedule('device', DEV, [1, 2, 3, 4, 5, 6, 7], startedAgo, 30, 'UTC', 'scratch', 'test');
+    await poll(20, 50);
+    eq('a restart inside a maintenance window is recorded as planned', (await events()).map((e) => e.planned), [false, true]);
+    eq('and the device row says so', (await row()).planned, true);
+    if (sched.ok && sched.rows[0]) await OPS.cancelMaintenanceSchedule(sched.rows[0].id);
+
+    const failed = await OPS.recordDevicePoll(ID, false, null, null, null, false, null, null, null, null, null, null, null, null, null, 999);
+    eq('a FAILED poll records nothing, whatever it is handed', [failed.ok, (await events()).length], [true, 2]);
+
+    await OPS.deleteDevices([DEV]);
+    eq('deleting the device takes its restarts (the cascade)', (await events()).length, 0);
+}
+
+// --- 16. acknowledgement (slice 62) ----------------------------------------------
+console.log('\n16. an acknowledgement names who and why, stops renotify, and belongs to the incident:');
+{
+    const HOST = 'scratch-ack';
+    const raise = async (kind = 'device-down', state = 'active'): Promise<string> => (await q<{ id: string }>(
+        `INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, raised_ts, last_seen_ts,
+                             notified_raise, cleared_ts)
+         VALUES ($1, $2, 'crit', $3, $4, 'scratch ack', now() - interval '5 hours', now() - interval '5 hours', now(),
+                 true, CASE WHEN $2 = 'cleared' THEN now() END)
+         RETURNING id::text AS id`, [`${kind}:${HOST}:${Math.random()}`, state, kind, HOST]))[0]!.id;
+    const owing = async (id: string): Promise<boolean> => {
+        const r = await OPS.alertsOwingRenotify(1);
+        if (!r.ok) throw new Error(`alertsOwingRenotify refused: ${r.reason}`);
+        return r.rows.some((a) => a.id === id);
+    };
+    const who = async (id: string) => (await q<{ by: string | null; note: string | null; at: boolean }>(
+        `SELECT acked_by AS by, ack_note AS note, acked_ts IS NOT NULL AS at FROM alerts WHERE id = $1::bigint`, [id]))[0];
+
+    const id = await raise();
+    eq('a crit raised five hours ago is owed a renotify at a one-hour interval', await owing(id), true);
+    const a1 = await OPS.ackAlert(id, 'alice', 'ISP ticket 4471');
+    eq('acknowledged: the row names who and the note, and the route gets the label to audit',
+        [a1.ok && a1.rows[0]?.label, await who(id)], ['scratch ack', { by: 'alice', note: 'ISP ticket 4471', at: true }]);
+    eq('and renotify skips it - DECISIONS-2026-09-01 ruling 2, honoured since before this slice', await owing(id), false);
+    const shown = await OPS.uiAlert(id);
+    eq('the alert page reads it, and the alert itself is unchanged - still active',
+        shown.ok && [shown.rows[0]?.state, shown.rows[0]?.acked_by, shown.rows[0]?.ack_note], ['active', 'alice', 'ISP ticket 4471']);
+    await OPS.ackAlert(id, 'bob', null);
+    eq('acknowledging again replaces the who and the note', await who(id), { by: 'bob', note: null, at: true });
+    const u1 = await OPS.unackAlert(id);
+    eq('taken back: all three cleared, and renotify applies again', [u1.ok && u1.rows.length, await who(id), await owing(id)],
+        [1, { by: null, note: null, at: false }, true]);
+    const u2 = await OPS.unackAlert(id);
+    eq('taking back what nobody acknowledged changes nothing', u2.ok && u2.rows.length, 0);
+    await q(`UPDATE alerts SET state = 'cleared', cleared_ts = now(), clear_reason = 'recovered' WHERE id = $1::bigint`, [id]);
+    const a2 = await OPS.ackAlert(id, 'alice', null);
+    eq('a cleared alert cannot be acknowledged - it is history', [a2.ok && a2.rows.length, (await who(id))?.at], [0, false]);
+
+    // A restart alert's clear is settled without an email; nothing else is.
+    const restart = await raise('reboot', 'cleared');
+    const down = await raise('device-down', 'cleared');
+    const settled = await OPS.settleRestartClears([restart, down]);
+    const flags = await q<{ c: boolean }>(
+        `SELECT notified_clear AS c FROM alerts WHERE id = ANY($1::bigint[]) ORDER BY id`, [[restart, down]]);
+    eq('settleRestartClears settles the restart alert\'s clear and only that',
+        [settled.ok && settled.rows.map((r) => r.id), flags.map((r) => r.c)], [[restart], [true, false]]);
+    await q(`DELETE FROM alerts WHERE host = $1`, [HOST]);
+}
+
+// --- 17. the device timeline (IDEAS-2026-10-15 item 4) -----------------------------
+console.log('\n17. one device\'s timeline: every kind, its own rows only, newest first, audit for admins:');
+{
+    const DEV = 'scratch-timeline';
+    const ID = '990006';
+    await q(`INSERT INTO devices (id, name, host, location, application) VALUES ($1::bigint, $2, '192.0.2.6', 'Rack 9', 'App T')`, [ID, DEV]);
+    await q(`INSERT INTO devices (id, name, host) VALUES (990007, 'scratch-other', '192.0.2.7')`);
+    await q(`INSERT INTO entities (device_id, kind, name, code) VALUES ($1::int, 'cpu', 'cpu', 'TL01')`, [ID]);
+    const ago = (min: number): string => `now() - interval '${min} minutes'`;
+    const alert = (key: string, host: string, cols: string, vals: string) => q(
+        `INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, last_seen_ts, code${cols})
+         VALUES ($1, 'cleared', 'crit', 'cpu', $2, $1, now() - interval '3 days', now(), 'TL01'${vals})`, [key, host]);
+    // One incident with all four moments, one older than the window except
+    // its clear, one pending that never raised, and one on another device.
+    await alert('tl-a', DEV, ', raised_ts, escalated_ts, cleared_ts, clear_reason, acked_ts, acked_by, ack_note',
+        `, ${ago(120)}, ${ago(90)}, ${ago(58)}, 'normal', ${ago(100)}, 'alice', 'ticket 9'`);
+    await alert('tl-c', DEV, ', raised_ts, cleared_ts, clear_reason', `, ${ago(1800)}, ${ago(1200)}, 'normal'`);
+    await q(`INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, last_seen_ts)
+             VALUES ('tl-pending', 'pending', 'warn', 'cpu', $1, 'never raised', now(), now())`, [DEV]);
+    await alert('tl-other', 'scratch-other', ', raised_ts', `, ${ago(30)}`);
+    await q(`INSERT INTO reachability_events (device_id, ts, from_state, to_state, rtt_ms) VALUES
+             ($1::bigint, ${ago(50)}, 'up', 'down', NULL), ($1::bigint, ${ago(49)}, 'down', 'up', 0.4),
+             (990007, ${ago(45)}, 'up', 'down', NULL)`, [ID]);
+    await q(`INSERT INTO reboot_events (device_id, ts, boot_ts, up_before_s, planned)
+             VALUES ($1::bigint, ${ago(179)}, ${ago(180)}, 86400, false)`, [ID]);
+    await q(`INSERT INTO maintenance_windows (scope, target, starts_ts, ends_ts, note, created_by) VALUES
+             ('device', $1, ${ago(240)}, ${ago(230)}, 'patching', 'bob'),
+             ('location', 'Rack 9', ${ago(300)}, ${ago(290)}, NULL, 'bob'),
+             ('device', 'scratch-other', ${ago(200)}, ${ago(190)}, NULL, 'bob')`, [DEV]);
+    // A daily schedule on its application, started six hours ago (UTC):
+    // exactly one occurrence falls in the last 24 hours, whatever the hour.
+    const six = (await q<{ t: string }>(
+        `SELECT to_char((now() AT TIME ZONE 'UTC') - interval '6 hours', 'HH24:MI') AS t`))[0]!.t;
+    const sched = await OPS.createMaintenanceSchedule('application', 'App T', [1, 2, 3, 4, 5, 6, 7], six, 30, 'UTC', 'nightly', 'test');
+    await q(`INSERT INTO audit (ts, actor_username, action, target, detail) VALUES
+             (${ago(10)}, 'bob', 'threshold.set', $1 || '/cpu', '{}'),
+             (${ago(12)}, 'bob', 'device.mute', '2 device(s)', jsonb_build_object('names', jsonb_build_array($1::text, 'x'))),
+             (${ago(15)}, 'bob', 'threshold.set', 'code TL01', '{}'),
+             (${ago(16)}, 'bob', 'alert.ack', $1 || ' (192.0.2.6) cpu', '{}'),
+             (${ago(17)}, 'bob', 'device.mute', '1 device(s)', '{"names": ["scratch-other"]}'),
+             (${ago(18)}, 'bob', 'threshold.set', 'scratch-other/cpu', '{}')`, [DEV]);
+
+    const tl = await OPS.deviceTimeline(DEV, 24, true, 300);
+    const rows = tl.ok ? tl.rows : [];
+    eq('every kind, newest first, nothing of another device, no pending alert, no ack audit line',
+        rows.map((r) => r.kind === 'audit' ? `audit ${String(r.data?.action)}` : r.kind),
+        ['audit threshold.set', 'audit device.mute', 'audit threshold.set', 'reach', 'reach', 'alert-clear',
+            'alert-escalate', 'alert-ack', 'alert-raise', 'restart', 'maintenance', 'maintenance', 'maintenance', 'alert-clear']);
+    const a = rows.find((r) => r.kind === 'alert-ack');
+    eq('an acknowledgement carries who and the note; a clear its reason',
+        [a?.data?.by, a?.data?.note, rows.find((r) => r.kind === 'alert-clear')?.data?.reason], ['alice', 'ticket 9', 'normal']);
+    const r = rows.find((x) => x.kind === 'restart');
+    eq('a restart sits at the time it came back, with its uptime before', [r?.data?.upBefore, r?.data?.planned], [86400, false]);
+    const m = rows.filter((x) => x.kind === 'maintenance');
+    const mins = (x: (typeof rows)[number]): number => Math.round((x.until!.getTime() - x.ts.getTime()) / 60_000);
+    eq('windows on the device and its location, and the ONE occurrence of its application\'s schedule, each with its end',
+        m.map((x) => [x.data?.scope, x.data?.repeating, mins(x)]),
+        [['device', false, 10], ['location', false, 10], ['application', true, 30]]);
+    eq('the older incident shows only its clear - its raise is outside the window', rows.at(-1)?.text, 'tl-c');
+    const noAudit = await OPS.deviceTimeline(DEV, 24, false, 300);
+    eq('without the audit permission there are no audit rows', noAudit.ok && noAudit.rows.filter((x) => x.kind === 'audit').length, 0);
+    const short = await OPS.deviceTimeline(DEV, 1, true, 300);
+    eq('an hour back holds only the last hour', short.ok && short.rows.map((x) => x.kind),
+        ['audit', 'audit', 'audit', 'reach', 'reach', 'alert-clear']);
+    const capped = await OPS.deviceTimeline(DEV, 24, true, 3);
+    eq('and the limit keeps the newest', capped.ok && capped.rows.length, 3);
+
+    if (sched.ok && sched.rows[0]) await OPS.cancelMaintenanceSchedule(sched.rows[0].id);
+    await q(`DELETE FROM maintenance_windows WHERE created_by = 'bob'`);
+    await q(`DELETE FROM audit WHERE actor_username = 'bob'`);
+    await q(`DELETE FROM alerts WHERE host IN ($1, 'scratch-other')`, [DEV]);
+    await OPS.deleteDevices([DEV, 'scratch-other']);
+}
+
+// --- 18. the availability report (sql/slice63.sql) ---------------------------------
+console.log('\n18. minute probes rolled up by the hour, maintenance apart; the report from them and the sweep:');
+{
+    const DEV = 'scratch-avail';
+    const ID = '990008';
+    await q(`INSERT INTO devices (id, name, host, location) VALUES ($1::bigint, $2, '192.0.2.8', 'Closet A')`, [ID, DEV]);
+    // Two whole hours, three and two hours back: 60 probes each, 2 misses in
+    // the first, 5 in the second - which a device-scope window covers whole.
+    const A = `date_trunc('hour', now()) - interval '3 hours'`;
+    const B = `date_trunc('hour', now()) - interval '2 hours'`;
+    await q(`INSERT INTO ping_samples (device_id, ts, rtt_ms)
+             SELECT $1::bigint, ${A} + make_interval(mins => g), CASE WHEN g < 2 THEN NULL ELSE 0.5 END
+               FROM generate_series(0, 59) g`, [ID]);
+    await q(`INSERT INTO ping_samples (device_id, ts, rtt_ms)
+             SELECT $1::bigint, ${B} + make_interval(mins => g), CASE WHEN g < 5 THEN NULL ELSE 0.5 END
+               FROM generate_series(0, 59) g`, [ID]);
+    await q(`INSERT INTO maintenance_windows (scope, target, starts_ts, ends_ts, note, created_by)
+             VALUES ('device', $1, ${B}, ${B} + interval '1 hour', 'firmware', 'avail-test')`, [DEV]);
+
+    const rollAll = async (): Promise<number> => {
+        let chunks = 0;
+        for (;;) {
+            const r = await OPS.rollUpPingChunk(24, 5);
+            if (!r.ok || !r.rows[0]) throw new Error(`roll-up refused: ${r.ok ? 'no row' : r.reason}`);
+            chunks++;
+            if (r.rows[0].caught_up || chunks > 10) return chunks;
+        }
+    };
+    await rollAll();
+    const hours = async () => q<{ h: string; p: number; m: number; pp: number; pm: number }>(
+        `SELECT to_char(hour_ts, 'HH24') AS h, probes AS p, misses AS m, planned_probes AS pp, planned_misses AS pm
+           FROM ping_hourly WHERE device_id = $1::bigint ORDER BY hour_ts`, [ID]);
+    const first = await hours();
+    eq('the first roll-up starts at the oldest probe: two hours, every probe counted, the window\'s hour planned whole',
+        first.map((r) => [r.p, r.m, r.pp, r.pm]), [[60, 2, 0, 0], [60, 5, 60, 5]]);
+    await q(`UPDATE job_state SET through_ts = through_ts - interval '3 hours' WHERE job = 'rollup:ping'`);
+    await rollAll();
+    eq('rolled again over the same hours, it rewrites them whole - nothing counted twice',
+        (await hours()).map((r) => [r.p, r.m, r.pp, r.pm]), [[60, 2, 0, 0], [60, 5, 60, 5]]);
+
+    // The sweep's transitions: one down before the period that ends ten
+    // minutes in, a 30 s blip and a two-minute outage in hour A, and ten
+    // minutes down inside the window in hour B.
+    const LO = `(now() - interval '2 days')::date::timestamp AT TIME ZONE 'UTC'`;
+    await q(`INSERT INTO reachability_events (device_id, ts, from_state, to_state) VALUES
+             ($1::bigint, ${LO} - interval '1 hour', 'up', 'down'),
+             ($1::bigint, ${LO} + interval '10 minutes', 'down', 'up'),
+             ($1::bigint, ${A} + interval '5 minutes', 'up', 'down'),
+             ($1::bigint, ${A} + interval '5 minutes 30 seconds', 'down', 'up'),
+             ($1::bigint, ${A} + interval '20 minutes', 'up', 'down'),
+             ($1::bigint, ${A} + interval '22 minutes', 'down', 'up'),
+             ($1::bigint, ${A} + interval '40 minutes', 'up', 'degraded'),
+             ($1::bigint, ${A} + interval '41 minutes', 'degraded', 'up'),
+             ($1::bigint, ${B} + interval '10 minutes', 'up', 'down'),
+             ($1::bigint, ${B} + interval '20 minutes', 'down', 'up')`, [ID]);
+    const days = (await q<{ f: string; t: string }>(
+        `SELECT to_char(now() - interval '2 days', 'YYYY-MM-DD') AS f, to_char(now(), 'YYYY-MM-DD') AS t`))[0]!;
+    const frontier = (await q<{ t: Date }>(`SELECT through_ts AS t FROM job_state WHERE job = 'rollup:ping'`))[0]!.t;
+    const rep = await OPS.availabilityReport(days.f, days.t, 'UTC', frontier);
+    const mine = rep.ok ? rep.rows.find((r) => r.device === DEV) : undefined;
+    eq('the report: both hours\' probes, the window\'s apart, two hours measured',
+        mine && [Number(mine.probes), Number(mine.misses), Number(mine.planned_probes), Number(mine.planned_misses), mine.hours_measured],
+        [120, 7, 60, 5, 2]);
+    const expectTotal = (await q<{ n: number }>(`SELECT ceil(extract(epoch FROM $1::timestamptz - (${A})) / 3600)::int AS n`, [frontier]))[0]!.n;
+    eq('and measured against the hours since it was first probed, not since the period began', mine?.hours_total, expectTotal);
+    eq('outages: the one carried in from before the period and the two-minute one; the 30 s blip apart; degraded is not down',
+        mine && [mine.outages, mine.blips, mine.longest_s, mine.down_s], [2, 1, 600, 750]);
+    eq('the ten minutes down inside the window are planned, not an outage', mine?.planned_down_s, 600);
+
+    // Retention never deletes a probe the roll-up has not taken.
+    await q(`INSERT INTO ping_samples (device_id, ts, rtt_ms) VALUES ($1::bigint, now(), 0.5)`, [ID]);
+    await q(`UPDATE job_state SET through_ts = ${B} WHERE job = 'rollup:ping'`);
+    await OPS.prunePingSamples(0);
+    const left = await q<{ before_b: number; after: number }>(
+        `SELECT count(*) FILTER (WHERE ts < ${B})::int AS before_b, count(*) FILTER (WHERE ts >= ${B})::int AS after
+           FROM ping_samples WHERE device_id = $1::bigint`, [ID]);
+    eq('with the frontier at hour B, a zero-day prune takes hour A\'s probes and keeps B\'s and the new one',
+        left[0], { before_b: 0, after: 61 });
+
+    await q(`DELETE FROM maintenance_windows WHERE created_by = 'avail-test'`);
+    await OPS.deleteDevices([DEV]);
+    eq('deleting the device takes its hours with it (the cascade)',
+        (await q<{ n: number }>(`SELECT count(*)::int AS n FROM ping_hourly WHERE device_id = $1::bigint`, [ID]))[0]?.n, 0);
+}
+
+// --- 19. notes (sql/slice64.sql) -------------------------------------------------
+console.log('\n19. a device\'s notes are stored as written, blank is none, and the roster carries them:');
+{
+    const DEV = 'scratch-notes';
+    await q(`INSERT INTO devices (id, name, host) VALUES (990009, $1, '192.0.2.9')`, [DEV]);
+    const text = 'Owner: Jordan Kim\nAsset tag 004417';
+    const w = await OPS.setDeviceNotes(DEV, `${text}\n\n  `);
+    const rosterNotes = async (): Promise<string | null | undefined> => {
+        const r = await OPS.uiDevices();
+        return r.ok ? r.rows.find((x) => x.name === DEV)?.notes : undefined;
+    };
+    eq('saved with its line break, the trailing blank lines trimmed, and read back from the roster',
+        [w.ok && w.rows.length, await rosterNotes()], [1, text]);
+    await OPS.setDeviceNotes(DEV, '   ');
+    eq('blank is none - NULL, one state', await rosterNotes(), null);
+    const nobody = await OPS.setDeviceNotes('no-such-device', 'x');
+    eq('a device that does not exist changes nothing', nobody.ok && nobody.rows.length, 0);
+    await OPS.deleteDevices([DEV]);
+}
+
+// --- 20. change from normal (sql/slice65.sql) ---------------------------------------
+console.log('\n20. change from normal: the week from the rollup, the last minutes from raw, the scan\'s judgement, and the holds:');
+{
+    const LOC = 'Scratch Closet';
+    // Three servers and a switch in one room, and a lone server in another.
+    await q(`INSERT INTO devices (id, name, host, location, stencil, last_poll_ts) VALUES
+             (990020, 'scratch-tc-a', '192.0.2.20', $1, 'server', now()),
+             (990021, 'scratch-tc-b', '192.0.2.21', $1, 'server', now()),
+             (990022, 'scratch-tc-c', '192.0.2.22', $1, 'switch', now()),
+             (990023, 'scratch-tc-d', '192.0.2.23', $1, 'server', now()),
+             (990024, 'scratch-tc-lone', '192.0.2.24', 'Scratch Attic', 'server', now())`, [LOC]);
+    await q(`INSERT INTO entities (id, device_id, kind, name, code, tracked) VALUES
+             (990201, 990020, 'temp', 'Temp: SYSTIN', 'TCA1', true),
+             (990202, 990020, 'temp', 'Temp: Package id 0', 'TCA2', true),
+             (990203, 990021, 'temp', 'Temp: mlx5-pci-0100:sensor0', 'TCB1', true),
+             (990204, 990022, 'temp', 'Temp: CPU temperature', 'TCC1', true),
+             (990205, 990023, 'temp', 'Temp: temp1', 'TCD1', true),
+             (990206, 990024, 'temp', 'Temp: AUXTIN1', 'TCL1', true),
+             (990207, 990024, 'temp', 'Temp: da1', 'TCL2', false),
+             (990208, 990023, 'temp', 'Temp: Module0', 'TCD2', true)`);
+    // A week of hourly means: 100 hours cycling 40, 40.5, 41, 41.5 - median
+    // 40.75, quartiles 40.375 and 41.125. The current hour and one eight days
+    // back read 99, and must not count. The DIMM has ten hours: learning.
+    await q(`INSERT INTO samples_hourly (entity_id, hour_ts, n, a0)
+             SELECT e, date_trunc('hour', now()) - make_interval(hours => g + 1), 120, 40 + (g % 4) * 0.5
+               FROM unnest(ARRAY[990201, 990202, 990203, 990204, 990205, 990206]) e, generate_series(0, 99) g
+             UNION ALL SELECT e, date_trunc('hour', now()), 120, 99
+               FROM unnest(ARRAY[990201, 990202, 990203, 990204, 990205, 990206]) e
+             UNION ALL SELECT e, date_trunc('hour', now()) - interval '8 days', 120, 99
+               FROM unnest(ARRAY[990201, 990202, 990203, 990204, 990205, 990206]) e
+             UNION ALL SELECT 990208, date_trunc('hour', now()) - make_interval(hours => g + 1), 120, 40
+               FROM generate_series(0, 9) g
+             UNION ALL SELECT 990207, date_trunc('hour', now()) - make_interval(hours => g + 1), 120, 40
+               FROM generate_series(0, 99) g`);
+    // An untracked sensor's row from when it was tracked: the refresh drops it.
+    await q(`INSERT INTO temp_baselines (entity_id, base_ts, hours, med, q1, q3)
+             VALUES (990207, now() - interval '1 day', 100, 40, 39, 41)`);
+    const ref = await OPS.refreshTempBaselines(7);
+    eq('the refresh runs and drops at least the stale row', ref.ok && (ref.rows[0]?.dropped ?? 0) >= 1, true);
+    const base = await q<{ id: number; hours: number; med: number; q1: number; q3: number }>(`
+        SELECT entity_id AS id, hours, med, q1, q3 FROM temp_baselines
+         WHERE entity_id BETWEEN 990201 AND 990208 ORDER BY entity_id`);
+    const b1 = base.find((x) => x.id === 990201);
+    eq('a tracked temperature\'s week: 100 hours, median 40.75, quartiles 40.375 / 41.125 - the current hour and day 8 left out',
+        b1 && [b1.hours, near(b1.med, 40.75), near(b1.q1, 40.375), near(b1.q3, 41.125)], [100, true, true, true]);
+    eq('every tracked temperature gets one, work-driven too (including counts from the next scan)',
+        base.map((x) => x.id), [990201, 990202, 990203, 990204, 990205, 990206, 990208]);
+    eq('the learning DIMM is kept with its ten hours', base.find((x) => x.id === 990208)?.hours, 10);
+
+    // The last 20 minutes at 30 s: A's board at 60 (a dead fan), B's NIC and
+    // C's switch chip 4 C warm for the last ten (the room), D at its week, A's
+    // CPU at 90 (work), the lone server's board at 60.
+    await q(`INSERT INTO samples (entity_id, ts, v0)
+             SELECT e, now() - make_interval(secs => g * 30 + 5),
+                    CASE e WHEN 990201 THEN 60 WHEN 990202 THEN 90 WHEN 990206 THEN 60 WHEN 990205 THEN 40.75
+                           WHEN 990203 THEN CASE WHEN g < 20 THEN 45 ELSE 40.75 END
+                           WHEN 990204 THEN CASE WHEN g < 20 THEN 44.5 ELSE 40.75 END END
+               FROM unnest(ARRAY[990201, 990202, 990203, 990204, 990205, 990206]) e, generate_series(0, 39) g`);
+    const rec = await OPS.tempChangeRecent([990203], 600, 1200);
+    eq('the recent read: B\'s last 10 minutes are 20 readings at 45, its last 20 are 40 with median 42.875',
+        rec.ok && rec.rows.map((r) => [r.n10, r.r10, r.n20, r.r20]), [[20, 45, 40, 42.875]]);
+
+    const judge = async (cfg = DEFAULT_RULES) => {
+        const all = await changeScan(cfg);
+        return Object.fromEntries(all.filter((c) => /TC[A-Z]\d$|Scratch/.test(c.key))
+            .map((c) => [c.key, [c.severity, c.frozen, c.value]]));
+    };
+    eq('THE SCAN: A\'s board and the lone board raise; B, C and D read normal; the room of four raises on three; the CPU, the learning DIMM and the untracked disk take no part; a room of one is not a room',
+        await judge(), {
+            'change:TCA1': ['warn', false, 19.3], 'change:TCB1': [null, false, 2.1], 'change:TCC1': [null, false, 1.9],
+            'change:TCD1': [null, false, 0], 'change:TCL1': ['warn', false, 19.3],
+            [`temp-room:location:${LOC}`]: ['warn', false, 3.8],
+        });
+    const room = (await changeScan(DEFAULT_RULES)).find((c) => c.key === `temp-room:location:${LOC}`);
+    eq('the room\'s label names the three, warmest first', room?.label,
+        `${LOC} (location): 3 of 4 devices warmer than their week - scratch-tc-a, scratch-tc-b, scratch-tc-c`);
+    await q(`UPDATE devices SET status = 'down' WHERE id = 990021`);
+    const down = await judge();
+    eq('B down: its own condition freezes, and the room - three judged, two warm - reads normal',
+        [down['change:TCB1'], down[`temp-room:location:${LOC}`]], [[null, true, null], [null, false, 0]]);
+    await q(`UPDATE devices SET status = 'up', alerts_muted = true WHERE id IN (990021, 990020)`);
+    const muted = await judge();
+    eq('A and B muted: nothing of theirs, and a room of two - C and D, one warm - reads normal',
+        [muted['change:TCA1'], muted['change:TCB1'], muted[`temp-room:location:${LOC}`]], [undefined, undefined, [null, false, 0]]);
+    await q(`UPDATE devices SET alerts_muted = false WHERE id IN (990021, 990020)`);
+    const included = await judge({ ...DEFAULT_RULES, overrides: [{ scope: 'code', code: 'TCA2', kind: 'temp-change', enabled: true }] });
+    eq('A\'s CPU included on its card: read, and +49 C raises', included['change:TCA2'], ['warn', false, 49.3]);
+
+    const shown = await OPS.uiDeviceEntities('scratch-tc-a');
+    const card = shown.ok ? shown.rows.find((r) => r.code === 'TCA1') : undefined;
+    eq('the device page reads the week and the stencil with the entities - no extra query',
+        card && [card.base_hours, card.base_med, card.stencil], [100, 40.75, 'server']);
+
+    // The holds, on alert rows as the scan would write them.
+    const alert = async (key: string, kind: string, host: string | null, code: string | null): Promise<string> => (await q<{ id: string }>(
+        `INSERT INTO alerts (alert_key, state, severity, kind, host, code, label, first_breach_ts, raised_ts, last_seen_ts)
+         VALUES ($1, 'active', 'warn', $2, $3, $4, 'scratch change', now() - interval '10 minutes', now() - interval '9 minutes', now())
+         RETURNING id::text AS id`, [key, kind, host, code]))[0]!.id;
+    const roomId = await alert(`temp-room:location:${LOC}`, 'temp-room', null, null);
+    const memberId = await alert('change:TCA1', 'temp-change', 'scratch-tc-a', 'TCA1');
+    const loneId = await alert('change:TCL1', 'temp-change', 'scratch-tc-lone', 'TCL1');
+    const flags = async (id: string) => {
+        const r = await OPS.getAlert(id);
+        const a = r.ok ? r.rows[0] : undefined;
+        return a && [a.in_maintenance, a.under_policy, a.in_group, a.group_overlap];
+    };
+    eq('a sensor in a room whose alert is open is HELD; one in another room is not',
+        [(await flags(memberId))?.[2], (await flags(loneId))?.[2]], [true, false]);
+    await q(`INSERT INTO maintenance_windows (scope, target, starts_ts, ends_ts, note, created_by)
+             VALUES ('location', $1, now() - interval '1 minute', now() + interval '1 hour', 'closet work', 'tc-test')`, [LOC]);
+    eq('a window on the location holds the room\'s alert, and not the attic\'s sensor',
+        [(await flags(roomId))?.[0], (await flags(loneId))?.[0]], [true, false]);
+    await q(`DELETE FROM maintenance_windows WHERE created_by = 'tc-test'`);
+    await q(`INSERT INTO notify_policy (scope, target, note, created_by) VALUES ('location', $1, NULL, 'tc-test')`, [LOC]);
+    eq('a policy on the location covers the room\'s alert', (await flags(roomId))?.[1], true);
+    await q(`DELETE FROM notify_policy WHERE created_by = 'tc-test'`);
+    eq('with both gone, the room\'s alert is held by nothing', await flags(roomId), [false, false, false, false]);
+    await q(`UPDATE alerts SET state = 'cleared', cleared_ts = now() - interval '5 minutes' WHERE id = $1::bigint`, [roomId]);
+    eq('the room cleared five minutes ago: its member is still held - a cooling room clears before its sensors do',
+        (await flags(memberId))?.[2], true);
+    await q(`UPDATE alerts SET cleared_ts = now() - interval '25 minutes' WHERE id = $1::bigint`, [roomId]);
+    eq('...and released once a sensor window has passed: still hot then is its own fault', (await flags(memberId))?.[2], false);
+    await q(`UPDATE alerts SET state = 'active', cleared_ts = NULL WHERE id = $1::bigint`, [roomId]);
+    await q(`UPDATE alerts SET state = 'cleared', cleared_ts = now() WHERE id = $1::bigint`, [memberId]);
+    eq('a held sensor\'s clear overlapped its room\'s alert - settled with it, no email for a raise nobody got',
+        (await flags(memberId))?.[3], true);
+    await q(`DELETE FROM alerts WHERE id = ANY($1::bigint[])`, [[roomId, memberId, loneId]]);
+
+    await OPS.deleteDevices(['scratch-tc-a', 'scratch-tc-b', 'scratch-tc-c', 'scratch-tc-d', 'scratch-tc-lone']);
+    eq('deleting the devices takes their weeks (the cascade)',
+        (await q<{ n: number }>(`SELECT count(*)::int AS n FROM temp_baselines WHERE entity_id BETWEEN 990201 AND 990208`))[0]?.n, 0);
 }
 
 await db.end();

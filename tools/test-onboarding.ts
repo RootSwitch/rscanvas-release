@@ -124,8 +124,11 @@ function main(): void {
             'Delete 1 device(s)',
             '25 interface(s) will be deleted with them',
             '1 shape(s) on 1 wall board(s) will stop binding',
-            'history is NOT deleted',
+            'raw samples are NOT deleted',
             `retention horizon (${RETENTION} days)`,
+            // The rollup is kept forever, so "it ages out" was false of it:
+            // the sentence names both kinds and what happens to each.
+            'hourly history is purged in the background',
         ]) {
             if (d.includes(want)) ok(`delete names "${want}"`);
             else bad(`delete does not name "${want}"`, d);
@@ -138,6 +141,9 @@ function main(): void {
         const d = planRemoval('delete', [row('a')], 30).detail;
         if (d.includes('(30 days)')) ok('the retention horizon comes from config, not a constant');
         else bad('the retention horizon is hard-coded', d);
+        if (!/history is NOT deleted|history ages out|all history/i.test(d)) {
+            ok('it no longer says ALL history ages out - the hourly rollup never did');
+        } else bad('the sentence still says all history ages out', d);
     }
     {
         const d = plan('disable', [row('a'), row('b')]).detail;

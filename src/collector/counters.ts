@@ -25,7 +25,11 @@
 //      as a wrap and can produce one plausible-but-false sample if it
 //      lands under the clamp. The parent lived with the same; the alert
 //      hysteresis (two breaching scans) absorbs a one-poll spike, and a
-//      64-bit agent never enters this function at all.
+//      64-bit agent never enters this function at all. NARROWED BY SLICE
+//      62: when sysUpTime shows the restart (collector/restart.ts), the poll
+//      voids every rate for that interval and never calls this. What is
+//      left is a reset the uptime cannot see - counters cleared by hand on
+//      a running device, or an agent with no readable uptime.
 //
 // THE GATE THE CODE PRE-NAMED: speedtrust.ts has said since it was ported
 // that "only a 64-bit counter may convict" an advertised speed - a 32-bit

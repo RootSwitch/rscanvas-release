@@ -28,3 +28,6 @@ rscanvas-*.tar.gz
 Thumbs.db
 .DS_Store
 ingest-steps.jsonl
+
+# The lab the README screenshots are captured in (tools/screenshot-recording.mjs).
+tools/screenshots.local.mjs

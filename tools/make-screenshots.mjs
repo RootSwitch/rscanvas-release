@@ -18,6 +18,21 @@
 //
 // No sign-in happens anywhere: /api/me answers as an admin, with that role's
 // actions from src/auth/authorize.ts, and every write is refused.
+//
+// THE DEMO NETWORK (2026-10-09). The pictures are moving to the demo
+// network the online demo replays - Canvas Suite's company, polled by a real
+// RSCanvas, its NOC board divided by location, its service checks live:
+//
+//   NODE_TLS_REJECT_UNAUTHORIZED=0 node tools/make-screenshots.mjs --capture https://<instance>:18080
+//       render every shot THROUGH that instance, saving each answer, scrubbed,
+//       to docs/src/screenshots/recording/ (tools/screenshot-recording.mjs)
+//   node tools/make-screenshots.mjs
+//       render from the recording when it exists - and fail on any request it
+//       has no answer for - else from the 30,000-entity lab's fixture/
+//   --recording DIR, --out DIR    elsewhere than docs/src/screenshots/recording, docs/images
+//
+// The capture signs in as SHOTS_USER / SHOTS_PASSWORD (the demo account and
+// the documented demo password unless set) - a lab instance, never a real one.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -27,20 +42,36 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actionsFor } from '../src/auth/authorize.ts';
 import { dress, extraAnswers } from '../docs/src/screenshots/dress.mjs';
+import { openCapture, openRecording } from './screenshot-recording.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = path.join(ROOT, 'public');
 const FIXTURE = path.join(ROOT, 'docs', 'src', 'screenshots', 'fixture');
-const OUT = path.join(ROOT, 'docs', 'images');
 const W = 1440, H = 900;
 const ZONE = 'America/Chicago';
+
+const ARGS = process.argv.slice(2);
+const opt = (name) => { const i = ARGS.indexOf(name); return i === -1 ? null : ARGS[i + 1]; };
+const OPTIONS = new Set(['--capture', '--recording', '--out']);
+const WANTED = ARGS.filter((a, i) => !OPTIONS.has(a) && !(i > 0 && OPTIONS.has(ARGS[i - 1])));
+const OUT = path.resolve(opt('--out') ?? path.join(ROOT, 'docs', 'images'));
+const RECORDING = path.resolve(opt('--recording') ?? path.join(ROOT, 'docs', 'src', 'screenshots', 'recording'));
+const CAPTURE = opt('--capture');
+
+// Where the answers come from: a live instance being captured, a recording
+// of one, or (until the recording replaces it) the lab's dressed fixture.
+const SOURCE = CAPTURE
+    ? await openCapture(CAPTURE.replace(/\/+$/, ''), RECORDING, {
+        user: process.env.SHOTS_USER || 'demo', password: process.env.SHOTS_PASSWORD || 'rscanvas-demo-2026',
+    })
+    : fs.existsSync(path.join(RECORDING, 'index.json')) ? openRecording(RECORDING) : null;
 
 // The lab's answers as captured, and as the pictures show them: dressed by
 // docs/src/screenshots/dress.mjs, which says what it changes and why.
 const raw = (n) => JSON.parse(fs.readFileSync(path.join(FIXTURE, `${n}.json`), 'utf8'));
 const fixture = (n) => dress(n, raw(n), raw);
-const EXTRA = extraAnswers(raw);
-const META = raw('meta');
+const EXTRA = SOURCE ? {} : extraAnswers(raw);
+const META = SOURCE ? { capturedAt: SOURCE.capturedAt, reportCodes: [] } : raw('meta');
 const T = Date.parse(META.capturedAt);
 
 // --- the page's server: the real client, the fixture's answers ---------------------
@@ -58,7 +89,7 @@ const ROUTES = {
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
     '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
 
-function serve(req, res) {
+async function serve(req, res) {
     const url = new URL(req.url ?? '/', 'http://x');
     const json = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     const p = url.pathname;
@@ -73,6 +104,17 @@ function serve(req, res) {
     if (req.method !== 'GET') { json(403, { ok: false, detail: 'screenshot server: read-only' }); return; }
     if (p === '/api/me') {
         json(200, { ok: true, authenticated: true, user: { username: 'admin', role: 'admin', can: actionsFor('admin') } });
+        return;
+    }
+    if (SOURCE) {
+        try {
+            const got = await SOURCE.answer(url);
+            if (got) json(got.status, got.body);
+            else json(404, { ok: false, detail: `screenshot server: the recording has no ${p}` });
+        } catch (err) {
+            SOURCE.missing.add(`${p}: ${err.message}`);
+            json(502, { ok: false, detail: 'screenshot server: capture failed' });
+        }
         return;
     }
     if (p === '/api/dashboard') { json(200, fixture(`dash-${url.searchParams.get('window') ?? '24'}`)); return; }
@@ -143,10 +185,114 @@ const freezeClock = `(() => {
 
 // --- the shots -------------------------------------------------------------------------
 
-const deviceJson = fixture('device');
-const reportNames = META.reportCodes.map((c) => deviceJson.entities.find((e) => e.code === c)?.name).filter(Boolean);
+const deviceJson = SOURCE ? null : fixture('device');
+const reportNames = SOURCE ? [] : META.reportCodes.map((c) => deviceJson.entities.find((e) => e.code === c)?.name).filter(Boolean);
+const wait = 'const wait = (ms) => new Promise((r) => setTimeout(r, ms));';
+// Scroll a panel to just under the sticky top bar - scrolling it to the very
+// top left its heading behind the bar.
+const under = (id) => `(() => { document.getElementById('${id}').scrollIntoView({ block: 'start' }); window.scrollBy(0, -(document.getElementById('topbar').offsetHeight + 12)); })()`;
 
+// The demo network's pictures (a capture or its recording).
 const SHOTS = [
+    {
+        name: 'dashboard', path: '/',
+        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.querySelectorAll('#dash-loc tbody tr').length > 0",
+        setup: 'window.scrollTo(0, 0)',
+    },
+    {
+        // Service health: the sites side by side, then the web and TCP checks.
+        name: 'services', path: '/',
+        ready: "document.querySelectorAll('#dash-sites tbody tr').length >= 3 && document.querySelectorAll('#dash-svcs tbody tr').length > 0",
+        setup: under('dash-svc-panel'),
+    },
+    {
+        // The services report: Branch 2's voice test over the last fortnight -
+        // the spread that finds an intermittent site, one check in one screen.
+        name: 'services-report', path: '/',
+        ready: "document.querySelectorAll('#dash-sites tbody tr').length >= 3",
+        setup: `(async () => {
+            ${wait}
+            const set = (id, v) => { const el = document.getElementById(id); el.value = v; el.dispatchEvent(new Event('change')); };
+            // The reports have their own tab since 2026-10-16.
+            document.querySelector('.navbtn[data-section=reports]').click();
+            for (let i = 0; i < 40 && document.getElementById('svc-report-panel').classList.contains('hidden'); i++) await wait(100);
+            set('svc-report-kind', 'voice');
+            const all = document.getElementById('svc-report-all');
+            if (all.checked) { all.checked = false; all.dispatchEvent(new Event('change')); }
+            for (let i = 0; i < 40 && !document.querySelector('#svc-report-pick input'); i++) await wait(100);
+            const pick = [...document.querySelectorAll('#svc-report-pick label')].find((l) => l.textContent.includes('Voice to Branch 2'));
+            const box = pick?.querySelector('input');
+            if (box && !box.checked) { box.checked = true; box.dispatchEvent(new Event('change')); }
+            set('svc-report-period', 'last-14');
+            document.getElementById('svc-report-run').click();
+            for (let i = 0; i < 40 && !document.querySelector('#svc-report-table tbody tr'); i++) await wait(100);
+            ${under('svc-report-panel')};
+        })()`,
+    },
+    {
+        // The GPU server, its first GPU's temperature chart open.
+        name: 'device', path: '/#device=gpu-01',
+        ready: "document.querySelectorAll('#sensor-cards .card').length >= 8",
+        setup: `(async () => {
+            ${wait}
+            const card = [...document.querySelectorAll('#sensor-cards .card')].find((c) => c.textContent.includes('Temp: GPU0'));
+            if (card) card.click();
+            for (let i = 0; i < 60 && !document.querySelector('#chart-body svg'); i++) await wait(100);
+            window.scrollTo(0, 0);
+        })()`,
+    },
+    {
+        name: 'devices', path: '/',
+        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10",
+        setup: `(async () => {
+            ${wait}
+            document.querySelector('.navbtn[data-section=devices]').click();
+            for (let i = 0; i < 40 && document.querySelectorAll('#devices tbody tr').length < 20; i++) await wait(100);
+            window.scrollTo(0, 0);
+        })()`,
+    },
+    {
+        // The edge firewall's first two interfaces over the last week.
+        name: 'report', path: '/',
+        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.getElementById('report-devices').childElementCount > 0",
+        setup: `(async () => {
+            ${wait}
+            document.querySelector('.navbtn[data-section=reports]').click();
+            for (let i = 0; i < 40 && document.getElementById('report-panel').classList.contains('hidden'); i++) await wait(100);
+            const dev = document.getElementById('report-device');
+            dev.value = 'edge-fw'; dev.dispatchEvent(new Event('change'));
+            for (let i = 0; i < 40 && !document.querySelector('#report-pick input'); i++) await wait(100);
+            for (const box of [...document.querySelectorAll('#report-pick input[type=checkbox]')].slice(0, 2)) {
+                if (!box.checked) { box.checked = true; box.dispatchEvent(new Event('change')); }
+            }
+            const per = document.getElementById('report-period'); per.value = 'last-7'; per.dispatchEvent(new Event('change'));
+            document.getElementById('report-run').click();
+            for (let i = 0; i < 40 && !document.querySelector('#report-table tbody tr'); i++) await wait(100);
+            ${under('report-panel')};
+        })()`,
+    },
+    {
+        // The NOC board: every location in its own section, the service
+        // fields on the tiles that have checks.
+        name: 'wall', path: '/wall.html?board=1',
+        ready: "document.querySelectorAll('#wall .gtile').length >= 38",
+        setup: 'window.scrollTo(0, 0)',
+    },
+    {
+        name: 'system', path: '/',
+        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10",
+        setup: `(async () => {
+            ${wait}
+            document.querySelector('.navbtn[data-section=system]').click();
+            for (let i = 0; i < 40 && !document.getElementById('health-verdict').textContent; i++) await wait(100);
+            window.scrollTo(0, 0);
+        })()`,
+    },
+];
+
+// The 30,000-entity lab's pictures, from fixture/ - until the recording
+// replaces them.
+const LEGACY_SHOTS = [
     {
         name: 'dashboard', path: '/',
         ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.querySelectorAll('#dash-alerts tbody tr').length > 0"
@@ -223,9 +369,9 @@ function pngSize(buf) {
 }
 
 async function main() {
-    const wanted = process.argv.slice(2);
-    const shots = wanted.length ? SHOTS.filter((s) => wanted.includes(s.name)) : SHOTS;
-    if (shots.length === 0) throw new Error(`no such shot; have ${SHOTS.map((s) => s.name).join(', ')}`);
+    const ALL = SOURCE ? SHOTS : LEGACY_SHOTS;
+    const shots = WANTED.length ? ALL.filter((s) => WANTED.includes(s.name)) : ALL;
+    if (shots.length === 0) throw new Error(`no such shot; have ${ALL.map((s) => s.name).join(', ')}`);
     const browser = CANDIDATES.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
     if (!browser) throw new Error('no Chrome or Edge found. Set CHROME=/path/to/browser');
     fs.mkdirSync(OUT, { recursive: true });
@@ -297,7 +443,14 @@ async function main() {
             console.warn(`  (could not remove the browser profile ${profile}: ${err.message})`);
         }
     }
-    console.log(`done - ${shots.length} shot(s) at ${W}x${H} in docs/images/, from the fixture captured ${META.capturedAt}`);
+    if (SOURCE) {
+        if (SOURCE.missing.size > 0) {
+            throw new Error(`the ${SOURCE.mode} could not answer ${SOURCE.missing.size} request(s):\n  ${[...SOURCE.missing].join('\n  ')}`);
+        }
+        SOURCE.finish();
+    }
+    const from = SOURCE ? `the ${SOURCE.mode === 'capture' ? 'capture' : 'recording'} at ${META.capturedAt}` : `the fixture captured ${META.capturedAt}`;
+    console.log(`done - ${shots.length} shot(s) at ${W}x${H} in ${path.relative(ROOT, OUT) || OUT}, from ${from}`);
 }
 
 main().catch((err) => { console.error(`make-screenshots: ${err.message}`); process.exit(1); });

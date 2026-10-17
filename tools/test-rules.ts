@@ -24,7 +24,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import {
     evaluate, detectReboots, LOWER_IS_BAD, METRIC_KINDS,
-    type ScanDoc, type RulesConfig, type ScanMetric,
+    type ScanDoc, type RulesConfig, type ScanMetric, type ScanDevice,
 } from '../src/alerts/rules.ts';
 
 let pass = 0;
@@ -316,6 +316,51 @@ console.log('alerting engine\n');
     else bad('jitter was reported as a reboot');
     if (!r.some((x) => x.code === 'u3')) ok('a null uptime is not a reboot - Number(null) is 0 and would look like one');
     else bad('a null uptime was read as a reboot');
+}
+
+// --- restart alerts (slice 62) --------------------------------------------------
+//
+// Judged by the collector and recorded on the device; the engine only says
+// whether a recent one raises. Off by default, on by override, warn, held
+// for REBOOT_HOLD_S, and never for a planned, muted or transient device.
+{
+    const restarts = (doc: ScanDoc, cfg: RulesConfig) => evaluate(doc, cfg).filter((c) => c.kind === 'reboot');
+    const dev = (over: Partial<ScanDevice> = {}): ScanDevice => ({
+        name: 'srv-3', host: '10.0.0.3', status: 'up', rebootAgeS: 60, rebootUpBeforeS: 23 * 86400 + 4 * 3600,
+        rebootPlanned: false, ...over,
+    });
+    const on: RulesConfig = { ...CONFIG, overrides: [{ scope: 'kind', kind: 'reboot', enabled: true }] };
+    const eqc = (l: string, got: unknown, want: unknown): void => {
+        if (JSON.stringify(got) === JSON.stringify(want)) ok(l); else bad(l, `got ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+    };
+
+    eqc('OFF BY DEFAULT: a minute-old restart raises nothing, and no condition is even built',
+        restarts({ devices: [dev()] }, CONFIG).length, 0);
+    const c = restarts({ devices: [dev()] }, on)[0];
+    eqc('on for every device by a kind override: warn, keyed by device, the uptime before in the label',
+        c && [c.key, c.severity, c.label, c.code], ['reboot:srv-3', 'warn', 'srv-3 (10.0.0.3) restarted after 23d 4h up', null]);
+    eqc('held for 30 minutes: at 29m59s still raised, at 30m severity null so an open one clears',
+        [restarts({ devices: [dev({ rebootAgeS: 1799 })] }, on)[0]?.severity,
+            restarts({ devices: [dev({ rebootAgeS: 1800 })] }, on)[0]?.severity], ['warn', null]);
+    eqc('no restart on record: a condition, severity null', restarts({ devices: [dev({ rebootAgeS: null, rebootUpBeforeS: null })] }, on)
+        .map((x) => [x.severity, x.label]), [[null, 'srv-3 (10.0.0.3) restarted']]);
+    eqc('a restart recorded inside a maintenance window never raises',
+        restarts({ devices: [dev({ rebootPlanned: true })] }, on)[0]?.severity, null);
+    eqc('a muted device and a transient one build no condition at all',
+        restarts({ devices: [dev({ muted: true }), dev({ name: 'laptop', transient: true })] }, on).length, 0);
+    const one: RulesConfig = { ...CONFIG, overrides: [{ scope: 'host-kind', host: 'srv-3', kind: 'reboot', enabled: true }] };
+    eqc('on for ONE device by a host override: that device only',
+        restarts({ devices: [dev(), dev({ name: 'other' })] }, one).map((x) => x.host), ['srv-3']);
+    const butNot: RulesConfig = { ...CONFIG, overrides: [
+        { scope: 'kind', kind: 'reboot', enabled: true },
+        { scope: 'host-kind', host: 'ap-1', kind: 'reboot', enabled: false },
+    ] };
+    eqc('on everywhere but off for one device: the narrower row wins',
+        restarts({ devices: [dev(), dev({ name: 'ap-1' })] }, butNot).map((x) => x.host), ['srv-3']);
+    eqc('a down device still reports its restart - the two are separate facts',
+        restarts({ devices: [dev({ status: 'down' })] }, on)[0]?.severity, 'warn');
+    eqc('the ENGINE default can be turned on by ALERT_RULES_JSON like any bool rule',
+        restarts({ devices: [dev()] }, { ...CONFIG, reboot: { enabled: true, severity: 'crit' } })[0]?.severity, 'crit');
 }
 
 // --- THE GENERATED DIFFERENTIAL -----------------------------------------------

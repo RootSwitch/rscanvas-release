@@ -94,6 +94,11 @@ export const MANIFEST = [
         needs: "entities_probe_idx ON entities (device_id) WHERE source = 'probe'",
         why: 'slice58: a handful of checks among 30,000 entities must not cost a pass over every interface',
     },
+    {
+        path: 'purgeRollupBatch: hourly DELETE from samples_hourly by entity_id = ANY on the no-timeout jobs lane',
+        needs: 'PRIMARY KEY (entity_id, hour_ts)',
+        why: 'slice60: the key leads with entity_id, so each monthly partition is probed, not scanned, per batch',
+    },
 ];
 
 export function verify(manifest, sqlText) {

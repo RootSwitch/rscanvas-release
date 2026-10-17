@@ -54,7 +54,7 @@ export function parseHosts(text) {
 
 /**
  * The device list's filter box, read (2026-09-28). A plain word matches a
- * device's name, address, location or application by substring - which is
+ * device's name, address, location, application or notes by substring - which is
  * what makes "PAM" find both PAM Prod and PAM Dev. `location:<name>` and
  * `application:<name>` match that group EXACTLY (ignoring case and the
  * spaces around it), and an empty name matches the devices with none set.
@@ -95,5 +95,8 @@ export function deviceMatches(d, f) {
         || String(d.name ?? '').toLowerCase().includes(q)
         || String(d.host ?? '').toLowerCase().includes(q)
         || String(d.location ?? '').toLowerCase().includes(q)
-        || String(d.application ?? '').toLowerCase().includes(q);
+        || String(d.application ?? '').toLowerCase().includes(q)
+        // Slice 64: and its notes, so an asset tag or an owner's name in
+        // them finds the device.
+        || String(d.notes ?? '').toLowerCase().includes(q);
 }

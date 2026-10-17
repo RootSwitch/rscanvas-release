@@ -232,13 +232,43 @@ if (first === undefined) {
     const n = await queriesFor(`/api/device?name=${encodeURIComponent(first)}`) - sessionCost;
     const entities = (await req(`/api/device?name=${encodeURIComponent(first)}`))
         .body?.entities?.length ?? 0;
+    // FIVE, NAMED (2026-10-15). The budget was 2 when the page was entities
+    // and their threshold provenance, and the route grew a constant read at a
+    // time without the budget following: the SNMP round trip (deviceRttHour),
+    // the 24h ping availability (easy-win E4), and slice 62's restarts. Each
+    // is one bounded statement whatever the entity count - the claim this
+    // pins - so the number is the list, and a sixth must be added here by
+    // name. It ran at 4 against a budget of 2 before slice 62 made it 5.
+    const DEVICE_BUDGET = 5;   // entities, overrides, rtt, availability, restarts
     if (entities === 0) {
         console.log(`  SKIP /api/device - "${first}" has no entities, so a budget proves nothing`);
-    } else if (n <= 2) {
-        ok(`/api/device spent ${n} own quer(y/ies) for ${entities} entities, budget 2 `
+    } else if (n <= DEVICE_BUDGET) {
+        ok(`/api/device spent ${n} own quer(y/ies) for ${entities} entities, budget ${DEVICE_BUDGET} `
             + '- constant in entity count, which is the whole claim');
     } else {
-        bad(`/api/device spent ${n} own for ${entities} entities, OVER its budget of 2`, { first });
+        bad(`/api/device spent ${n} own for ${entities} entities, OVER its budget of ${DEVICE_BUDGET}`, { first });
+    }
+
+    // The availability report (IDEAS-2026-10-15 item 8): the roll-up's
+    // frontier, then every device's probes and outages in one statement -
+    // two, whether the fleet is forty devices or fifteen hundred.
+    {
+        const day = (d: Date): string => d.toISOString().slice(0, 10);
+        const q = `/api/report/availability?from=${day(new Date(Date.now() - 29 * 86_400_000))}&to=${day(new Date())}&tz=UTC`;
+        const an = await queriesFor(q) - sessionCost;
+        const lines = (await req(q)).body?.lines?.length ?? 0;
+        if (an <= 2) ok(`/api/report/availability spent ${an} own quer(y/ies) for ${lines} devices, budget 2 - frontier and one statement`);
+        else bad(`/api/report/availability spent ${an}, OVER its budget of 2`);
+    }
+
+    // The timeline (IDEAS-2026-10-15 item 4): alerts, ping changes,
+    // restarts, windows, schedule occurrences and audit lines in ONE
+    // statement, whatever the window - 30 days costs what a day does.
+    for (const hours of [24, 720]) {
+        const tn = await queriesFor(`/api/device/timeline?name=${encodeURIComponent(first)}&hours=${hours}`) - sessionCost;
+        const rows = (await req(`/api/device/timeline?name=${encodeURIComponent(first)}&hours=${hours}`)).body?.events?.length ?? 0;
+        if (tn <= 1) ok(`/api/device/timeline?hours=${hours} spent ${tn} own quer(y/ies) for ${rows} rows, budget 1 - every kind in one statement`);
+        else bad(`/api/device/timeline?hours=${hours} spent ${tn}, OVER its budget of 1`, { first });
     }
 
     // The history chart, and the claim is that it costs ONE statement

@@ -30,6 +30,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 function walkDir(dir, out = []) {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -289,10 +290,14 @@ function check(dir) {
     return 0;
 }
 
-const arg = process.argv[2];
-if (arg === '--self-test') process.exit(selfTest());
-else if (arg === '--check') process.exit(check(process.argv[3] ?? 'src'));
-else {
-    console.error('usage: check-entity-source.mjs --self-test | --check <srcdir>');
-    process.exit(2);
+// Only when run, not when imported: check-entity-deletes.mjs reads SQL with
+// the same tokeniser.
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+    const arg = process.argv[2];
+    if (arg === '--self-test') process.exit(selfTest());
+    else if (arg === '--check') process.exit(check(process.argv[3] ?? 'src'));
+    else {
+        console.error('usage: check-entity-source.mjs --self-test | --check <srcdir>');
+        process.exit(2);
+    }
 }

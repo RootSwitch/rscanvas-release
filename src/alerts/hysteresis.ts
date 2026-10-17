@@ -54,6 +54,10 @@ export const CLEAR_BAND: Readonly<Record<string, number>> = {
                     // different populations, and each names its own band.
     fan: 200,       // rpm
     battery: 5,     // % - LOWER_IS_BAD: must climb 5 above warn to clear
+    // C - change from normal (slice 65): the value is a sensor's rise over
+    // its week and the threshold its gate, so it clears a degree under the
+    // gate. The replay's one near miss sat at the 8 C floor for a while.
+    'temp-change': 1,
 
     // 'if-errors' and 'if-discards' have NO band, and as of 2026-09-01 that
     // is recorded as UNDECIDED rather than decided: their rates are spiky by

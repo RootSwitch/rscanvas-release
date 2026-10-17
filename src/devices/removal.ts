@@ -92,9 +92,15 @@ export function planRemoval(
         }
         // And the one that generates a bug report if left unsaid: somebody
         // deletes eighty devices to reclaim disk and files a bug when the
-        // graph does not move.
-        parts.push('their history is NOT deleted - samples age out on the retention '
-            + `horizon (${rawRetentionDays} days), so disk does not come back today`);
+        // graph does not move. TWO kinds of history, and the sentence used to
+        // name one: it said all of it "ages out on the retention horizon",
+        // which was true of raw samples and false of the hourly rollup, kept
+        // forever - a deleted device's rollup rows stayed for good (found on
+        // the demo box 2026-10-09). They are purged now (sql/slice60.sql),
+        // behind the rollup, so within a few hours rather than at once.
+        parts.push('their raw samples are NOT deleted - they age out on the retention '
+            + `horizon (${rawRetentionDays} days), so disk does not come back today - `
+            + 'and their hourly history is purged in the background within a few hours');
     } else if (mode === 'disable') {
         parts.push('polling stops; history, alerts and board bindings are kept, and '
             + 're-enabling puts them back');

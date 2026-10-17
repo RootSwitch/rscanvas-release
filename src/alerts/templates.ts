@@ -88,6 +88,19 @@ function detailFor(alert: Alert): string {
     // "value 1 (threshold 1)" helps no one. The label already carries the
     // device's own wording ("Power On battery").
     if (alert.kind === 'state') return 'reporting an alarm condition';
+    // Slice 65: the value is a RISE over the sensor's own week, not a
+    // reading, and "value 21.3C (threshold 8C)" would read as a temperature.
+    if (alert.kind === 'temp-change') {
+        return alert.value != null
+            ? `${alert.value} C warmer than its median over the last week (it raises past +${alert.threshold ?? '?'} C`
+              + ' - three times its usual spread, or 8 C)'
+            : 'warmer than its last week';
+    }
+    if (alert.kind === 'temp-room') {
+        return 'several devices in one location warmer than their own last week at once'
+            + (alert.value != null ? `, at least ${alert.value} C each` : '')
+            + ' - the room, not one device: check its cooling';
+    }
     if (alert.value != null && alert.threshold != null) {
         return `value ${alert.value}${unit} (threshold ${alert.threshold}${unit})`;
     }
@@ -103,7 +116,9 @@ function detailFor(alert: Alert): string {
         case 'ping-down':   return alert.severity === 'warn'
             ? `answering ping slowly${alert.value != null ? ` (${alert.value} ms)` : ''}`
             : 'not answering ping';
-        case 'reboot':      return 'recently rebooted';
+        // Slice 62. sysUpTime is the AGENT's uptime, so what is known is that
+        // one of the two restarted - said as that, the device-down lesson.
+        case 'reboot':      return 'restarted - the device, or its SNMP agent (its uptime started again from zero)';
         case 'watchdog':    return 'a status feed is unavailable or stale';
         default:            return alert.value != null ? `value ${alert.value}${unit}` : 'state changed';
     }
@@ -149,8 +164,11 @@ export function varsFor(alert: Alert, event: AlertEvent): Record<string, string>
         // Recovered reading for clear messages; empty (not "--") when the alarm
         // had no numeric value, so a device-down clear reads cleanly. Binary
         // state alarms skip it too - "(now 0)" adds nothing.
-        reading: (alert.value == null || alert.kind === 'state')
-            ? '' : ` (now ${alert.value}${alert.unit || ''})`,
+        reading: (alert.value == null || alert.kind === 'state' || alert.kind === 'temp-room')
+            ? ''
+            // A rise, said as one (slice 65): "(now 0.4C)" would read as a temperature.
+            : alert.kind === 'temp-change' ? ` (now ${alert.value >= 0 ? '+' : ''}${alert.value} C on its week)`
+                : ` (now ${alert.value}${alert.unit || ''})`,
     };
 }
 
