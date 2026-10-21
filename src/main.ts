@@ -48,6 +48,8 @@ import { mergeOverrides } from './alerts/overrides.ts';
 import { GROUP_KIND, OUTSIDE_VALUE, parseGroupKey } from './alerts/groups.ts';
 import { buildOverrideIndex, resolveRuleInfo, IF_RULE_KINDS, BOOL_RULE_KINDS, PATH_RULE_KINDS, SERVICE_RULE_KINDS, THROUGHPUT_RULE_KINDS } from './alerts/rules.ts';
 import { classifyTempSensor, participation, BASELINE_MIN_HOURS, TEMP_CHANGE_KIND, TEMP_ROOM_KIND } from './alerts/tempchange.ts';
+import { fanStopState, FAN_STOPPED_KIND } from './alerts/fanstop.ts';
+import { estimateGrowth } from './store/growth.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
 import { parseSourceDeclaration, sameCoverage } from './boards/source.ts';
@@ -2196,6 +2198,12 @@ const server = createWebServer(tlsPair, (req, res) => {
                 on: boolean; source: string; fleetOn: boolean;
                 deviceRowId: string | null; fleetRowId: string | null;
             } | null = null;
+            // Slice 66: change alerts, the same shape - this device's rule
+            // and the fleet's, with their rows' ids.
+            let changeAlerts: {
+                on: boolean; source: string; fleetOn: boolean;
+                deviceRowId: string | null; fleetRowId: string | null;
+            } | null = null;
             // CHANGE FROM NORMAL (slice 65), the device's part: whether its
             // own row has taken it out, and the fleet's two switches (one
             // sensor, a room) with their rows' ids. Each temperature's own
@@ -2228,6 +2236,16 @@ const server = createWebServer(tlsPair, (req, res) => {
                     on: rb.source !== 'none' && !rb.muted, source: rb.source,
                     fleetOn: rbFleet.source !== 'none' && !rbFleet.muted,
                     deviceRowId: rbRow(name), fleetRowId: rbRow(null),
+                };
+                const ch = resolveRuleInfo(idx, cfg, 'device-change', null, name);
+                const chFleet = resolveRuleInfo(buildOverrideIndex((cfg.overrides ?? []).filter((o) =>
+                    !(o.kind === 'device-change' && o.scope === 'host-kind' && o.host === name))), cfg, 'device-change', null, name);
+                const chRow = (host: string | null) => (orows.ok
+                    ? orows.rows.find((o) => o.kind === 'device-change' && o.host === host && o.code === null)?.id ?? null : null);
+                changeAlerts = {
+                    on: ch.source !== 'none' && !ch.muted, source: ch.source,
+                    fleetOn: chFleet.source !== 'none' && !chFleet.muted,
+                    deviceRowId: chRow(name), fleetRowId: chRow(null),
                 };
                 const tcRow = (kind: string, host: string | null) => (orows.ok
                     ? orows.rows.find((o) => o.kind === kind && o.host === host && o.code === null) ?? null : null);
@@ -2305,11 +2323,30 @@ const server = createWebServer(tlsPair, (req, res) => {
                             hours: base_hours ?? null, med: base_med ?? null, q1: base_q1 ?? null, q3: base_q3 ?? null,
                         };
                     }
+                    // A FAN'S STOPPED-FAN ALERT (2026-10-18): whether it is
+                    // watched and what said so - fanStopState, the scan's own
+                    // answer - its own row's id, and what it would be with
+                    // that row gone, so the card's button can drop a row that
+                    // would only repeat the default.
+                    let stopped: Record<string, unknown> | null = null;
+                    if (r.kind === 'fan') {
+                        const code = String(r.code);
+                        const st = fanStopState(idx, cfg, code, name, String(r.name ?? ''));
+                        const own = orows.ok
+                            ? orows.rows.find((o) => o.kind === FAN_STOPPED_KIND && o.code === r.code) : undefined;
+                        const bare = { ...idx, byCode: new Map(idx.byCode) };
+                        bare.byCode.delete(`${code}|${FAN_STOPPED_KIND}`);
+                        stopped = {
+                            on: st.on, why: st.why, rowId: own?.id ?? null,
+                            withoutRow: fanStopState(bare, cfg, code, name, String(r.name ?? '')).on,
+                        };
+                    }
+                    const extras = { ...(change === null ? {} : { change }), ...(stopped === null ? {} : { stopped }) };
                     const info = resolveRuleInfo(idx, cfg, ek(String(r.kind)), String(r.code), name);
-                    if (info.source === 'none') return change === null ? r : { ...r, change };
+                    if (info.source === 'none') return { ...r, ...extras };
                     return {
                         ...r,
-                        ...(change === null ? {} : { change }),
+                        ...extras,
                         threshold: {
                             source: info.source, muted: info.muted,
                             warn: info.levels?.warn ?? null, crit: info.levels?.crit ?? null,
@@ -2339,7 +2376,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             // read; a refusal costs the list (null), never the page.
             const restarts = await OPS.deviceRestarts(name, DEVICE_RESTARTS_SHOWN);
             sendJson(res, 200, {
-                ok: true, device: name, entities, ifRuleDefaults, linkDown, restartAlerts, tempChange,
+                ok: true, device: name, entities, ifRuleDefaults, linkDown, restartAlerts, changeAlerts, tempChange,
                 restarts: restarts.ok ? restarts.rows : null,
                 entitiesCapped: rows.rows.length >= UI_DEVICE_ENTITY_CAP,
                 availability24h: probes > 0
@@ -2431,10 +2468,20 @@ const server = createWebServer(tlsPair, (req, res) => {
             if (!parts.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${parts.reason})` }); return; }
             const jobs = await OPS.uiJobState();
             if (!jobs.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${jobs.reason})` }); return; }
+            // THE GROWTH ESTIMATE (2026-10-19): each part's rate and where it
+            // levels off (src/store/growth.ts). Garnish: a refused read costs
+            // the estimate, never the panel.
+            const facts = await OPS.growthFacts();
+            const f = facts.ok ? facts.rows[0] : undefined;
+            const growth = f === undefined ? null : estimateGrowth(parts.rows, {
+                dbBytes: Number(f.db_bytes), pingBytes: Number(f.ping_bytes), pingOldestS: f.ping_oldest_s,
+                pingHourlyBytes: Number(f.ping_hourly_bytes), pingHourlyOldestS: f.ping_hourly_oldest_s, nowS: f.now_s,
+            }, { rawDays: CONFIG.rawRetentionDays, messageDays: CONFIG.messageRetentionDays, pingDays: CONFIG.pingHistoryDays });
             sendJson(res, 200, {
                 ok: true,
                 partitions: parts.rows,
                 jobs: jobs.rows,
+                growth,
                 // The settings that govern retention, with the env var that
                 // sets each one. They are env-only by decision - there is no
                 // config store - so showing the NAME is what makes the page
@@ -2443,6 +2490,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                     { name: 'MESSAGE_RETENTION_DAYS', value: CONFIG.messageRetentionDays, means: 'days of syslog and trap messages kept' },
                     { name: 'RAW_RETENTION_DAYS', value: CONFIG.rawRetentionDays, means: 'days of raw samples kept (the rollup keeps the hourly summary longer)' },
                     { name: 'ALERT_RETENTION_DAYS', value: CONFIG.alertRetentionDays, means: 'days a cleared alert and its delivery log are kept' },
+                    { name: 'PING_HISTORY_DAYS', value: CONFIG.pingHistoryDays, means: 'days of minute ping probes kept (their hourly summary is kept for good)' },
                     { name: 'TRGM_RECENT_DAYS', value: CONFIG.trgmRecentDays, means: 'days of message partitions carrying a trigram index, which is what free-text search can reach' },
                     { name: 'RETENTION_DRY_RUN', value: CONFIG.retentionDryRun, means: 'when true the hourly job reports what it would drop and drops nothing' },
                     { name: 'RETENTION_MIN_KEEP_DAYS', value: CONFIG.retentionMinKeepDays, means: 'floor: a keep_days below this is refused outright (guard 1)' },
@@ -2873,6 +2921,51 @@ const server = createWebServer(tlsPair, (req, res) => {
             await auth.audit(principal, 'device.speed', name,
                 { interface: r.rows[0].name, override_bps: bps }, inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, name: r.rows[0].name, override_bps: r.rows[0].speed_override_bps });
+            return;
+        }
+        // REMOVE A STALE INTERFACE (2026-10-19): a port the switch no longer
+        // has - a LAG deleted, a card pulled - stays in the list as stale for
+        // good, because the corpse sweep only takes a re-deal's leftovers.
+        // ADMIN ONLY (device.delete): it takes the history with it, and
+        // deleting is not an operator's (authorize.ts). Stale only, decided by
+        // the store, not the page.
+        if (path === '/api/device/interface/remove' && method === 'POST') {
+            if (!enforce(res, principal, 'device.delete')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const name = typeof body.name === 'string' ? body.name : '';
+            const code = typeof body.code === 'string' ? body.code : '';
+            if (name === '' || code === '') {
+                sendJson(res, 400, { ok: false, detail: 'need the device name and the interface code' });
+                return;
+            }
+            const w = await OPS.removeStaleInterface(name, code);
+            if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+            const r = w.rows[0];
+            if (r === undefined) {
+                sendJson(res, 404, { ok: false, detail: `no interface ${code} on ${name}` });
+                return;
+            }
+            if (!r.removed) {
+                sendJson(res, 409, {
+                    ok: false,
+                    detail: `${r.name} is not stale - the device still reports it, so it cannot be removed; untrack it to stop watching it`,
+                });
+                return;
+            }
+            await auth.audit(principal, 'interface.remove', `${name}/${r.name}`,
+                { code, rules: r.rules }, inetOrNull(clientIp(req)));
+            sendJson(res, 200, {
+                ok: true, removed: r.name, rules: r.rules,
+                detail: `${r.name} removed from ${name}, with its history`
+                    + (r.rules > 0 ? ` and ${r.rules} alert setting${r.rules === 1 ? '' : 's'} of its own` : '')
+                    + '. If the device reports an interface of that name again, it arrives as new.',
+            });
             return;
         }
         if (path === '/api/device/track' && method === 'POST') {

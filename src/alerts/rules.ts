@@ -119,6 +119,11 @@ export interface RulesConfig {
      *  and a room's. Absent means TEMP_CHANGE_DEFAULT / TEMP_ROOM_DEFAULT: on. */
     tempChange?: BoolRule;
     tempRoom?: BoolRule;
+    /** A tracked fan reading 0 (2026-10-18). Absent means FAN_STOPPED_DEFAULT: on. */
+    fanStopped?: BoolRule;
+    /** A device's OS, hardware or boot firmware changed (slice 66). Absent
+     *  means DEVICE_CHANGE_DEFAULT: off. */
+    deviceChange?: BoolRule;
     overrides?: Override[];
 }
 
@@ -137,6 +142,12 @@ export interface ScanDevice {
     rebootAgeS?: number | null;
     rebootUpBeforeS?: number | null;
     rebootPlanned?: boolean | null;
+    /** Slice 66: seconds since the poll that recorded the device's last
+     *  identity change, what changed in words, and whether a maintenance
+     *  window covered it. Absent means no change on record. */
+    changeAgeS?: number | null;
+    changeText?: string | null;
+    changePlanned?: boolean | null;
 }
 export interface ScanInterface {
     id?: string | null;
@@ -281,7 +292,7 @@ export const IF_RULE_KINDS = ['if-down', 'if-errors', 'if-discards', 'if-util'] 
  *  An ENABLED override of one is how a port alerts under a device-wide mute
  *  (manual link-down, 2026-10-02) - resolveBoolInfo already honoured it. */
 export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down', 'svc-down', 'svc-content', 'path-down', 'reboot',
-    'temp-change', 'temp-room']);
+    'temp-change', 'temp-room', 'fan-stopped', 'device-change']);
 
 /** The four rules a service check carries (slice 58): two yes/no, two levelled. */
 export const SERVICE_RULE_KINDS = ['svc-down', 'svc-content', 'svc-ms', 'svc-cert'] as const;
@@ -320,6 +331,30 @@ export const REBOOT_DEFAULT: BoolRule = { enabled: false, severity: 'warn' };
  */
 export const TEMP_CHANGE_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
 export const TEMP_ROOM_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
+
+/**
+ * A STOPPED FAN (2026-10-18) ships ON: a tracked fan was spinning when it
+ * was discovered, so one reading 0 has stopped, and no level has to be
+ * chosen first. The fans built to stop - a graphics card's, parked while it
+ * is idle - are left out by name (src/alerts/fanstop.ts). WARN: a stopped
+ * fan is a part to replace, not yet an outage; the heat it causes has its
+ * own alert in change from normal.
+ */
+export const FAN_STOPPED_DEFAULT: BoolRule = { enabled: true, severity: 'warn' };
+
+/**
+ * A CHANGE TO WHAT A DEVICE IS (slice 66) ships OFF, as restarts do and for
+ * the same reason: a Linux kernel moves with most updates, so on for every
+ * device would mail each one. (A Windows box's monthly update does NOT show:
+ * its agent names the build, 20348, not the update revision - a server's
+ * update of 2026-10-19 recorded nothing. A feature update, a new build,
+ * does.) Every change is on the device's timeline either way; the alert is
+ * for the devices where an unannounced upgrade or a swapped part is news.
+ * WARN, held CHANGE_HOLD_S and cleared without an email - like a restart, it
+ * is over when it is read.
+ */
+export const DEVICE_CHANGE_DEFAULT: BoolRule = { enabled: false, severity: 'warn' };
+export const CHANGE_HOLD_S = 30 * 60;
 
 /** How long a restart alert stays raised: long enough for a wall and the
  *  Alerts page to show it between glances, then it clears without an email
@@ -374,6 +409,14 @@ export function resolveRuleInfo(
     if (kind === 'temp-change' || kind === 'temp-room') {
         const d = kind === 'temp-change' ? config.tempChange ?? TEMP_CHANGE_DEFAULT : config.tempRoom ?? TEMP_ROOM_DEFAULT;
         const b = resolveBoolInfo(idx, d, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'fan-stopped') {
+        const b = resolveBoolInfo(idx, config.fanStopped ?? FAN_STOPPED_DEFAULT, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'device-change') {
+        const b = resolveBoolInfo(idx, config.deviceChange ?? DEVICE_CHANGE_DEFAULT, code, host, kind);
         return { source: b.source, muted: b.muted, levels: null };
     }
     if (kind === 'svc-ms' || kind === 'svc-cert' || kind === 'path-loss' || kind === 'path-jitter' || kind === 'path-mos'

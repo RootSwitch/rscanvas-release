@@ -46,6 +46,7 @@ import { NOTIFIER_APP } from './events.ts';
 import { varsFor, render, type AlertEvent, type Alert } from './templates.ts';
 import { GROUP_KIND, parseGroupKey, groupDetail } from './groups.ts';
 import { digestMessage, type NotifyBudget } from './notify-budget.ts';
+import { step } from '../store/caller.ts';
 
 const NL = String.fromCharCode(10);
 
@@ -364,6 +365,7 @@ export async function dispatchEvent(
     event: AlertEvent, alert: AlertRecord,
     opts: { retry?: boolean; budget?: NotifyBudget; now?: number } = {},
 ): Promise<boolean> {
+    step(`${event} for alert ${alert.id}`);
     const vars = varsFor(toTemplateAlert(alert), event);
     const isClear = event === 'clear';
     // A group alert (slice 55) names the devices it stands in for, looked up
@@ -414,6 +416,9 @@ export async function dispatchEvent(
             return;
         }
         opts.budget?.release(channel, key);
+        // Named for the skip line (store/caller.ts): a send is the one await
+        // in this pass that is not the database.
+        step(`${event} for alert ${alert.id} by ${channel}`);
         const r = await send();
         await recordAttempt(alert.id, channel, event, r);
         allOk = allOk && r.ok;
@@ -574,20 +579,24 @@ export async function retryPass(now = new Date(), budget?: NotifyBudget): Promis
     // raise was never delivered and whose clear landed inside a window must
     // have its debt waived now, or it would deliver as a "resolved" page
     // about an unknown incident once the window expires.
+    step('settling clears inside a window');
     const settled = await OPS.settleInWindowClears();
     if (!settled.ok) throw new Error(`lane refused the in-window settle (${settled.reason})`);
     // Slice 25: the policy twin. A raise-and-clear that both happened under
     // a standing policy must have the clear's debt waived while the policy
     // still stands - otherwise DELETING the policy owes a "resolved" page
     // about an incident nobody was told of.
+    step('settling clears under a policy');
     const settledPolicy = await OPS.settleUnderPolicyClears();
     if (!settledPolicy.ok) throw new Error(`lane refused the policy settle (${settledPolicy.reason})`);
     // Slice 55: the group twin. A member whose raise was held under its
     // group alert, and never told, has its clear waived: the group's email
     // named it and the group's clear closes it.
+    step('settling clears a group covered');
     const settledGroup = await OPS.settleGroupCoveredClears();
     if (!settledGroup.ok) throw new Error(`lane refused the group settle (${settledGroup.reason})`);
     let sent = 0;
+    step('reading the raise queue');
     const raises = await OPS.alertsOwingRaise();
     if (!raises.ok) throw new Error(`lane refused the raise queue (${raises.reason})`);
     for (const r of raises.rows) {
@@ -599,12 +608,14 @@ export async function retryPass(now = new Date(), budget?: NotifyBudget): Promis
     // from the raise queue by construction - it requires notified_raise -
     // and delivered before clears so an incident that worsened and then
     // ended reads in that order on a channel that was down for both.
+    step('reading the escalate queue');
     const escalates = await OPS.alertsOwingEscalate();
     if (!escalates.ok) throw new Error(`lane refused the escalate queue (${escalates.reason})`);
     for (const r of escalates.rows) {
         if (!due(r, now)) continue;
         if (await dispatchEvent('escalate', r, { retry: true, budget })) sent++;
     }
+    step('reading the clear queue');
     const clears = await OPS.alertsOwingClear();
     if (!clears.ok) throw new Error(`lane refused the clear queue (${clears.reason})`);
     for (const r of clears.rows) {
@@ -620,6 +631,7 @@ export async function retryPass(now = new Date(), budget?: NotifyBudget): Promis
     // the raise debt (markNotified) and retries per channel from there.
     let renotifyOwed = 0;
     if (CONFIG.alertRenotifyH > 0) {
+        step('reading the renotify queue');
         const renotifies = await OPS.alertsOwingRenotify(CONFIG.alertRenotifyH);
         if (!renotifies.ok) throw new Error(`lane refused the renotify queue (${renotifies.reason})`);
         renotifyOwed = renotifies.rows.length;
@@ -655,6 +667,7 @@ export async function retryPass(now = new Date(), budget?: NotifyBudget): Promis
 export async function flushDigests(budget: NotifyBudget, now = Date.now()): Promise<number> {
     let delivered = 0;
     for (const { channel, keys, notices } of budget.dueDigests(now)) {
+        step(`digest of ${notices.length} by ${channel}`);
         const d = digestMessage(notices);
         const sev = d.severity === 'crit' ? 2 : d.severity === 'warn' ? 4 : 5;
         const r = channel === 'syslog'

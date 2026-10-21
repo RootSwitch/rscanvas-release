@@ -263,7 +263,8 @@ export async function discoverSensors(
     }
 
     // 5. Fans, vendor tach tables: only spinning fans track at discovery; a
-    //    tracked fan later reading 0 still polls and can alarm.
+    //    tracked fan later reading 0 still polls and raises the stopped-fan
+    //    alert (alerts/fanstop.ts).
     if (vendor?.fan !== undefined) {
         const rows = await boundedWalk(vendor.fan.rpmOid);
         let n = 0;

@@ -19,6 +19,19 @@ import { speedTrust } from './speedtrust.ts';
 import { planRekey } from './rekey.ts';
 import { OPS, storeFailureLane, storeRefusal, type SampleRow } from '../store/index.ts';
 import { inDomain } from '../store/bounds.ts';
+import {
+    IDENT_OIDS, familyOf, osText, cleanModel, apcModel, pickEntityModel, routerosBoardFromDescr,
+    unifiModelFromDescr, wantsEntityModel, wantsIdentityRead,
+} from './identity.ts';
+
+/** What the identity read found (slice 66); a null is "not answered", never "is none". */
+export interface IdentityRead {
+    sysObjectId: string | null;
+    osVersion: string | null;
+    hwModel: string | null;
+    fwVersion: string | null;
+    fwUpgrade: string | null;
+}
 
 export interface PollResult {
     ok: boolean;
@@ -70,6 +83,12 @@ export interface PollResult {
     ramKb: number | null;
     /** Whether this poll ATTEMPTED the inventory read. Stamps the backoff. */
     inventoryTried: boolean;
+    /** Slice 66: the identity read, when this poll made one (inventory,
+     *  restart, or never read before); null when it did not. */
+    identity: IdentityRead | null;
+    /** Slice 66: the OS in words, from this poll's own sysDescr; null on a
+     *  failed poll or an agent with no sysDescr. */
+    osSummary: string | null;
     error: string | null;
     /** store (2026-10-06): the poll failed on OUR database, not on the
      *  device - the caller must not count it against the device. */
@@ -105,6 +124,63 @@ export function rate(
     return Number(now - prev) / elapsedS;
 }
 
+/**
+ * A walk that gives up (slice 66). Walking a subtree an agent does not serve
+ * can hang with no response, no error and no library timeout - measured on
+ * the lab's own mock agent, and the reason probe.ts bounds its discovery
+ * walks. The identity read walks ENTITY-MIB, which most agents do not serve;
+ * past the deadline it returns nothing, and the abandoned walk dies with the
+ * session when the poll closes it.
+ */
+function boundedWalk(session: ReturnType<typeof createSession>, oid: string, ms: number): Promise<Map<string, unknown>> {
+    return Promise.race([
+        walk(session, oid) as Promise<Map<string, unknown>>,
+        new Promise<Map<string, unknown>>((resolve) => setTimeout(() => resolve(new Map()), ms).unref()),
+    ]);
+}
+
+/**
+ * The identity read (slice 66), SNMPCanvas's collectIdentity ported: the
+ * vendor's own tree first - it outranks everything - then ENTITY-MIB for gear
+ * no rule knows. Each read answers for itself: a GET the agent refuses
+ * leaves its fields null, which the write keeps as "not answered".
+ */
+export async function readIdentity(
+    session: ReturnType<typeof createSession>, sysDescr: string | null,
+): Promise<IdentityRead> {
+    const out: IdentityRead = { sysObjectId: null, osVersion: null, hwModel: null, fwVersion: null, fwUpgrade: null };
+    const so = await get(session, [SYS.sysObjectID]);
+    out.sysObjectId = asString(so.get(SYS.sysObjectID) ?? null);
+    const fam = familyOf(out.sysObjectId);
+    const read = async (oids: string[]): Promise<Map<string, unknown>> => {
+        try { return await get(session, oids) as Map<string, unknown>; } catch { return new Map(); }
+    };
+    const str = (m: Map<string, unknown>, oid: string): string | null => cleanModel(asString((m.get(oid) ?? null) as never));
+    const I = IDENT_OIDS;
+    if (fam === 'routeros') {
+        const g = await read([I.mikrotikVersion, I.mikrotikFirmware, I.mikrotikFirmwareUpgrade, I.mikrotikBoard, I.mikrotikBoardAlt]);
+        out.osVersion = str(g, I.mikrotikVersion);
+        out.fwVersion = str(g, I.mikrotikFirmware);
+        out.fwUpgrade = str(g, I.mikrotikFirmwareUpgrade);
+        out.hwModel = str(g, I.mikrotikBoard) ?? str(g, I.mikrotikBoardAlt) ?? routerosBoardFromDescr(sysDescr);
+    } else if (fam === 'apc') {
+        const g = await read([I.apcUpsModel, I.apcUpsSku, I.apcPduModel]);
+        out.hwModel = apcModel(str(g, I.apcUpsModel), str(g, I.apcUpsSku), str(g, I.apcPduModel));
+    } else if (fam === 'unifi') {
+        const g = await read([I.unifiModel]);
+        out.hwModel = str(g, I.unifiModel) ?? unifiModelFromDescr(sysDescr);
+    } else if (fam === null) {
+        const g = await read([I.qnapModel]);
+        out.hwModel = str(g, I.qnapModel);
+    }
+    if (out.hwModel === null && wantsEntityModel(fam)) {
+        const models = await boundedWalk(session, I.entPhysicalModelName, 5_000);
+        const names = models.size > 0 ? null : await boundedWalk(session, I.entPhysicalName, 5_000);
+        out.hwModel = pickEntityModel(models, names);
+    }
+    return out;
+}
+
 /** Whose failure a thrown poll error is: the device's (by SNMP's own kind),
  *  the store's, or other. Exported for tools/test-poll-store.ts. */
 export function pollErrorKind(err: unknown): NonNullable<PollResult['errorKind']> {
@@ -123,6 +199,15 @@ export async function pollDevice(
          *  database's age of that poll when this one was dispatched. */
         uptime_s?: number | null;
         since_seen_s?: number | null;
+        /** Slice 66: the stored identity, so a poll that does not read it
+         *  still words the OS with what the last read found. identity_ts
+         *  null means it was never read, and this poll reads it. */
+        sys_object_id?: string | null;
+        os_version?: string | null;
+        identity_ts?: Date | null;
+        /** The OS words the last good poll stored: a description that moves
+         *  is an upgrade, and reads the identity (wantsIdentityRead). */
+        os_summary?: string | null;
     },
     credential: Credential,
     takenCodes: Set<string>,
@@ -154,7 +239,7 @@ export async function pollDevice(
         ok: false, summary: null, deviceId: device.id, rttMs: 0, samples: [], counters: [], lastValues: [],
         discovered: 0, speedConvictions: [], rekeyed: [], sysName: null, sysDescr: null, sysLocation: null,
         cpuModel: null, uptimeS: null, restart: { kind: 'unknown' }, cpuCores: null, ramKb: null, stencil: null,
-        inventoryTried: false, error: null, errorKind: null,
+        inventoryTried: false, identity: null, osSummary: null, error: null, errorKind: null,
     };
 
     try {
@@ -174,6 +259,37 @@ export async function pollDevice(
             device.uptime_s,
             device.since_seen_s == null ? null : device.since_seen_s + (performance.now() - t0) / 1000,
             result.uptimeS);
+
+        // THE IDENTITY READ (slice 66): what the device is and runs, from the
+        // vendor's own tree. With the daily inventory; after a restart, or a
+        // description that moved, because that is an upgrade and the record
+        // should not wait a day for it; and once for a device never read,
+        // which is how a fleet gets its identity the day this lands
+        // (identity.ts wantsIdentityRead). Fenced like the inventory:
+        // nothing it fails to read can fail the poll.
+        if (wantsIdentityRead({
+            inventory: wantInventory, neverRead: device.identity_ts == null,
+            restarted: result.restart.kind === 'restarted', storedOs: device.os_summary,
+            osNow: osText(device.sys_object_id ?? null, result.sysDescr, device.os_version ?? null),
+        })) {
+            try {
+                result.identity = await readIdentity(session, result.sysDescr);
+            } catch {
+                // An agent that refuses the tree is the normal case for most
+                // of it; identity_ts is stamped regardless (the write), so
+                // it is asked again tomorrow, not every poll.
+                result.identity = {
+                    sysObjectId: null, osVersion: null, hwModel: null, fwVersion: null, fwUpgrade: null,
+                };
+            }
+        }
+        // The OS in words from THIS poll's sysDescr, with the family and
+        // version the identity read found now or last time - so RouterOS
+        // 7.2x's own version string shows at its first poll after an
+        // upgrade, and an older RouterOS keeps its MIB version between reads.
+        result.osSummary = osText(
+            result.identity?.sysObjectId ?? device.sys_object_id ?? null, result.sysDescr,
+            result.identity?.osVersion ?? device.os_version ?? null);
 
         // THE INVENTORY READ, and it is deliberately fenced off from the poll.
         //

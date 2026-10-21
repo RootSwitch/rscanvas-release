@@ -49,8 +49,11 @@ import { OPS, type AlertRecord } from '../store/index.ts';
 import { isGhostInterface } from './ghosts.ts';
 import { mergeOverrides } from './overrides.ts';
 import { groupConditions } from './groups.ts';
+import { fanStopConditions } from './fanstop.ts';
+import { deviceChangeConditions } from './changes.ts';
 import {
-    evaluate, buildOverrideIndex, REBOOT_DEFAULT, TEMP_CHANGE_DEFAULT, TEMP_ROOM_DEFAULT,
+    evaluate, buildOverrideIndex, REBOOT_DEFAULT, TEMP_CHANGE_DEFAULT, TEMP_ROOM_DEFAULT, FAN_STOPPED_DEFAULT,
+    DEVICE_CHANGE_DEFAULT,
     type Condition, type RulesConfig, type ScanDoc, type ScanInterface, type ScanMetric, type ScanService,
 } from './rules.ts';
 import {
@@ -120,6 +123,10 @@ export const DEFAULT_RULES: RulesConfig = {
     // Change from normal (slice 65): on - rules.ts TEMP_CHANGE_DEFAULT says why.
     tempChange: TEMP_CHANGE_DEFAULT,
     tempRoom: TEMP_ROOM_DEFAULT,
+    // A tracked fan reading 0 (2026-10-18): on - rules.ts FAN_STOPPED_DEFAULT says why.
+    fanStopped: FAN_STOPPED_DEFAULT,
+    // A change to what a device is (slice 66): off - rules.ts DEVICE_CHANGE_DEFAULT says why.
+    deviceChange: DEVICE_CHANGE_DEFAULT,
     overrides: [],
 };
 
@@ -145,6 +152,8 @@ export function loadRulesConfig(): RulesConfig {
         reboot: parsed.reboot ?? DEFAULT_RULES.reboot,
         tempChange: parsed.tempChange ?? DEFAULT_RULES.tempChange,
         tempRoom: parsed.tempRoom ?? DEFAULT_RULES.tempRoom,
+        fanStopped: parsed.fanStopped ?? DEFAULT_RULES.fanStopped,
+        deviceChange: parsed.deviceChange ?? DEFAULT_RULES.deviceChange,
         overrides: parsed.overrides ?? [],
     };
 }
@@ -371,6 +380,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
             name: d.name, host: d.host, status: d.status, transient: d.transient,
             muted: d.alerts_muted,
             rebootAgeS: d.reboot_age_s, rebootUpBeforeS: d.reboot_up_before_s, rebootPlanned: d.reboot_planned,
+            changeAgeS: d.change_age_s, changeText: d.change_text, changePlanned: d.change_planned,
         })),
         // THE GHOST GATE (src/alerts/ghosts.ts): a row whose went-quiet
         // stamp outlived the horizon leaves the doc entirely, so its
@@ -423,6 +433,13 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     };
 
     const conditions = evaluate(doc, cfg);
+    // A STOPPED FAN (2026-10-18): the same doc's fans, judged beside the
+    // engine rather than inside it (alerts/fanstop.ts says why). Pure, so
+    // nothing here can fail the way a read can.
+    conditions.push(...fanStopConditions(doc, cfg, buildOverrideIndex(cfg.overrides)));
+    // A CHANGE TO WHAT A DEVICE IS (slice 66), off unless turned on: the
+    // roster's last recorded change, shaped like a restart (alerts/changes.ts).
+    conditions.push(...deviceChangeConditions(doc, cfg));
 
     // The watchdog rides the same machinery as every real alert: raised by
     // the counters, cleared by the counters, visible in history. Severity
@@ -570,7 +587,9 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     // clear is written and before the notify job can read the queue or these
     // events, so no email says so - and dropped from the events this scan
     // hands on. By id: only the clears this scan made.
-    const restartClears = events.filter((e) => e.type === 'clear' && e.key.startsWith('reboot:'))
+    // A change alert's clear (slice 66) is the same kind of news, and settled the same way.
+    const restartClears = events.filter((e) => e.type === 'clear'
+        && (e.key.startsWith('reboot:') || e.key.startsWith('devchange:')))
         .map((e) => e.alertId);
     let quiet = new Set<string>();
     if (restartClears.length > 0) {

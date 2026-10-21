@@ -901,6 +901,119 @@ console.log('\n20. change from normal: the week from the rollup, the last minute
         (await q<{ n: number }>(`SELECT count(*)::int AS n FROM temp_baselines WHERE entity_id BETWEEN 990201 AND 990208`))[0]?.n, 0);
 }
 
+// --- 21. what a device is, and when that changes (sql/slice66.sql) ---------------------
+console.log('\n21. the identity is stored by the poll write, and a change from one known value to another is recorded:');
+{
+    const DEV = 'scratch-ident';
+    const ID = '990006';
+    await q(`INSERT INTO devices (id, name, host) VALUES ($1::bigint, $2, '192.0.2.6')`, [ID, DEV]);
+    const ident = (o: Partial<{ sysObjectId: string; osVersion: string; hwModel: string; fwVersion: string; fwUpgrade: string }>) => ({
+        sysObjectId: null, osVersion: null, hwModel: null, fwVersion: null, fwUpgrade: null, ...o,
+    });
+    const poll = (ok: boolean, identity: ReturnType<typeof ident> | null, os: string | null) => OPS.recordDevicePoll(
+        ID, ok, null, 'RouterOS CRS354-48G-4S+2Q+', null, false, null, null, null, 1000, null, null, null, null, null, null,
+        identity, os);
+    const changes = async () => q<{ field: string; old_value: string; new_value: string; planned: boolean }>(
+        `SELECT field, old_value, new_value, planned FROM device_changes WHERE device_id = $1::bigint ORDER BY id`, [ID]);
+    const row = async () => (await q<Record<string, unknown>>(
+        `SELECT sys_object_id, os_version, hw_model, fw_version, fw_upgrade, os_summary,
+                identity_ts IS NOT NULL AS read, change_seen_ts IS NOT NULL AS changed, change_planned
+           FROM devices WHERE id = $1::bigint`, [ID]))[0]!;
+
+    await poll(true, ident({ sysObjectId: '1.3.6.1.4.1.14988.1', osVersion: '7.20.6', hwModel: 'CRS354-48G-4S+2Q+',
+        fwVersion: '7.7', fwUpgrade: '7.20.6' }), 'RouterOS 7.20.6');
+    eq('the first read is stored, and a first value is no change', [await row(), (await changes()).length], [{
+        sys_object_id: '1.3.6.1.4.1.14988.1', os_version: '7.20.6', hw_model: 'CRS354-48G-4S+2Q+', fw_version: '7.7',
+        fw_upgrade: '7.20.6', os_summary: 'RouterOS 7.20.6', read: true, changed: false, change_planned: null,
+    }, 0]);
+    await poll(true, null, 'RouterOS 7.20.6');
+    eq('a poll with no identity read keeps every stored value, and records nothing',
+        [(await row()).hw_model, (await row()).fw_version, (await changes()).length], ['CRS354-48G-4S+2Q+', '7.7', 0]);
+    await poll(true, ident({}), 'RouterOS 7.20.6');
+    eq('a read that answered nothing (all null) is not a change either', (await changes()).length, 0);
+
+    await poll(true, ident({ sysObjectId: '1.3.6.1.4.1.14988.1', osVersion: '7.24.5', hwModel: 'CRS354-48G-4S+2Q+',
+        fwVersion: '7.24.5', fwUpgrade: '7.24.5' }), 'RouterOS 7.24.5 (stable)');
+    eq('an upgrade: the OS and the boot firmware each recorded, old and new, not planned',
+        (await changes()).map((c) => [c.field, c.old_value, c.new_value, c.planned]),
+        [['os', 'RouterOS 7.20.6', 'RouterOS 7.24.5 (stable)', false], ['firmware', '7.7', '7.24.5', false]]);
+    eq('and the device row carries it for the scan', [(await row()).changed, (await row()).change_planned], [true, false]);
+
+    const failed = await poll(false, ident({ hwModel: 'SOMETHING-ELSE' }), 'Something else');
+    eq('a FAILED poll records no change and keeps the OS words', [failed.ok, (await changes()).length, (await row()).os_summary],
+        [true, 2, 'RouterOS 7.24.5 (stable)']);
+    await q(`UPDATE devices SET hw_model = 'CRS354-48G-4S+2Q+' WHERE id = $1::bigint`, [ID]);
+
+    const scan = await OPS.alertScanDevices();
+    const s = scan.ok ? scan.rows.find((d) => d.name === DEV) : undefined;
+    eq('the scan reads the change\'s age and what changed, in words',
+        s && [s.change_age_s !== null && s.change_age_s < 30, s.change_planned, s.change_text],
+        [true, false, 'OS RouterOS 7.20.6 -> RouterOS 7.24.5 (stable); boot firmware 7.7 -> 7.24.5']);
+
+    // PLANNED, as for a restart: a window open on the device when it was recorded.
+    const startedAgo = (await q<{ t: string }>(
+        `SELECT to_char((now() AT TIME ZONE 'UTC') - interval '5 minutes', 'HH24:MI') AS t`))[0]!.t;
+    const sched = await OPS.createMaintenanceSchedule('device', DEV, [1, 2, 3, 4, 5, 6, 7], startedAgo, 30, 'UTC', 'scratch', 'test');
+    await poll(true, ident({ hwModel: 'CRS354-48G-4S+2Q+ (rev 2)' }), 'RouterOS 7.24.5 (stable)');
+    eq('a part swapped inside a maintenance window is recorded as planned',
+        (await changes()).slice(-1).map((c) => [c.field, c.new_value, c.planned]), [['hardware', 'CRS354-48G-4S+2Q+ (rev 2)', true]]);
+    eq('and the device row says so', (await row()).change_planned, true);
+    if (sched.ok && sched.rows[0]) await OPS.cancelMaintenanceSchedule(sched.rows[0].id);
+
+    // A runaway agent - a description that changes every poll - is held to
+    // twenty rows a field a day.
+    for (let i = 0; i < 25; i++) await poll(true, null, `Flapping OS ${i}`);
+    eq('twenty rows a field a day, then nothing more for that field',
+        (await changes()).filter((c) => c.field === 'os').length, 20);
+
+    const tl = await OPS.deviceTimeline(DEV, 24, false, 300);
+    const ch = tl.ok ? tl.rows.filter((r) => r.kind === 'change') : [];
+    eq('the timeline carries every change with its old and new', [ch.length, ch.some((r) => r.text === 'firmware'
+        && (r.data as { old?: string; new?: string } | null)?.old === '7.7' && (r.data as { new?: string } | null)?.new === '7.24.5')],
+    [22, true]);
+
+    // A change alert's clear is settled without an email, as a restart's is.
+    const [a] = await q<{ id: string }>(`INSERT INTO alerts (alert_key, state, severity, kind, host, label,
+                                                             first_breach_ts, raised_ts, cleared_ts, last_seen_ts, notified_raise)
+        VALUES ($2, 'cleared', 'warn', 'device-change', $1, 'scratch change',
+                now() - interval '32 minutes', now() - interval '31 minutes', now(), now(), true)
+        RETURNING id::text AS id`, [DEV, `devchange:${DEV}`]);
+    const settled = await OPS.settleRestartClears([a!.id]);
+    eq('a change alert\'s clear is settled: no email', settled.ok && settled.rows.map((r) => r.id), [a!.id]);
+    await q(`DELETE FROM alerts WHERE id = $1::bigint`, [a!.id]);
+
+    await OPS.deleteDevices([DEV]);
+    eq('deleting the device takes its change record (the cascade)', (await changes()).length, 0);
+}
+
+// --- 22. removing a stale interface (2026-10-19) ------------------------------------
+console.log('\n22. a stale interface can be removed, with its history and its own rules; a live one cannot:');
+{
+    const DEV = 'scratch-rmif';
+    await q(`INSERT INTO devices (id, name, host) VALUES (990007, $1, '192.0.2.7')`, [DEV]);
+    await q(`INSERT INTO entities (id, device_id, kind, snmp_index, name, code, tracked, lv_ts, lv_stale_since) VALUES
+             (990301, 990007, 'if', '7', 'bonding2', 'SRM1', true, now() - interval '2 hours', now() - interval '90 minutes'),
+             (990302, 990007, 'if', '8', 'sfp-sfpplus1', 'SRM2', true, now(), NULL)`);
+    await q(`INSERT INTO threshold_overrides (kind, host, code, warn, crit, enabled, note) VALUES
+             ('if-down', NULL, 'SRM1', NULL, NULL, false, 'scratch'), ('if-util', NULL, 'SRM1', 70, 90, true, 'scratch'),
+             ('if-down', NULL, 'SRM2', NULL, NULL, false, 'scratch')`);
+    const live = await OPS.removeStaleInterface(DEV, 'SRM2');
+    eq('a port the device still reports is refused, and stays', [live.ok && live.rows.map((r) => [r.name, r.stale, r.removed]),
+        (await q<{ n: number }>(`SELECT count(*)::int AS n FROM entities WHERE id = 990302`))[0]?.n], [[['sfp-sfpplus1', false, false]], 1]);
+    const gone = await OPS.removeStaleInterface(DEV, 'SRM1');
+    eq('a stale one goes, with its two rule rows', gone.ok && gone.rows.map((r) => [r.name, r.stale, r.removed, r.rules]),
+        [['bonding2', true, true, 2]]);
+    eq('its hourly history is queued for the purge, as a deleted device\'s is',
+        (await q<{ n: number }>(`SELECT count(*)::int AS n FROM rollup_purge WHERE entity_id = 990301`))[0]?.n, 1);
+    eq('the live port\'s rule is untouched', (await q<{ n: number }>(
+        `SELECT count(*)::int AS n FROM threshold_overrides WHERE code = 'SRM2'`))[0]?.n, 1);
+    const none = await OPS.removeStaleInterface(DEV, 'SRM1');
+    eq('asked again: no such interface, nothing done', none.ok && none.rows.length, 0);
+    await q(`DELETE FROM threshold_overrides WHERE note = 'scratch'`);
+    await q(`DELETE FROM rollup_purge WHERE entity_id = 990301`);
+    await OPS.deleteDevices([DEV]);
+}
+
 await db.end();
 await closeAll();
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

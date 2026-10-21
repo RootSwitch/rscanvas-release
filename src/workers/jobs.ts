@@ -26,7 +26,8 @@ import { parentPort } from 'node:worker_threads';
 import { CONFIG } from '../config.ts';
 import { startHeartbeat } from '../heartbeat.ts';
 import { installSafetyNet } from '../safety.ts';
-import { OPS, closeAll } from '../store/index.ts';
+import { OPS, closeAll, laneCalls } from '../store/index.ts';
+import { newCaller, runAs, step, describeOverrun, type Caller } from '../store/caller.ts';
 import { scanTick } from '../alerts/scan.ts';
 import { BASELINE_DAYS } from '../alerts/tempchange.ts';
 import { dispatchEvent, retryPass, flushDigests, queuedEventGate } from '../alerts/notify.ts';
@@ -56,7 +57,9 @@ let running = true;
 type JobRecord = JobsStats['jobs'][number];
 
 const jobs = new Map<string, JobRecord>();
-const inFlight = new Set<string>();
+// The run in flight per job, as a caller (store/caller.ts): a job that finds
+// its last run still going can then say where that run is.
+const inFlight = new Map<string, Caller>();
 
 function record(name: string): JobRecord {
     let r = jobs.get(name);
@@ -101,18 +104,24 @@ async function runOnce(
     name: string, fn: () => Promise<string>, persist = false,
 ): Promise<void> {
     const r = record(name);
-    if (inFlight.has(name)) {
+    const running = inFlight.get(name);
+    if (running !== undefined) {
         r.skippedInFlight++;
+        // WHERE the earlier run is (2026-10-20): production's notify pass
+        // overran every tick for six hours one night and this line could
+        // only be counted. Now it names the step, the lane phase and the
+        // lane's other holders - store/caller.ts describeOverrun.
         log(`${name}: still running from the last tick, skipping this one `
-            + `(${r.skippedInFlight} skipped so far)`);
+            + `(${r.skippedInFlight} skipped so far) - ${describeOverrun(running, performance.now(), laneCalls())}`);
         return;
     }
-    inFlight.add(name);
+    const caller = newCaller(name);
+    inFlight.set(name, caller);
     r.runs++;
     r.lastRunAt = new Date().toISOString();
     const t0 = performance.now();
     try {
-        r.lastDetail = await fn();
+        r.lastDetail = await runAs(caller, fn);
         r.lastOkAt = new Date().toISOString();
         // CONSECUTIVE, not cumulative. `failures` alone cannot tell "lost one
         // lock race in March" from "has thrown on every run since Tuesday", and
@@ -562,6 +571,7 @@ async function alertNotify(): Promise<string> {
     // WRITE-IN-LOOP-OK: a READ, and the loop is bounded by the notify
     // batch rather than by fleet size - it cannot scale with entities.
     for (const ev of events) {
+        step(`${ev.type} for alert ${ev.alertId}, as it was queued`);
         // WRITE-IN-LOOP-OK: a READ, and bounded by the notify batch rather than
         // by fleet size.
         const rec = await OPS.getAlert(ev.alertId);
@@ -579,6 +589,7 @@ async function alertNotify(): Promise<string> {
     const r = await retryPass(new Date(), notifyBudget);
     sent += r.sent;
     // What the budget held, once a minute per channel, as one message.
+    step('digests');
     sent += await flushDigests(notifyBudget);
     // Channel health, refreshed once a minute off the pass that owns the
     // channels (easy-win E6): the trailing-failure streaks ride JobsStats so
@@ -586,6 +597,7 @@ async function alertNotify(): Promise<string> {
     // instead of the notifications table silently growing.
     if (Date.now() - lastChannelHealthMs >= 60_000) {
         lastChannelHealthMs = Date.now();
+        step('channel health');
         const ch = await OPS.notifyChannelHealth();
         if (ch.ok) {
             notifyChannels = ch.rows.map((c) => ({
@@ -804,7 +816,7 @@ function snapshot(): JobsStats {
         thread: 'jobs',
         asyncErrors,
         jobs: [...jobs.values()],
-        inFlight: [...inFlight],
+        inFlight: [...inFlight.keys()],
         frontier,
         notifyChannels,
         heartbeat: hb.stats(),
@@ -843,7 +855,7 @@ parentPort?.on('message', (msg: { type: string; job?: string }) => {
         const deadline = Date.now() + CONFIG.jobsStopDeadlineMs;
         const wait = (): void => {
             if (inFlight.size === 0 || Date.now() > deadline) {
-                if (inFlight.size > 0) log(`ALARM stopping with ${[...inFlight].join(', ')} still in flight`);
+                if (inFlight.size > 0) log(`ALARM stopping with ${[...inFlight.keys()].join(', ')} still in flight`);
                 parentPort?.postMessage({ type: 'final', stats: snapshot() });
                 closeAll().then(() => { hb.stop(); process.exit(0); }).catch(() => process.exit(1));
                 return;

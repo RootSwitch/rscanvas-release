@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.1.0-alpha.10 - 2026-10-21
+
+A short release, most of it asked for by the operator's own network in the
+week after alpha.9. A device says what it is - its OS and model in words,
+under its name and in the roster - and a change to either is recorded on
+its timeline, with an alert to turn on where an upgrade is news. A stopped
+fan raises an alert. A port the device no longer has can be removed with
+its history. Retention says how fast the database grows and where it
+levels off, and a background job that overruns says what it is waiting on.
+Built from the public tree on a fresh Linux clone, and an alpha.9 install
+upgraded to it in one step.
+
+### Added
+
+- **A stopped fan raises an alert.** A tracked fan that reads 0 raises a
+  warn after two scans in a row, about a minute, and clears when it turns
+  again. Nothing has to be set first: on by default for every fan. Before
+  this, a fan's levels alarmed only on a HIGH reading, so a dead fan raised
+  nothing. A graphics card's fan, which stops on purpose while the card is
+  idle, is left out by its name. A fan card's settings, behind its cog,
+  say whether that fan is watched and why, with a button to include or
+  exclude it - for any other fan built to stop.
+- **What a device is, in words.** The OS column and a new line under a
+  device's name now say "RouterOS 7.24.5 (stable)", "Linux 6.8.0-142-generic",
+  "Windows Server 2022 (build 20348)", "pfSense 2.9.0", "TrueNAS 13.0-U6.8",
+  "IOS-XE 17.3.8a" rather than the agent's raw description, which is a hover
+  away; an agent no rule knows keeps its own words. Hardware is the device's
+  model where the vendor's own tree names it - a MikroTik's board, an APC's
+  model, a UniFi's, else ENTITY-MIB - and the processor where it does not.
+  A MikroTik also shows its boot firmware (RouterBOOT), and says so when it
+  is behind the one its RouterOS offers. Read with the daily inventory, after
+  a restart, and whenever the description changes, so an upgrade shows on the
+  poll that sees it. Ported from SNMPCanvas, which read these only at
+  discovery.
+- **Changes to what a device is are recorded.** When its OS, hardware model
+  or boot firmware moves from one value to another, the device's timeline
+  says so, old and new - "OS changed: RouterOS 7.20.6 -> RouterOS 7.24.5
+  (stable)". A first value is not a change, so nothing is recorded the day
+  this arrives.
+- **Change alerts, off until you want them.** On the device page, turn them
+  on for that device or for every device: a change then raises a warn that
+  stays 30 minutes and clears without an email, naming what changed. Never
+  for a change inside a maintenance window, or on a transient device. Off by
+  default because a Linux kernel changes with most updates. A Windows box's
+  monthly updates do not show: its agent reports the build, not the update.
+
+- **Remove a stale interface.** An interface the device no longer reports -
+  a LAG deleted on the switch, a card pulled - stays in its list as stale;
+  an admin can now remove it from the device page, with its history and
+  its own alert settings. A port the device still reports cannot be removed.
+  (The automatic cleanup only takes the leftover duplicates of an interface
+  renumbering, never a port that is really gone.)
+
+- **How fast the database grows, and where it levels off.** System >
+  Retention now opens with a line per part - raw samples, syslog and traps,
+  ping detail, the hourly history kept for good, and the rest - giving its
+  size, its rate a day, how long it is kept, how full its window is and
+  where it levels off, then the whole: "1.86 GB now; levels off near 2.1 GB
+  as the windows fill, then grows about 0.47 GB a year". Rates come from
+  the last seven complete days, with the free-text index on the newest
+  syslog days counted once, so neither a light first week nor that index
+  reads as the rate. PING_HISTORY_DAYS joins the settings listed there.
+
+- **A background job that overruns says what it is waiting on.** When a
+  job's next turn finds the last run still going, the log line that counts
+  the skip now also says how long that run has been going and the step it
+  is on. For alert notifications that means which queue it is reading, or
+  which alert it is sending and by which channel. It says whether the run
+  is waiting for a database connection, connecting, or in a query, and who
+  else holds that connection pool. Before, the line could only be counted.
+
+### Upgrading
+
+One schema change (`sql/slice66.sql`, additive: nine columns and one
+table), applied by the installer as usual. Each device reads its identity
+on its first poll after the upgrade, so the words and models fill in within
+a poll interval; nothing is recorded as a change.
+
+The stopped-fan alert is on by default: after the upgrade, a tracked fan
+that reads 0 raises a warn within about a minute. A graphics card's fan is
+left out by its name; exclude any other fan built to stop on its card.
+
 ## 0.1.0-alpha.9 - 2026-10-17
 
 The week the data started answering more of the questions an operator

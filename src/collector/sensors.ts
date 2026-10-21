@@ -305,7 +305,9 @@ export const plausibleC = (c: number | null): boolean => c !== null && c > 0 && 
 
 /** Absent fan bays and stopped fans read 0: only spinning fans are tracked
  *  at discovery, and a TRACKED fan that later drops to 0 still polls and
- *  can raise an alarm - the order of those two facts is the design. */
+ *  raises the stopped-fan alert (src/alerts/fanstop.ts) - the order of those
+ *  two facts is the design. Until 2026-10-18 this comment promised the alarm
+ *  and nothing raised it: a fan's levels alarm on a HIGH reading. */
 export const fanTracked = (rpm: number | null): boolean =>
     rpm !== null && rpm > 0 && rpm < 60000;
 

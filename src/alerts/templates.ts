@@ -101,6 +101,12 @@ function detailFor(alert: Alert): string {
             + (alert.value != null ? `, at least ${alert.value} C each` : '')
             + ' - the room, not one device: check its cooling';
     }
+    // A stopped fan (2026-10-18): its reading is 0, and saying so as
+    // "value 0rpm" would bury the news. The tachometer may be what died, so
+    // both are named.
+    if (alert.kind === 'fan-stopped') {
+        return 'reading 0 - the fan has stopped turning, or its speed sensor has stopped reporting it';
+    }
     if (alert.value != null && alert.threshold != null) {
         return `value ${alert.value}${unit} (threshold ${alert.threshold}${unit})`;
     }
@@ -119,6 +125,8 @@ function detailFor(alert: Alert): string {
         // Slice 62. sysUpTime is the AGENT's uptime, so what is known is that
         // one of the two restarted - said as that, the device-down lesson.
         case 'reboot':      return 'restarted - the device, or its SNMP agent (its uptime started again from zero)';
+        // Slice 66: the label carries what changed, old and new.
+        case 'device-change': return 'what the device runs or is changed - an upgrade, a downgrade, or a part swapped';
         case 'watchdog':    return 'a status feed is unavailable or stale';
         default:            return alert.value != null ? `value ${alert.value}${unit}` : 'state changed';
     }

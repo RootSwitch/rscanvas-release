@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.9
+# Known issues, as of 0.1.0-alpha.10
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08 and 2026-10-17 for the second to the ninth. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17 and 2026-10-21 for the second to the tenth. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
@@ -81,6 +81,19 @@ what each alpha fixed.
   the page and email say "the device or its SNMP agent".
 - **Availability is by ping alone** (alpha.9), by the operator's ruling: a
   host that answers ping with every service down is available.
+- **A Windows server's monthly updates do not show** (alpha.10). Its agent
+  reports the build (20348), not the update revision, so its OS line and
+  the change record move only with a new build. A Linux kernel or a
+  RouterOS upgrade shows on the poll that sees it.
+- **A stopped fan is judged by its name** (alpha.10). A fan named for a
+  graphics card (GPU, graphics, VGA) is left out, because those park at 0
+  while the card is idle. Any other fan built to stop - a zero-RPM case
+  fan, a power supply's - raises a warn until it is excluded on its card,
+  and so does a graphics card's fan named otherwise.
+- **The growth estimate needs a little history** (alpha.10). A part's rate
+  needs one complete UTC day of it, and the hourly history's three days of
+  the month (or of the month before), so a new install reads "too early to
+  give a rate" at first. Where a part levels off assumes today's rate.
 
 ## Findings still open
 

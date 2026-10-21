@@ -898,6 +898,20 @@ function ipKey(s) {
     return ((o[0] * 256 + o[1]) * 256 + o[2]) * 256 + o[3];
 }
 
+// WHAT A DEVICE IS (slice 66), one answer for the Devices columns and the
+// device page. The OS: the summary in words the poll keeps (os_summary), else
+// the agent's own first line. Hardware: the device model a vendor tree or
+// ENTITY-MIB named (hw_model), else the processor (cpu_model).
+function deviceOs(d) {
+    if (d?.os_summary) return d.os_summary;
+    const line = String(d?.sys_descr ?? '').split(/\r?\n/)[0].replace(/\s+/g, ' ').trim();
+    return line === '' ? null : line;
+}
+function deviceHardware(d) {
+    return d?.hw_model || d?.cpu_model || null;
+}
+const CHANGE_WORDS = { os: 'OS', hardware: 'hardware', firmware: 'boot firmware' };
+
 const DEVICE_SORTS = {
     name: (a, b) => String(a.name).localeCompare(String(b.name)),
     host: (a, b) => {
@@ -939,8 +953,8 @@ const DEVICE_SORTS = {
     top_bps: (a, b) => (b.top_bps ?? -1) - (a.top_bps ?? -1),
     alarms: (a, b) => (b.alarms ?? 0) - (a.alarms ?? 0) || (b.state_sensors ?? 0) - (a.state_sensors ?? 0),
     batt_pct: (a, b) => (a.batt_pct ?? 1e9) - (b.batt_pct ?? 1e9),   // LOWEST charge first: that is the one to look at
-    sys_descr: (a, b) => String(a.sys_descr ?? '\uffff').localeCompare(String(b.sys_descr ?? '\uffff')),
-    cpu_model: (a, b) => String(a.cpu_model ?? '\uffff').localeCompare(String(b.cpu_model ?? '\uffff')),
+    sys_descr: (a, b) => String(deviceOs(a) ?? '\uffff').localeCompare(String(deviceOs(b) ?? '\uffff')),
+    cpu_model: (a, b) => String(deviceHardware(a) ?? '\uffff').localeCompare(String(deviceHardware(b) ?? '\uffff')),
     // Shortest uptime first: the recently rebooted are the ones to look at.
     uptime_s: (a, b) => (a.uptime_s ?? 1e15) - (b.uptime_s ?? 1e15),
     cpu_cores: (a, b) => (b.cpu_cores ?? -1) - (a.cpu_cores ?? -1),
@@ -1439,11 +1453,15 @@ const ROSTER_COLS = [
           return cell(parts.join(' \u00b7 '), 'num');
       } },
     { key: 'sys_descr', label: 'OS', sort: 'sys_descr', on: false,
-      title: 'The agent\u2019s own description at discovery; use Rediscover after upgrades',
-      cell: (d) => clipCell(d.sys_descr ?? '', 'muted') },
+      title: 'What it runs, in words - from the agent\u2019s own description (sysDescr), read on every poll, and the vendor\u2019s version where that lacks one; hover a cell for the agent\u2019s own words',
+      cell: (d) => {
+          const c = clipCell(deviceOs(d) ?? '', 'muted');
+          if (d.sys_descr) c.title = d.sys_descr;
+          return c;
+      } },
     { key: 'cpu_model', label: 'hardware', sort: 'cpu_model', on: false,
-      title: 'Processor model from HOST-RESOURCES, refreshed daily; blank when the agent does not expose it',
-      cell: (d) => clipCell(d.cpu_model ?? '', 'muted') },
+      title: 'The device model the vendor\u2019s own tree or ENTITY-MIB names, else the processor model from HOST-RESOURCES; read daily and after a restart',
+      cell: (d) => clipCell(deviceHardware(d) ?? '', 'muted') },
     // Slice 21: the three values nothing collected until now.
     { key: 'uptime_s', label: 'uptime', th: 'num', sort: 'uptime_s', on: false,
       title: 'sysUpTime at the last poll - note it wraps at about 497 days, which looks like a reboot',
@@ -2351,6 +2369,12 @@ function renderSensorCards(all) {
                 own.push(`change from normal ${s.change.on ? 'on' : 'off'} (${s.change.why})`);
             }
         }
+        if (s.kind === 'fan' && s.tracked && s.stopped) {
+            details.appendChild(fanStopLine(s));
+            if (s.stopped.why === 'this sensor' || s.stopped.why === 'this device') {
+                own.push(`stopped-fan alert ${s.stopped.on ? 'on' : 'off'} (${s.stopped.why})`);
+            }
+        }
         if (details.childElementCount > 0) {
             if (gear !== null) {
                 details.classList.toggle('hidden', !openCardSettings.has(s.code));
@@ -2454,6 +2478,50 @@ async function setSensorChange(s, want) {
         })
         : await saveThreshold({ kind: 'temp-change', host: null, code: s.code, warn: null, crit: null,
             enabled: want, note: want ? 'change from normal: included' : 'change from normal: excluded' });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) { window.alert(r.detail || `refused (${r.status})`); return; }
+    await showDevice(currentDevice);
+}
+
+// --- the stopped-fan alert on a fan's card (2026-10-18) -------------------------------
+//
+// Whether this fan is watched for reading 0, and what said so. The button
+// writes the fan's own 'fan-stopped' row - or drops it when the fan would
+// say the same without it, so the Thresholds list holds only decisions.
+function fanStopLine(s) {
+    const f = s.stopped;
+    const el = document.createElement('div');
+    el.className = 'muted small change-line';
+    const text = f.on
+        ? (f.why === 'this sensor' ? 'stopped-fan alert: on for this fan' : 'stopped-fan alert: on - raises if it reads 0')
+        : f.why === 'this sensor' ? 'stopped-fan alert: off for this fan'
+            : f.why === 'this device' ? 'stopped-fan alert: off for this device'
+                : f.why === 'every device' ? 'stopped-fan alert: off for every device'
+                    : "stopped-fan alert: off - by its name a graphics card's fan, which stops while the card is idle";
+    el.textContent = `${text} `;
+    el.title = 'Raises when a tracked fan reads 0 for two scans in a row (about a minute), and clears when it turns again.';
+    if (can('alertrule.write') && s.code) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'small';
+        b.textContent = f.on ? 'exclude' : 'include';
+        b.title = f.on ? 'Do not alert when this fan stops - for a fan built to stop'
+            : 'Alert when this fan reads 0, whatever its name says';
+        b.addEventListener('click', (ev) => { ev.stopPropagation(); setFanStop(s, !f.on); });
+        el.appendChild(b);
+    }
+    return el;
+}
+
+async function setFanStop(s, want) {
+    const f = s.stopped;
+    closeCardForms();
+    const r = want === f.withoutRow && f.rowId
+        ? await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: f.rowId }),
+        })
+        : await saveThreshold({ kind: 'fan-stopped', host: null, code: s.code, warn: null, crit: null,
+            enabled: want, note: want ? 'stopped-fan alert: included' : 'stopped-fan alert: excluded' });
     if (r.status === 401) { showLogin(); return; }
     if (!r.ok) { window.alert(r.detail || `refused (${r.status})`); return; }
     await showDevice(currentDevice);
@@ -3023,6 +3091,32 @@ function trackButton(e) {
     return b;
 }
 
+// REMOVE A STALE INTERFACE (2026-10-19, the operator: a LAG deleted on the
+// switch stayed in the list as stale for good). Offered on stale rows only,
+// to a role that may delete; the server refuses a row the device still
+// reports, whatever the page thinks. The history goes with it, so it asks.
+function removeInterfaceButton(e) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn-track';
+    b.textContent = 'remove';
+    b.title = 'the device no longer reports this interface - remove it from RSCanvas, with its history';
+    b.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        if (!window.confirm(`Remove ${e.name} from ${currentDevice}? The device no longer reports it. `
+            + 'Its history and its own alert settings go with it, and this cannot be undone. '
+            + 'If an interface of that name appears again, it arrives as new.')) return;
+        const r = await api('/api/device/interface/remove', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: currentDevice, code: e.code }),
+        });
+        if (r.status === 401) { showLogin(); return; }
+        if (!r.ok) { window.alert(r.detail || `refused (${r.status})`); return; }
+        await showDevice(currentDevice);
+    });
+    return b;
+}
+
 // --- per-interface alert rules (2026-09-23) -----------------------------------
 //
 // THE GAP: sensor cards had a gear with Mute; interface rows had only
@@ -3045,6 +3139,9 @@ let lastLinkDown = null;
 // server could not resolve it), and its restarts, newest first.
 let lastRestartAlerts = null;
 let lastRestarts = null;
+// Slice 66, from /api/device: whether change alerts are on for the device on
+// screen - the same shape as restart alerts', null when unresolved.
+let lastChangeAlerts = null;
 // Slice 65, from /api/device: the device's change-from-normal row and the
 // fleet's two switches ({ deviceOff, deviceRowId, singleOn, roomOn,
 // singleRowId, roomRowId, minHours }, null when unresolved).
@@ -3345,6 +3442,8 @@ function renderEntities(data) {
         lastRestarts = data.restarts ?? null;
         syncRestartControl();
         renderRestarts();
+        lastChangeAlerts = data.changeAlerts ?? null;
+        syncChangeControl();
         lastTempChange = data.tempChange ?? null;
         syncTempChangeControl();
     }
@@ -3436,7 +3535,7 @@ function renderEntities(data) {
             p.title = `the device answers, but this interface is gone from its agent's table (since ${fmtAgo(e.lv_stale_since)}). `
                 + 'A duplicate row with the same name that reads normally means this is a leftover '
                 + 'generation from an ifIndex change - untrack it and cleanup removes it after a week. '
-                + 'No duplicate means the port itself was removed.';
+                + 'No duplicate means the port itself was removed: "remove" (admin) takes the row and its history.';
             return p;
         };
         // The name cell carries the rule badge: which alerts are muted on
@@ -3473,10 +3572,11 @@ function renderEntities(data) {
             stale ? stalePill() : pill('untracked', 'badge'),
             cell('', 'num'), cell('', 'num'), cell('', 'num'), cell('', 'num'),
             stale
-                ? cell(`not watched - no reading since ${fmtAgo(e.lv_stale_since)}, cleanup removes it after a week if a live duplicate exists`, 'muted')
+                ? cell(`not watched - no reading since ${fmtAgo(e.lv_stale_since)}, cleanup removes it after a week if a live duplicate exists; otherwise remove it`, 'muted')
                 : cell('not watched - no alerts, no new readings', 'muted'),
         ]);
         tr.appendChild(trackTd);
+        if (stale && e.code && can('device.delete')) trackTd.appendChild(removeInterfaceButton(e));
         // The rule gear beside untrack, admin-only like the sensor gear
         // (alertrule.write is an admin permission). Offered on tracked rows
         // only - an untracked interface raises nothing to mute - while an
@@ -3738,6 +3838,40 @@ function renderDeviceHeader() {
     addr.title = d?.snmp_enabled === false ? 'the address RSCanvas pings (SNMP is off for this device)'
         : 'the address RSCanvas polls and pings';
     $('device-logs').classList.toggle('hidden', !d?.host || !can('syslog.read'));
+    // OS and hardware (2026-10-19, operator): the roster's sys_descr and
+    // cpu_model, the Devices page's OS and hardware columns. sysDescr is the
+    // agent's own words, re-read every poll, so an upgrade shows at once;
+    // some agents write several lines (Cisco's copyright block), so the line
+    // shows the first and the tooltip carries all of it.
+    const ident = $('device-identity');
+    ident.replaceChildren();
+    const firstLine = (v) => String(v ?? '').split(/\r?\n/)[0].replace(/\s+/g, ' ').trim();
+    // Slice 66: the OS in words and the device model, from deviceOs and
+    // deviceHardware (the columns' own answers); the agent's words on hover.
+    // A MikroTik also gets its RouterBOOT, and says so when the installed one
+    // is behind the one its RouterOS offers.
+    const rawDescr = String(d?.sys_descr ?? '').trim();
+    const fwLags = !!(d?.fw_version && d?.fw_upgrade && d.fw_version !== d.fw_upgrade);
+    for (const [label, value, tip] of [
+        ['OS', deviceOs(d), rawDescr !== '' ? `the agent's own description (read on every poll):\n${rawDescr}` : ''],
+        ['Hardware', deviceHardware(d), d?.hw_model ? "the device model, from the vendor's own tree or ENTITY-MIB"
+            : 'the processor model, from HOST-RESOURCES - the agent names no device model'],
+        ['Boot firmware', d?.fw_version ? (fwLags ? `${d.fw_version} - RouterOS offers ${d.fw_upgrade}` : d.fw_version) : null,
+            fwLags ? 'the RouterBOOT installed is behind the one this RouterOS ships: System > RouterBOARD > Upgrade, then reboot'
+                : 'the RouterBOOT installed (MIKROTIK-MIB)'],
+    ]) {
+        const text = firstLine(value);
+        if (text === '') continue;
+        const part = document.createElement('span');
+        const k = document.createElement('span');
+        k.className = 'muted';
+        k.textContent = `${label} `;
+        part.append(k, document.createTextNode(text));
+        if (label === 'Boot firmware' && fwLags) part.classList.add('warn-text');
+        part.title = tip;
+        ident.appendChild(part);
+    }
+    ident.classList.toggle('hidden', ident.childElementCount === 0);
     const grp = $('device-grouping');
     grp.replaceChildren();
     for (const [label, value] of [['location', d?.location], ['application', d?.application]]) {
@@ -3809,6 +3943,7 @@ async function showDevice(name) {
     if (arriving) {
         lastRestartAlerts = null; lastRestarts = null; $('restart-msg').textContent = '';
         syncRestartControl(); renderRestarts();
+        lastChangeAlerts = null; $('change-msg').textContent = ''; syncChangeControl();
         lastTempChange = null; $('tempchange-msg').textContent = ''; syncTempChangeControl();
         openCardSettings.clear();
     }
@@ -4179,6 +4314,72 @@ $('dev-restart-fleet').addEventListener('click', async () => {
     await showDevice(currentDevice);
 });
 
+// CHANGE ALERTS for the device on screen (slice 66), restart alerts' twin:
+// the checkbox is THIS device, the button the fleet; both override rows,
+// saved on toggle, and the device's own row dropped when it would only
+// repeat the fleet's. Every change is on the timeline whether or not this
+// is on.
+function syncChangeControl() {
+    const ca = lastChangeAlerts;
+    const box = $('dev-change-alerts');
+    box.checked = ca?.on === true;
+    box.disabled = ca === null;
+    const fleet = $('dev-change-fleet');
+    fleet.classList.toggle('hidden', ca === null);
+    fleet.textContent = ca?.fleetOn ? 'turn off for every device' : 'turn on for every device';
+    const known = lastDevices.find((d) => d.name === currentDevice);
+    if (ca !== null && known?.transient === true) {
+        $('change-msg').textContent = 'this device is transient - its changes are on the timeline, and never raise';
+    }
+}
+
+$('dev-change-alerts').addEventListener('change', async () => {
+    if (currentDevice === null || lastChangeAlerts === null) return;
+    const box = $('dev-change-alerts');
+    const want = box.checked;
+    const ca = lastChangeAlerts;
+    const r = want === ca.fleetOn
+        ? (ca.deviceRowId
+            ? await api('/api/thresholds/delete', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id: ca.deviceRowId }),
+            })
+            : { ok: true })
+        : await saveThreshold({ kind: 'device-change', host: currentDevice, code: null, warn: null, crit: null,
+            enabled: want, note: want ? 'change alerts on' : 'change alerts off' });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        box.checked = !want;
+        $('change-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('change-msg').textContent = want
+        ? 'ON - a change to its OS, hardware or boot firmware raises a warn for 30 minutes'
+        : 'OFF - changes are still recorded on its timeline, and raise nothing';
+    await showDevice(currentDevice);
+});
+
+$('dev-change-fleet').addEventListener('click', async () => {
+    if (currentDevice === null || lastChangeAlerts === null) return;
+    const ca = lastChangeAlerts;
+    const want = !ca.fleetOn;
+    if (!window.confirm(want
+        ? 'Turn change alerts on for every device? A Linux kernel changes with most updates, so expect one per kernel update. Monthly Windows updates do not show: the agent reports the build, not the update. A device given its own setting here keeps it.'
+        : 'Turn change alerts off for every device? A device turned on here keeps its own setting.')) return;
+    const r = !want && ca.fleetRowId
+        ? await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: ca.fleetRowId }),
+        })
+        : await saveThreshold({ kind: 'device-change', host: null, code: null, warn: null, crit: null,
+            enabled: want, note: want ? 'change alerts on for every device' : 'change alerts off for every device' });
+    if (r.status === 401) { showLogin(); return; }
+    $('change-msg').textContent = r.ok
+        ? (want ? 'ON for every device without its own setting' : 'OFF for every device without its own setting')
+        : (r.detail || `refused (${r.status})`);
+    await showDevice(currentDevice);
+});
+
 // --- the device timeline (IDEAS-2026-10-15 item 4) ------------------------------
 //
 // What happened to the device on screen, newest first, from /api/device/
@@ -4224,6 +4425,9 @@ function timelineWords(e) {
         case 'reach': return [`ping ${d.from} to ${d.to}`, d.rtt != null ? `${Number(d.rtt).toFixed(1)} ms` : ''];
         case 'restart': return ['restarted', `the device or its SNMP agent, after at least ${fmtRuntime(d.upBefore)} up`
             + (d.planned ? ' - inside a maintenance window, so it raised nothing' : '')];
+        // Slice 66: its OS, hardware or boot firmware, old and new.
+        case 'change': return [`${CHANGE_WORDS[d.field] ?? d.field ?? 'identity'} changed`,
+            `${d.old ?? '?'} → ${d.new ?? '?'}` + (d.planned ? ' - inside a maintenance window' : '')];
         case 'maintenance': return [d.repeating ? 'repeating window' : 'maintenance window',
             `until ${fmtWhen(e.until)}`
             + (d.scope && d.scope !== 'device' ? ` (${d.scope === 'all' ? 'everything' : `${d.scope} ${d.target}`})` : '')
@@ -6719,6 +6923,7 @@ function renderRetention(d) {
     const total = parts.reduce((a, x) => a + Number(x.bytes || 0), 0);
     $('retention-sub').textContent =
         `${parts.length} partitions, ${fmtBytes(total)} on disk`;
+    renderGrowth(adminData.growth ?? null);
 
     const tbody = $('partitions').querySelector('tbody');
     tbody.replaceChildren();
@@ -6782,6 +6987,44 @@ function renderRetention(d) {
             cell(c.means, 'muted'),
         ]));
     }
+}
+
+// GROWTH (2026-10-19): one line a part, then the total - the operator's ask
+// after SNMPCanvas's "about 26.9 MiB/day ... levels off near 2.37 GiB". The
+// numbers are the server's (src/store/growth.ts); this only words them.
+function renderGrowth(g) {
+    const el = $('retention-growth');
+    el.replaceChildren();
+    if (g === null) {
+        el.appendChild(factLine('growth', 'not available - the store did not answer the size read'));
+        return;
+    }
+    const days = (n) => `${n} day${n === 1 ? '' : 's'}`;
+    const words = {
+        raw: 'Raw samples', messages: 'Syslog and traps', ping: 'Ping detail',
+        hourly: 'Hourly history, kept for good', other: 'Everything else',
+    };
+    for (const p of g.parts) {
+        let text;
+        if (p.key === 'other') {
+            text = `${fmtBytes(p.bytes)} - devices, alerts, the audit trail and the rest, read as it stands`;
+        } else if (p.key === 'hourly') {
+            text = p.perDay === null ? `${fmtBytes(p.bytes)} - too early to give a rate`
+                : `${fmtBytes(p.bytes)}, about ${fmtBytes(p.perDay)} a day - about ${fmtBytes(p.perDay * 365)} a year`;
+        } else if (p.perDay === null) {
+            text = `${fmtBytes(p.bytes)}, kept ${days(p.keptDays)} - too early to give a rate`;
+        } else {
+            text = `${fmtBytes(p.bytes)}, about ${fmtBytes(p.perDay)} a day, kept ${days(p.keptDays)} - `
+                + (p.full ? `full, about ${fmtBytes(p.steadyBytes)}`
+                    : `${p.heldDays} of ${p.keptDays} days held, levels off near ${fmtBytes(p.steadyBytes)}`)
+                + (p.indexBytes > 0 ? ` (with ${fmtBytes(p.indexBytes)} of free-text index on the most recent days)` : '');
+        }
+        el.appendChild(factLine(words[p.key] ?? p.key, text));
+    }
+    el.appendChild(factLine('Altogether', g.steadyBytes === null
+        ? `${fmtBytes(g.totalBytes)} now - too early to say where it levels off`
+        : `${fmtBytes(g.totalBytes)} now; at today's rates it levels off near ${fmtBytes(g.steadyBytes)} as the windows fill`
+            + (g.perYearBytes === null ? '' : `, then grows about ${fmtBytes(g.perYearBytes)} a year with the history kept for good`)));
 }
 
 async function previewRetention(table) {

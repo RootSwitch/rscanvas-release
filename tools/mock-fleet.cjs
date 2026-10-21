@@ -46,6 +46,25 @@
 //                 decides by name which sensors follow the room, and every
 //                 coretemp core follows work - so a fleet that is to exercise
 //                 it serves names like SYSTIN or mlx5-pci-0100:sensor0.
+//   FANS_PER      fans per device, served as NET-SNMP extend rows named
+//                 fan-<name> - the way an agent owner publishes one, and so
+//                 vendor-free (default 0 = none). Spinning at 3800..4200 rpm.
+//   FAN_NAMES     comma-separated names for them, cycled (default ChassisN);
+//                 no spaces, as an extend's name has none
+//   FAN_PARK      names that read 0 throughout - a graphics card's fan,
+//                 parked while the card is idle (default none)
+//   FAN_STOP      names that STOP (read 0) at FAN_STOP_AFTER_S seconds after
+//                 boot and turn again at FAN_START_AFTER_S, 0 = never - the
+//                 dead fan the stopped-fan alert exists for (default none)
+//   MOCK_ROUTEROS=1   every device answers as a MikroTik (slice 66's identity
+//                 read): sysObjectID 14988.1, sysDescr "RouterOS <board>", and
+//                 MIKROTIK-MIB's version, RouterBOOT and board scalars.
+//   ROS_BOARD / ROS_VERSION / ROS_FIRMWARE   the board, RouterOS version and
+//                 installed RouterBOOT (default CRS354-48G-4S+2Q+, 7.20.6, 7.7);
+//                 the RouterBOOT on offer is ROS_VERSION, as on a real one
+//   ROS_DESCR_VERSION=1   sysDescr carries the version too, as RouterOS 7.2x
+//                 does: "RouterOS <board> <version> (stable)". Restart the
+//                 mock with new values to stage an upgrade.
 //   SHIFT_INDEXES N   every ifIndex is offset by N while ifName stays put -
 //                     a PCIe re-enumeration. Seed a fleet at 0, restart at N:
 //                     Gi0/1 that was ifIndex 1 now arrives on ifIndex 1+N.
@@ -102,6 +121,18 @@ const FLAP_PCT = int(process.env.SENSOR_FLAP_PCT, 10);
 const STEP_AFTER_MS = int(process.env.SENSOR_STEP_AFTER_S, 300) * 1000;
 const STEP_C = int(process.env.SENSOR_STEP_C, 30);
 const TEMP_NAMES = (process.env.TEMP_NAMES || '').split(',').map((x) => x.trim()).filter((x) => x !== '');
+const FANS     = int(process.env.FANS_PER, 0);
+const names    = (v) => (v || '').split(',').map((x) => x.trim()).filter((x) => x !== '');
+const FAN_NAMES = names(process.env.FAN_NAMES);
+const FAN_PARK = new Set(names(process.env.FAN_PARK));
+const FAN_STOP = new Set(names(process.env.FAN_STOP));
+const FAN_STOP_AFTER_MS = int(process.env.FAN_STOP_AFTER_S, 0) * 1000;
+const FAN_START_AFTER_MS = int(process.env.FAN_START_AFTER_S, 0) * 1000;
+const ROS = process.env.MOCK_ROUTEROS === '1';
+const ROS_BOARD = process.env.ROS_BOARD || 'CRS354-48G-4S+2Q+';
+const ROS_VERSION = process.env.ROS_VERSION || '7.20.6';
+const ROS_FIRMWARE = process.env.ROS_FIRMWARE || '7.7';
+const ROS_DESCR_VERSION = process.env.ROS_DESCR_VERSION === '1';
 if (!['drift', 'step', 'flap'].includes(SENSOR_MODE)) {
     console.error(`SENSOR_MODE must be drift, step or flap - got ${JSON.stringify(SENSOR_MODE)}`);
     process.exit(2);
@@ -185,8 +216,19 @@ function buildDevice(i) {
     // lab-5 ingest run met the same collision on 2026-09-24. Fixed here now.
     const name = evil ? EVIL_STRINGS.sysName : `lab-node-${port}`;
     for (const [n, oid, type, value] of [
-        ['sysDescr', '1.3.6.1.2.1.1.1', OT.OctetString, `SNMPCanvas fleet mock - Linux ${name} 6.8.0 x86_64`],
-        ['sysObjectID', '1.3.6.1.2.1.1.2', OT.OID, '1.3.6.1.4.1.8072.3.2.10'],
+        ['sysDescr', '1.3.6.1.2.1.1.1', OT.OctetString, ROS
+            ? `RouterOS ${ROS_BOARD}${ROS_DESCR_VERSION ? ` ${ROS_VERSION} (stable)` : ''}`
+            : `SNMPCanvas fleet mock - Linux ${name} 6.8.0 x86_64`],
+        ['sysObjectID', '1.3.6.1.2.1.1.2', OT.OID, ROS ? '1.3.6.1.4.1.14988.1' : '1.3.6.1.4.1.8072.3.2.10'],
+        // MIKROTIK-MIB's identity scalars (slice 66), at the OIDs the
+        // operator's shelf walk of a CRS answered them on.
+        ...(ROS ? [
+            ['mtxrLicVersion', '1.3.6.1.4.1.14988.1.1.4.4', OT.OctetString, ROS_VERSION],
+            ['mtxrFirmwareVersion', '1.3.6.1.4.1.14988.1.1.7.4', OT.OctetString, ROS_FIRMWARE],
+            ['mtxrFirmwareUpgradeVersion', '1.3.6.1.4.1.14988.1.1.7.7', OT.OctetString, ROS_VERSION],
+            ['mtxrBoardName', '1.3.6.1.4.1.14988.1.1.7.8', OT.OctetString, ROS_BOARD],
+            ['mtxrBoard', '1.3.6.1.4.1.14988.1.1.7.9', OT.OctetString, ROS_BOARD],
+        ] : []),
         ['sysUpTime', '1.3.6.1.2.1.1.3', OT.TimeTicks, 0],
         ['sysContact', '1.3.6.1.2.1.1.4', OT.OctetString, 'lab@example.net'],
         ['sysName', '1.3.6.1.2.1.1.5', OT.OctetString, name],
@@ -347,7 +389,35 @@ function buildDevice(i) {
         }
     }
 
-    devices.push({ port, mib, ifaces, counters, temps, bootMs: Date.now() - (i * 60000), fleetIndex: i });
+    // FANS, as NET-SNMP-EXTEND output rows: the table is indexed by the
+    // extend's name as a length-prefixed string (fan-Chassis1 is
+    // 12.102.97.110...), which RSCanvas decodes (decodeExtendName) and reads
+    // the kind from the prefix of.
+    const fans = [];
+    if (FANS > 0) {
+        mib.registerProvider({
+            name: 'nsExtendOutput1Table', type: snmp.MibProviderType.Table,
+            oid: '1.3.6.1.4.1.8072.1.3.2.3.1',
+            tableColumns: [
+                { number: 1, name: 'nsExtendOutput1Line', type: OT.OctetString, maxAccess: RO },
+                { number: 2, name: 'nsExtendOutputFull', type: OT.OctetString, maxAccess: RO },
+                { number: 100, name: 'nsExtendToken', type: OT.OctetString, maxAccess: snmp.MaxAccess['not-accessible'] },
+            ],
+            tableIndex: [{ columnName: 'nsExtendToken' }],
+        });
+        for (let f = 0; f < FANS; f++) {
+            // Cycled names get a suffix past the first round: two rows with
+            // one name would be one index twice.
+            const n = FAN_NAMES.length > 0 ? FAN_NAMES[f % FAN_NAMES.length] : `Chassis${f + 1}`;
+            const name = FAN_NAMES.length > 0 && f >= FAN_NAMES.length ? `${n}-${Math.floor(f / FAN_NAMES.length) + 1}` : n;
+            const fan = { token: `fan-${name}`, rpm: 3800 + ((i * 13 + f * 7) % 400), parked: FAN_PARK.has(n), stops: FAN_STOP.has(n) };
+            fans.push(fan);
+            const v = String(fan.parked ? 0 : fan.rpm);
+            mib.addTableRow('nsExtendOutput1Table', [v, v, fan.token]);
+        }
+    }
+
+    devices.push({ port, mib, ifaces, counters, temps, fans, bootMs: Date.now() - (i * 60000), fleetIndex: i });
 }
 
 let live = 0, dead = 0;
@@ -414,12 +484,23 @@ setInterval(() => {
             }
             d.mib.setTableSingleCell('lmTempSensorsTable', 3, [t.idx], Math.round(c * 1000));
         }
+        for (const f of d.fans) {
+            const stopped = f.stops && FAN_STOP_AFTER_MS > 0 && sinceStart >= FAN_STOP_AFTER_MS
+                && !(FAN_START_AFTER_MS > 0 && sinceStart >= FAN_START_AFTER_MS);
+            const v = String(f.parked || stopped ? 0 : f.rpm + Math.round(Math.random() * 40 - 20));
+            d.mib.setTableSingleCell('nsExtendOutput1Table', 1, [f.token], v);
+            d.mib.setTableSingleCell('nsExtendOutput1Table', 2, [f.token], v);
+        }
     }
 }, TICK_MS);
 
-const perDevice = IFACES + STORES + CPUS + TEMPS;
+const perDevice = IFACES + STORES + CPUS + TEMPS + FANS;
 console.log(`fleet up: ${live} live agents on udp/${BASE + OFFSET}-${BASE + OFFSET + SIZE - 1}, ${dead} dead ports (timeouts by design)`);
-console.log(`per device: ${IFACES} interfaces + ${STORES} storage + ${CPUS} cpu + ${TEMPS} temps = ~${perDevice} pollable entities`);
+console.log(`per device: ${IFACES} interfaces + ${STORES} storage + ${CPUS} cpu + ${TEMPS} temps + ${FANS} fans = ~${perDevice} pollable entities`);
+if (FANS > 0) {
+    const f0 = devices[0]?.fans ?? [];
+    console.log(`fans (extend): ${f0.map((f) => `${f.token}${f.parked ? ' parked at 0' : f.stops ? ` stops at +${FAN_STOP_AFTER_MS / 1000}s${FAN_START_AFTER_MS > 0 ? `, turns again at +${FAN_START_AFTER_MS / 1000}s` : ''}` : ''}`).join(', ')}`);
+}
 if (TEMPS > 0) {
     // SAY WHICH SENSORS MISBEHAVE, so a test does not have to re-derive the
     // selection rule - it reads the same list the fleet used.

@@ -21,6 +21,7 @@
 import pg from 'pg';
 import { CONFIG } from '../config.ts';
 import { LANES, ALL_LANES, type Lane, type ExhaustionPolicy } from './lanes.ts';
+import { currentCaller, type LaneCalls, type LanePhase } from './caller.ts';
 
 export interface Timing {
     /** admitMs + connectMs. What the caller actually waited before work began. */
@@ -157,10 +158,19 @@ class LaneStats {
 
 // --- lane runtime ------------------------------------------------------------
 
+interface LaneCall {
+    caller: string | null;
+    phase: LanePhase;
+    /** performance.now() when it entered this phase. */
+    sinceMs: number;
+}
+
 interface LaneRuntime {
     pool: pg.Pool;
     admission: Admission;
     stats: LaneStats;
+    /** Calls from first wait to release (onLane). */
+    calls: Set<LaneCall>;
 }
 
 const runtimes = new Map<Lane, LaneRuntime>();
@@ -269,6 +279,7 @@ function runtime(lane: Lane): LaneRuntime {
         pool,
         admission: new Admission(spec.max),
         stats: new LaneStats(),
+        calls: new Set(),
     };
     runtimes.set(lane, rt);
     return rt;
@@ -294,8 +305,35 @@ export async function onLane<T>(
     lane: Lane,
     work: (client: pg.PoolClient) => Promise<{ rows: T[]; rowCount: number }>,
 ): Promise<Outcome<T>> {
-    const spec = LANES[lane];
     const rt = runtime(lane);
+    // Every call is on the runtime's list from its first wait to its release,
+    // named for the caller it ran as (store/caller.ts), so a job that overran
+    // can be told what it was waiting on. Removed in the finally, whichever
+    // way the call ends.
+    const call: LaneCall = { caller: currentCaller()?.name ?? null, phase: 'admission', sinceMs: performance.now() };
+    rt.calls.add(call);
+    try {
+        return await admitAndRun(lane, rt, work, call);
+    } finally {
+        rt.calls.delete(call);
+    }
+}
+
+/** The calls in flight on this thread's lanes, for describeOverrun(). */
+export function laneCalls(nowMs = performance.now()): LaneCalls[] {
+    return [...runtimes.entries()].map(([lane, rt]) => ({
+        lane,
+        capacity: LANES[lane].max,
+        calls: [...rt.calls].map((c) => ({ caller: c.caller, phase: c.phase, ms: nowMs - c.sinceMs })),
+    }));
+}
+
+async function admitAndRun<T>(
+    lane: Lane, rt: LaneRuntime,
+    work: (client: pg.PoolClient) => Promise<{ rows: T[]; rowCount: number }>,
+    call: LaneCall,
+): Promise<Outcome<T>> {
+    const spec = LANES[lane];
 
     const tAdmit = performance.now();
     const admitted = await rt.admission.acquire(spec.connectionTimeoutMs);
@@ -350,11 +388,15 @@ export async function onLane<T>(
 
     try {
         const tConnect = performance.now();
+        call.phase = 'connect';
+        call.sinceMs = tConnect;
         client = await rt.pool.connect();
         client.on('error', onClientError);
         const connectMs = performance.now() - tConnect;
 
         const tExec = performance.now();
+        call.phase = 'query';
+        call.sinceMs = tExec;
         try {
             const res = await work(client);
             const execMs = performance.now() - tExec;

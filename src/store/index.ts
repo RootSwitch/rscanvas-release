@@ -25,6 +25,7 @@
 export { LANES, ALL_LANES, type Lane, type LaneSpec, type ExhaustionPolicy } from './lanes.ts';
 export {
     laneState,
+    laneCalls,
     allLaneStates,
     closeAll,
     storeFailureLane,

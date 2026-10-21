@@ -411,6 +411,11 @@ async function runPoll(device: {
      *  poll, for the restart judgement in pollDevice. */
     uptime_s?: number | null;
     since_seen_s?: number | null;
+    /** Slice 66: the stored identity (poll.ts's device type says why). */
+    sys_object_id?: string | null;
+    os_version?: string | null;
+    identity_ts?: Date | null;
+    os_summary?: string | null;
 }): Promise<void> {
     const isDown = device.consecutive_failures >= CONFIG.pollDownAfter;
     polling.set(device.id, { name: device.name, since: Date.now() });
@@ -633,6 +638,7 @@ async function runPoll(device: {
             res.ok && res.rttMs > 0 ? res.rttMs : null,
             res.stencil, anchor,
             res.restart.kind === 'restarted' ? res.restart.upBeforeS : null,
+            res.identity, res.osSummary,
         );
         if (!recorded.ok) {
             log(`ALARM recordDevicePoll refused for ${device.name} (${recorded.reason}) - `

@@ -866,6 +866,11 @@
                 <button type="button" id="device-modify" class="small" aria-expanded="false"
                         aria-controls="device-edit"
                         data-can="device.rename device.address alert.suppress device.group device.mute alertrule.write">Modify</button></h2>
+            <!-- What it is (2026-10-19, operator): the Devices page's OS and
+                 hardware columns, on their own line under the name, OS first
+                 because more devices have one. Left out when the agent gives
+                 neither. -->
+            <div id="device-identity" class="device-identity small hidden"></div>
             <!-- An open maintenance window is STATE, not a control, so it stays
                  visible above the folded edit block. -->
             <div id="dev-maint" class="hints hidden"></div>
@@ -998,6 +1003,18 @@
                     maintenance window, or for a transient device. Saves when toggled.</span>
                 <button type="button" id="dev-restart-fleet"></button>
                 <span id="restart-msg" class="small"></span>
+            </div>
+            <!-- Change alerts (slice 66): restart alerts' twin, off by default.
+                 Every change to the OS, hardware or boot firmware is on the
+                 timeline either way; this is whether one raises. -->
+            <div class="row" data-can="alertrule.write">
+                <label class="small"><input type="checkbox" id="dev-change-alerts"> change alerts</label>
+                <span class="muted small">a warn when its OS, hardware model or boot firmware changes, open
+                    for 30 minutes and cleared without an email. Never for a change inside a maintenance
+                    window, or for a transient device. Every change is on its timeline either way.
+                    Saves when toggled.</span>
+                <button type="button" id="dev-change-fleet"></button>
+                <span id="change-msg" class="small"></span>
             </div>
             <!-- Change from normal (slice 65): on by default for temperatures
                  whose names say they follow the room. Off here takes this
@@ -1400,6 +1417,12 @@
         <div class="panel hidden admin-only" data-section="system" id="retention-panel">
             <h2>Retention <span id="retention-sub" class="muted"></span></h2>
             <div id="retention-msg" class="allquiet hidden"></div>
+
+            <!-- Growth (2026-10-19, operator, after SNMPCanvas's one-line
+                 estimate): each part's rate, how long it is kept, and where
+                 it levels off; src/store/growth.ts says how it is measured. -->
+            <h3>Growth</h3>
+            <div id="retention-growth" class="small"></div>
 
             <h3>What happens next</h3>
             <div class="row">

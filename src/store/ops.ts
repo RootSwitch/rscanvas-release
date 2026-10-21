@@ -1203,6 +1203,12 @@ export const OPS = {
          *  for the restart judgement (collector/restart.ts). */
         uptime_s: number | null;
         since_seen_s: number | null;
+        /** Slice 66: the stored identity, for the OS words on polls that do
+         *  not read it; identity_ts null = never read, so the poll reads it. */
+        sys_object_id: string | null;
+        os_version: string | null;
+        identity_ts: Date | null;
+        os_summary: string | null;
     }>('collector', `
         -- host(), NOT host::text. Casting an inet to text keeps the netmask,
         -- so a device stored as 127.0.0.1 comes back "127.0.0.1/32" and every
@@ -1219,7 +1225,8 @@ export const OPS = {
                -- stamped last_seen_ts: the collector adds its own monotonic
                -- time to it and never compares its wall clock with ours.
                uptime_s,
-               extract(epoch FROM now() - last_seen_ts)::float8 AS since_seen_s
+               extract(epoch FROM now() - last_seen_ts)::float8 AS since_seen_s,
+               sys_object_id, os_version, identity_ts, os_summary
           FROM devices
          WHERE enabled = true
            -- Slice 35: a ping-only device has no agent, so polling it buys
@@ -1326,13 +1333,44 @@ export const OPS = {
         // Slice 62: set when collector/restart.ts judged that the device
         // restarted since its last good poll - the uptime that poll read.
         restartUpBeforeS: number | null = null,
+        // Slice 66: the identity read, when this poll made one, and the OS in
+        // words from this poll's sysDescr. Null leaves the stored values.
+        identity: import('../collector/poll.ts').IdentityRead | null = null,
+        osSummary: string | null = null,
     ) => laneQuery('collector', `
         -- THE RESTART, in the statement that stores the uptime it was judged
         -- from (sql/slice62.sql). A data-modifying CTE runs whether or not
         -- the UPDATE reads it, and inserts nothing unless a restart was
         -- judged. PLANNED is decided now, against the device's windows and
         -- schedules at this moment - slice62.sql says why not at delivery.
-        WITH restart AS (
+        WITH cur AS (
+            SELECT id, name, location, application, os_summary, hw_model, fw_version
+              FROM devices WHERE id = $1::bigint
+        ),
+        -- THE CHANGE RECORD (sql/slice66.sql), in the statement that stores
+        -- the new value, compared against the row as it stood: one row per
+        -- field that moved from one KNOWN value to another - a first value
+        -- is not a change, and a read that did not answer (null) is not
+        -- one either. A runaway agent rewriting its description every poll
+        -- is held to twenty rows a field a day rather than one a poll.
+        change AS (
+            INSERT INTO device_changes (device_id, field, old_value, new_value, planned)
+            SELECT cur.id, c.field, c.old, c.new,
+                   EXISTS (SELECT 1 FROM maintenance_active(now()) w
+                            WHERE w.scope = 'all'
+                               OR (w.scope = 'device' AND w.target = cur.name)
+                               OR (w.scope = 'location' AND w.target = cur.location)
+                               OR (w.scope = 'application' AND w.target = cur.application))
+              FROM cur
+              CROSS JOIN LATERAL (VALUES ('os', cur.os_summary, $18::text),
+                                         ('hardware', cur.hw_model, $17::jsonb->>'hwModel'),
+                                         ('firmware', cur.fw_version, $17::jsonb->>'fwVersion')) AS c(field, old, new)
+             WHERE $2 AND c.old IS NOT NULL AND c.new IS NOT NULL AND c.old <> c.new
+               AND (SELECT count(*) FROM device_changes x
+                     WHERE x.device_id = cur.id AND x.field = c.field AND x.ts > now() - interval '1 day') < 20
+            RETURNING planned
+        ),
+        restart AS (
             INSERT INTO reboot_events (device_id, boot_ts, up_before_s, planned)
             SELECT d.id, now() - make_interval(secs => $10::float8), $16::float8,
                    EXISTS (SELECT 1 FROM maintenance_active(now()) w
@@ -1378,6 +1416,17 @@ export const OPS = {
                sys_location = coalesce($5, sys_location),
                inventory_ts = CASE WHEN $6 THEN now() ELSE inventory_ts END,
                cpu_model    = coalesce($7, cpu_model),
+               -- Slice 66: the identity, kept when a read did not answer;
+               -- identity_ts stamps the ATTEMPT, as inventory_ts does.
+               os_summary    = CASE WHEN $2 THEN coalesce($18::text, os_summary) ELSE os_summary END,
+               sys_object_id = coalesce($17::jsonb->>'sysObjectId', sys_object_id),
+               os_version    = coalesce($17::jsonb->>'osVersion', os_version),
+               hw_model      = coalesce($17::jsonb->>'hwModel', hw_model),
+               fw_version    = coalesce($17::jsonb->>'fwVersion', fw_version),
+               fw_upgrade    = coalesce($17::jsonb->>'fwUpgrade', fw_upgrade),
+               identity_ts   = CASE WHEN $17::jsonb IS NOT NULL THEN now() ELSE identity_ts END,
+               change_seen_ts = CASE WHEN EXISTS (SELECT 1 FROM change) THEN now() ELSE change_seen_ts END,
+               change_planned = coalesce((SELECT bool_and(planned) FROM change), change_planned),
                -- Slice 32: the GUESS only. The override beside it is the
                -- operator's and is never touched by a poll.
                stencil      = coalesce($14, stencil),
@@ -1393,7 +1442,8 @@ export const OPS = {
         // device as DOWN (review F16).
         [id, ok, sysName, sysDescr, sysLocation, inventoryTried, cpuModel, measurement(pollLagMs),
             summary === null ? null : boundedJson(summary), measurement(uptimeS), int4(cpuCores), int8(ramKb),
-            measurement(snmpRttMs), stencil, pollAnchor, measurement(restartUpBeforeS)]),
+            measurement(snmpRttMs), stencil, pollAnchor, measurement(restartUpBeforeS),
+            identity === null ? null : JSON.stringify(identity), osSummary]),
 
     /**
      * A poll that could not be RECORDED (2026-10-06): it failed on the
@@ -3145,6 +3195,38 @@ export const OPS = {
              purge AS (INSERT INTO rollup_purge (entity_id) SELECT id FROM gone ON CONFLICT (entity_id) DO NOTHING)
         DELETE FROM devices WHERE id IN (SELECT id FROM target) RETURNING name`, [names]),
 
+    /**
+     * REMOVE ONE STALE INTERFACE (2026-10-19, the operator: a LAG deleted on
+     * the switch stays in the list as stale forever - the corpse sweep only
+     * takes rows with a live twin of the same name, a re-deal's leftovers,
+     * and a removed port has none).
+     *
+     * STALE ONLY, enforced HERE rather than trusted from the page: a row the
+     * device still answers for is refused, so a stale page cannot delete a
+     * live port. Its hourly history goes the way a deleted device's does (the
+     * rollup_purge queue, sql/slice60.sql); its own rule rows (a per-port
+     * mute, link-down on or off) go with it, because a code is minted from
+     * the device and the name, and a later interface of the same name would
+     * otherwise inherit them. Its open alerts are left to the scan: absent
+     * conditions retire as source-removed.
+     *
+     * One row back when the interface exists: whether it was stale, whether
+     * it went, and how many rule rows went with it. None when it does not.
+     */
+    removeStaleInterface: (deviceName: string, code: string) => laneQuery<{
+        name: string; stale: boolean; removed: boolean; rules: number;
+    }>('interactive', `
+        WITH target AS (
+            SELECT e.id, e.code, e.name, e.lv_stale_since IS NOT NULL AS stale
+              FROM entities e JOIN devices d ON d.id = e.device_id
+             WHERE d.name = $1 AND e.code = $2 AND e.kind = 'if'
+        ),
+        gone AS (DELETE FROM entities WHERE id IN (SELECT id FROM target WHERE stale) RETURNING id, code),
+        purge AS (INSERT INTO rollup_purge (entity_id) SELECT id FROM gone ON CONFLICT (entity_id) DO NOTHING),
+        rules AS (DELETE FROM threshold_overrides WHERE code IN (SELECT code FROM gone) RETURNING 1)
+        SELECT t.name, t.stale, EXISTS (SELECT 1 FROM gone) AS removed, (SELECT count(*) FROM rules)::int AS rules
+          FROM target t`, [deviceName, code]),
+
     /** Delete a board. Its tokens cascade, which revokes its displays. */
     deleteBoard: (id: string) => laneQuery('interactive',
         'DELETE FROM boards WHERE id = $1::bigint', [id]),
@@ -3579,6 +3661,9 @@ export const OPS = {
     uiPartitions: () => laneQuery<{
         parent: string; partition_name: string; est_rows: string;
         bytes: string; pretty: string; has_trgm: boolean; has_host_trgm: boolean;
+        /** The free-text indexes' share of bytes (2026-10-19, the growth
+         *  estimate: they come and go with TRGM_RECENT_DAYS). */
+        trgm_bytes: string;
     }>('interactive', `
         SELECT parent.relname AS parent,
                c.relname AS partition_name,
@@ -3586,12 +3671,32 @@ export const OPS = {
                pg_total_relation_size(c.oid)::text AS bytes,
                pg_size_pretty(pg_total_relation_size(c.oid)) AS pretty,
                to_regclass(c.relname || '_msg_trgm')  IS NOT NULL AS has_trgm,
-               to_regclass(c.relname || '_host_trgm') IS NOT NULL AS has_host_trgm
+               to_regclass(c.relname || '_host_trgm') IS NOT NULL AS has_host_trgm,
+               (coalesce(pg_total_relation_size(to_regclass(c.relname || '_msg_trgm')), 0)
+                + coalesce(pg_total_relation_size(to_regclass(c.relname || '_host_trgm')), 0))::text AS trgm_bytes
           FROM pg_inherits i
           JOIN pg_class c ON c.oid = i.inhrelid
           JOIN pg_class parent ON parent.oid = i.inhparent
          WHERE parent.relkind = 'p'
          ORDER BY parent.relname, c.relname`),
+
+    /**
+     * The facts the growth estimate needs beyond the partition list
+     * (src/store/growth.ts): the whole database, and the two ping tables,
+     * which are not partitioned. Their oldest rows come off their time
+     * indexes (ping_samples_ts_idx, ping_hourly_hour_idx), so this costs the
+     * same at any size.
+     */
+    growthFacts: () => laneQuery<{
+        db_bytes: string; ping_bytes: string; ping_oldest_s: number | null;
+        ping_hourly_bytes: string; ping_hourly_oldest_s: number | null; now_s: number;
+    }>('interactive', `
+        SELECT pg_database_size(current_database())::text AS db_bytes,
+               pg_total_relation_size('ping_samples')::text AS ping_bytes,
+               extract(epoch FROM (SELECT min(ts) FROM ping_samples))::float8 AS ping_oldest_s,
+               pg_total_relation_size('ping_hourly')::text AS ping_hourly_bytes,
+               extract(epoch FROM (SELECT min(hour_ts) FROM ping_hourly))::float8 AS ping_hourly_oldest_s,
+               extract(epoch FROM now())::float8 AS now_s`),
 
     /** What each background job last did, for "what did it do last night". */
     uiJobState: () => laneQuery<{
@@ -3972,7 +4077,9 @@ export const OPS = {
                                -- what a machine IS, which does not stop being
                                -- true because it stopped answering.
                                ('stencil',  to_jsonb(coalesce(d.stencil_override, d.stencil))),
-                               ('hardware', to_jsonb(d.cpu_model)),
+                               -- Slice 66: the device model when the agent
+                               -- names one, the processor when it does not.
+                               ('hardware', to_jsonb(coalesce(d.hw_model, d.cpu_model))),
                                ('cpu',      CASE WHEN d.status = 'up' THEN to_jsonb(round(d.cpu_pct::numeric)) END),
                                ('mem',      CASE WHEN d.status = 'up' THEN to_jsonb(round(d.mem_pct::numeric)) END),
                                ('top',      CASE WHEN d.status = 'up' THEN to_jsonb(d.top_bps::float8) END),
@@ -5323,7 +5430,7 @@ export const OPS = {
      */
     settleRestartClears: (ids: string[]) => laneQuery<{ id: string }>('alerts', `
         UPDATE alerts SET notified_clear = true
-         WHERE id = ANY($1::bigint[]) AND kind = 'reboot' AND state = 'cleared' AND NOT notified_clear
+         WHERE id = ANY($1::bigint[]) AND kind IN ('reboot', 'device-change') AND state = 'cleared' AND NOT notified_clear
         RETURNING id::text AS id`, [ids]),
 
     /**
@@ -5339,6 +5446,8 @@ export const OPS = {
      *   reach        ping transitions (slice 12).
      *   restart      at the time it came back, with how long it had been up
      *                and whether a window covered it (slice 62).
+     *   change       its OS, hardware or boot firmware moving from one value
+     *                to another, old and new (slice 66).
      *   maintenance  one-shot windows and each OCCURRENCE of a repeating one
      *                that covered the device in the window, by the rule
      *                maintenance_active() uses (sql/slice61.sql): the local
@@ -5387,6 +5496,11 @@ export const OPS = {
                        jsonb_build_object('upBefore', r.up_before_s, 'planned', r.planned, 'seen', r.ts)
                   FROM d, w, reboot_events r
                  WHERE r.device_id = d.id AND r.ts >= w.lo
+                UNION ALL
+                SELECT c.ts, 'change', NULL, c.field, NULL, NULL,
+                       jsonb_build_object('field', c.field, 'old', c.old_value, 'new', c.new_value, 'planned', c.planned)
+                  FROM d, w, device_changes c
+                 WHERE c.device_id = d.id AND c.ts >= w.lo
                 UNION ALL
                 SELECT mw.starts_ts, 'maintenance', NULL, mw.note, mw.id::text, mw.ends_ts,
                        jsonb_build_object('scope', mw.scope, 'target', mw.target, 'by', mw.created_by, 'repeating', false)
@@ -5887,6 +6001,8 @@ export const OPS = {
         batt_pct: number | null; runtime_s: number | null;
         sys_descr: string | null; cpu_model: string | null;
         uptime_s: number | null; cpu_cores: number | null; ram_kb: number | null;
+        /** Slice 66: the OS in words, the device model, a MikroTik's RouterBOOT. */
+        os_summary: string | null; hw_model: string | null; fw_version: string | null; fw_upgrade: string | null;
     }>('interactive', `
         -- GROUPED AGGREGATES JOINED ONCE, never correlated subqueries per row.
         --
@@ -5970,6 +6086,7 @@ export const OPS = {
                CASE WHEN d.status = 'up' THEN d.batt_pct END::float8 AS batt_pct,
                CASE WHEN d.status = 'up' THEN d.runtime_s END::float8 AS runtime_s,
                d.sys_descr, d.cpu_model,
+               d.os_summary, d.hw_model, d.fw_version, d.fw_upgrade,
                -- Slice 21: uptime is a reading (blank when not up, like the
                -- summary); cores and RAM are inventory facts and stay.
                CASE WHEN d.status = 'up' THEN d.uptime_s END::float8 AS uptime_s,
@@ -6023,6 +6140,8 @@ export const OPS = {
         poll_age_s: number; poll_interval_s: number;
         /** Slice 62: the last restart, aged by the same clock as poll_age_s. */
         reboot_age_s: number | null; reboot_up_before_s: number | null; reboot_planned: boolean | null;
+        /** Slice 66: the last identity change, aged the same way, and in words. */
+        change_age_s: number | null; change_planned: boolean | null; change_text: string | null;
     }>('alerts', `
         -- EFFECTIVE status merges both instruments (slice 9): ICMP-down wins
         -- over SNMP-up because ping notices in seconds what the 30s poll
@@ -6048,7 +6167,19 @@ export const OPS = {
                extract(epoch FROM now() - last_poll_ts)::int AS poll_age_s,
                poll_interval_s,
                extract(epoch FROM now() - reboot_seen_ts)::int AS reboot_age_s,
-               reboot_up_before_s, reboot_planned
+               reboot_up_before_s, reboot_planned,
+               -- Slice 66: the last change, and the rows that poll wrote, in
+               -- words. Read only for a device changed in the last day - the
+               -- alert's hold is half an hour, and a clear keeps the words its
+               -- raise had - so the steady fleet pays a NULL test, not a join.
+               extract(epoch FROM now() - change_seen_ts)::int AS change_age_s,
+               change_planned,
+               CASE WHEN change_seen_ts > now() - interval '1 day' THEN (
+                   SELECT string_agg(CASE c.field WHEN 'os' THEN 'OS' WHEN 'firmware' THEN 'boot firmware' ELSE c.field END
+                                     || ' ' || c.old_value || ' -> ' || c.new_value, '; ' ORDER BY c.id)
+                     FROM device_changes c
+                    WHERE c.device_id = devices.id AND c.ts >= devices.change_seen_ts - interval '1 second')
+               END AS change_text
           FROM devices
          WHERE enabled = true
            -- Slice 35: last_poll_ts is the SNMP poll's stamp, so gating on it

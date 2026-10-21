@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.9).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.10).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -19,8 +19,10 @@ database outage, a full disk, and a new user's first fifteen minutes in the
 browser. The fourth fixes what running the third on that network and on the
 30,000-entity lab turned up. The seventh adds service checks: web pages,
 TCP ports, and voice and throughput tests to your sites.
-`KNOWN-ISSUES.md` says what is missing or untested; `TESTING.md` says what
-was measured and how; `CHANGELOG.md` says what changed. This is public domain software
+`docs/WHAT-IT-WATCHES.md` lists everything it collects and every alert it can
+raise, with the shipped defaults; `KNOWN-ISSUES.md` says what is missing or
+untested; `TESTING.md` says what was measured and how; `CHANGELOG.md` says
+what changed. This is public domain software
 (`LICENSE`, the Unlicense); the device-icon artwork carries its own notices
 (`NOTICE-ICONS.md`).
 

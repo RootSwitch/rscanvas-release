@@ -539,6 +539,8 @@ table.list td.clip { max-width: 190px; overflow: hidden; text-overflow: ellipsis
 /* The polled address, first after the name (2026-10-16): plain weight, full
    strength - it is the one fact here people copy. */
 .device-address { font-weight: normal; }
+.device-identity { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: -4px 0 8px; overflow-wrap: anywhere; }
+.device-identity .warn-text { color: var(--se-warn); }
 /* The interface table's "hide untracked", in its header row (2026-10-16). */
 #hide-untracked-ifs-label { font-weight: normal; cursor: pointer; }
 /* The folded edit block, set off from the readings below it when open. */
