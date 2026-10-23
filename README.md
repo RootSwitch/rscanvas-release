@@ -30,6 +30,15 @@ It began as a rebuild of the [Canvas Suite](https://github.com/RootSwitch/canvas
 six separate applications that passed JSON files between themselves, as one
 internally modular application.
 
+## Try it
+
+**[The live demo](https://rootswitch.github.io/rscanvas-demo/)** - two weeks
+of a small company's network (headquarters, two branches and a cloud site,
+38 devices), polled by a real RSCanvas and replayed in your browser. The
+Dashboard, every device and chart, the alerts, logs and reports, and four
+NOC boards all work; nothing is being monitored, and nothing you change is
+saved.
+
 ## What it looks like
 
 ![The Dashboard: open alerts, then every location and application with its devices up and down, then the top 10 interfaces by traffic each way, errors and discards, CPU and memory over the last 24 hours, each with its change against the day before](docs/images/dashboard.png)
