@@ -138,14 +138,12 @@ export function siteRows(checks, alerts) {
         }
         by.set(c.device, row);
     }
+    // No row-wide "last run": each test keeps its own (voice.lastTs,
+    // tput.lastTs), shown beside its numbers - one for both read as the
+    // slower test's while it was the faster one's (2026-10-21).
     const rows = [...by.values()].map((r) => {
         const states = [r.voice?.state, r.tput?.state].filter(Boolean);
-        const lasts = [r.voice?.lastTs, r.tput?.lastTs].filter(Boolean).map((t) => Date.parse(t));
-        return {
-            ...r,
-            state: states.reduce((w, s) => (stateRank(s) > stateRank(w) ? s : w), 'ok'),
-            lastTs: lasts.length > 0 ? new Date(Math.max(...lasts)).toISOString() : null,
-        };
+        return { ...r, state: states.reduce((w, s) => (stateRank(s) > stateRank(w) ? s : w), 'ok') };
     });
     return rows.sort((a, b) => stateRank(b.state) - stateRank(a.state)
         || (a.voice?.mos ?? 99) - (b.voice?.mos ?? 99)

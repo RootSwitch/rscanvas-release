@@ -22,6 +22,7 @@
 //   from, to,        // seconds
 //   unit,            // 'bps' | 'pct' | 'bytes' | 'degc' | 'rpm' | 'dur' | ...
 //   bucketSec,
+//   stepSec,         // optional: how often the series is MEANT to have a reading
 // })
 
 const NS = 'http://www.w3.org/2000/svg';
@@ -113,9 +114,44 @@ function nearest(data, t, tolerance) {
     return bestD <= tolerance ? best : null;
 }
 
+/**
+ * The runs a series draws as, split where it must not be joined: at a null,
+ * and at a gap wider than 2.5 steps. Pure, for tools/test-charts.ts.
+ */
+export function lineRuns(data, stepSec) {
+    const maxGap = stepSec * 2.5;
+    const runs = [];
+    let run = [];
+    let prevT = null;
+    for (const [t, v] of data) {
+        if (v === null || v === undefined || (prevT !== null && t - prevT > maxGap)) {
+            if (run.length > 0) runs.push(run);
+            run = [];
+        }
+        if (v !== null && v !== undefined) run.push([t, v]);
+        prevT = t;
+    }
+    if (run.length > 0) runs.push(run);
+    return runs;
+}
+
+/**
+ * THE STEP a gap is judged in (2026-10-21): the bucket, or the series' own
+ * cadence when that is slower. An hourly bandwidth test drew NOTHING at 3
+ * days and under - the bucket there is 14 minutes or less, every hourly
+ * reading sat more than 2.5 buckets from the next, so each was a run of one,
+ * and a run of one drew no line. The cadence comes from the server (a
+ * check's interval, a device's poll interval), not from the data: a poller
+ * that answers once an hour because it is failing must still show its gaps.
+ */
+export function chartStep(bucketSec, stepSec) {
+    return Math.max(bucketSec || 300, Number(stepSec) || 0);
+}
+
 export function render(container, opts) {
     const { series, from, to, unit } = opts;
     const bucketSec = opts.bucketSec || 300;
+    const step = chartStep(bucketSec, opts.stepSec);
     container.replaceChildren();
 
     let max = 0;
@@ -143,34 +179,31 @@ export function render(container, opts) {
         svg.appendChild(label);
     }
 
-    // Series paths. A null value OR a time gap wider than 2.5 buckets BREAKS
+    // Series paths. A null value OR a time gap wider than 2.5 steps BREAKS
     // the line rather than interpolating across it - the parent's rule, and
     // the same doctrine as `stale`: a poller that stopped must not draw as a
-    // straight line between the readings on either side of the outage.
+    // straight line between the readings on either side of the outage. A
+    // reading alone between two gaps is drawn as a dot: a path of one point
+    // draws nothing, which hid it.
     for (const s of series) {
         const lineParts = [];
         const areaParts = [];
-        let run = [];
-        const flush = () => {
-            if (run.length === 0) return;
+        const dots = [];
+        for (const r of lineRuns(s.data, step)) {
+            const run = r.map(([t, v]) => [x(t), y(Math.min(v, yMax))]);
+            if (run.length === 1) { dots.push(run[0]); continue; }
             const pts = run.map(([px, py]) => `${px.toFixed(1)},${py.toFixed(1)}`).join('L');
             lineParts.push(`M${pts}`);
             if (s.area) {
                 const y0 = y(0);
                 areaParts.push(`M${run[0][0].toFixed(1)},${y0}L${pts}L${run[run.length - 1][0].toFixed(1)},${y0}Z`);
             }
-            run = [];
-        };
-        let prevT = null;
-        const maxGap = bucketSec * 2.5;
-        for (const [t, v] of s.data) {
-            if (v === null || (prevT !== null && t - prevT > maxGap)) flush();
-            if (v !== null) run.push([x(t), y(Math.min(v, yMax))]);
-            prevT = t;
         }
-        flush();
         if (areaParts.length) svg.appendChild(svgEl('path', { class: `chart-area-${s.cls}`, d: areaParts.join('') }));
         if (lineParts.length) svg.appendChild(svgEl('path', { class: `chart-line-${s.cls}`, d: lineParts.join('') }));
+        for (const [px, py] of dots) {
+            svg.appendChild(svgEl('circle', { class: `chart-dot-${s.cls}`, cx: px.toFixed(1), cy: py.toFixed(1), r: 2.4 }));
+        }
     }
 
     // THE TIMELINE ON THE CHART (IDEAS-2026-10-15 item 4). Bands first, so a
@@ -236,7 +269,7 @@ export function render(container, opts) {
         head.textContent = `${fmtTime(t, 0)} ${new Date(t * 1000).toLocaleDateString()}`;
         tip.appendChild(head);
         for (const s of series) {
-            const pt = nearest(s.data, t, bucketSec * 1.5);
+            const pt = nearest(s.data, t, step * 1.5);
             tip.appendChild(document.createElement('br'));
             let line = `${s.label}: ${fmtValue(pt, unit)}`;
             // A series may PLOT one line and EXPLAIN several. The error
@@ -246,7 +279,7 @@ export function render(container, opts) {
             // hover carries the breakdown the line collapsed.
             if (Array.isArray(s.parts) && s.parts.length > 0) {
                 const bits = s.parts
-                    .map((p) => `${p.label} ${fmtValue(nearest(p.data, t, bucketSec * 1.5), unit)}`)
+                    .map((p) => `${p.label} ${fmtValue(nearest(p.data, t, step * 1.5), unit)}`)
                     .join(', ');
                 line += ` (${bits})`;
             }

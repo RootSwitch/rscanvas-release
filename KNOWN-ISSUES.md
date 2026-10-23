@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.10
+# Known issues, as of 0.1.0-alpha.11
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17 and 2026-10-21 for the second to the tenth. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17, 2026-10-21 and 2026-10-23 for the second to the eleventh. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
@@ -90,6 +90,21 @@ what each alpha fixed.
   while the card is idle. Any other fan built to stop - a zero-RPM case
   fan, a power supply's - raises a warn until it is excluded on its card,
   and so does a graphics card's fan named otherwise.
+- **A part swapped for an identical-looking one is not a change**
+  (alpha.11). A change is recorded when the agent's own report moves - its
+  description or object ID - so that better words in a later release are
+  not one. A part swapped for one the agent describes the same way, with
+  the same object ID, is stored without a record.
+- **A filesystem replaced by another at its index is not followed**
+  (alpha.11). Filesystems are followed by name when the agent renumbers
+  them; one that is gone, with a different one now mounted at its index,
+  has no name to follow, so its row reads the newcomer under the old name.
+- **A board of every group sorts its sections by name** (alpha.11). A
+  board made from every location or every application, or divided by the
+  axis it is not picked by, has no declared order, so its sections run
+  alphabetically. A board's own groups can be listed in the order wanted -
+  the network first on a NOC wall - but a group added later then joins the
+  board only when it is added to the list; the other axis has no list.
 - **The growth estimate needs a little history** (alpha.10). A part's rate
   needs one complete UTC day of it, and the hourly history's three days of
   the month (or of the month before), so a new install reads "too early to

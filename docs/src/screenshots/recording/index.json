@@ -1,0 +1,32 @@
+{
+ "capturedAt": "2026-10-23T13:05:56.451Z",
+ "source": "the demo network, polled by a real RSCanvas",
+ "routes": {
+  "/api/admin/retention": "d8ec15d1ce5af7.json",
+  "/api/alert-rules": "83d6c0cf4a6145.json",
+  "/api/alerts": "6859898761cbdb.json",
+  "/api/audit?limit=50": "c866f0c2408c9a.json",
+  "/api/boards": "8bed7eb2863113.json",
+  "/api/credentials": "7eb4fcc4a260e9.json",
+  "/api/dashboard/groups": "a7c9079d00a01c.json",
+  "/api/dashboard/services": "4a990231f2fee7.json",
+  "/api/dashboard?window=24": "8df7695a1b8385.json",
+  "/api/device/groups?axis=location": "48f36d4efd97f6.json",
+  "/api/device/timeline?hours=24&name=gpu-01": "d333a4c6384929.json",
+  "/api/device?name=edge-fw": "9c57624c032aaa.json",
+  "/api/device?name=gpu-01": "215e9889266347.json",
+  "/api/devices": "53b1044b9705c6.json",
+  "/api/display/board?board=1": "a1f11908485391.json",
+  "/api/entity/history?code=69QR&hours=24": "1e2449918aeeb7.json",
+  "/api/group-alerts": "a55e5e46400067.json",
+  "/api/health": "1533da9c5b395a.json",
+  "/api/maintenance": "2e3af333ccc5de.json",
+  "/api/policy": "7e089ce1070457.json",
+  "/api/reachability/events": "93b8ac1ed3a11d.json",
+  "/api/report/services?codes=32RM&from=2026-10-10&kind=voice&to=2026-10-23&tz=America/Chicago": "55fef7ab74ff2f.json",
+  "/api/report/traffic?codes=32FG,6SLM&from=2026-10-17&to=2026-10-23&tz=America/Chicago": "8d2308663bfa6a.json",
+  "/api/syslog/export": "cd91a09b43df82.json",
+  "/api/thresholds": "a515182d7417d4.json",
+  "/api/users": "6654ad4d1d4942.json"
+ }
+}

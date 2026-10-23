@@ -89,6 +89,21 @@ eq('...and its multi-line form, as a real agent sends it', summarizeOS(E + '9.1.
 'IOS-XE 17.3.8a');
 eq('classic IOS, the form Cisco documents', summarizeOS(null,
     'Cisco IOS Software, C2960 Software (C2960-LANBASEK9-M), Version 15.0(2)SE11, RELEASE SOFTWARE (fc3)'), 'IOS 15.0(2)SE11');
+// IOS-XE that does not say so (2026-10-21): the demo's ISR4331 read "IOS 17.9.4a".
+eq('an ISR4000 names only its IOSD image: IOS-XE', summarizeOS(E + '9.1.2068',
+    'Cisco IOS Software [Cupertino], ISR Software (X86_64_LINUX_IOSD-UNIVERSALK9-M), Version 17.9.4a, RELEASE SOFTWARE (fc3)'),
+'IOS-XE 17.9.4a');
+eq('...so does an ASR1000', summarizeOS(null,
+    'Cisco IOS Software [Amsterdam], ASR1000 Software (X86_64_LINUX_IOSD-UNIVERSALK9-M), Version 17.3.1, RELEASE SOFTWARE (fc4)'),
+'IOS-XE 17.3.1');
+eq('a Catalyst 3850 on 16.x names neither: every version from 16 is IOS-XE', summarizeOS(null,
+    'Cisco IOS Software [Fuji], Catalyst L3 Switch Software (CAT3K_CAA-UNIVERSALK9-M), Version 16.9.5, RELEASE SOFTWARE (fc1)'),
+'IOS-XE 16.9.5');
+eq('the older IOS-XE that says so, on version 3', summarizeOS(null,
+    'Cisco IOS Software, IOS-XE Software, Catalyst L3 Switch Software (CAT3K_CAA-UNIVERSALK9-M), Version 03.06.06E RELEASE SOFTWARE (fc1)'),
+'IOS-XE 03.06.06E');
+eq('an ISR G2 on 15.x stays classic IOS', summarizeOS(null,
+    'Cisco IOS Software, C2900 Software (C2900-UNIVERSALK9-M), Version 15.7(3)M8, RELEASE SOFTWARE (fc2)'), 'IOS 15.7(3)M8');
 eq('NX-OS', summarizeOS(null, 'Cisco NX-OS(tm) n9000, Software (n9000-dk9), Version 9.3(8), RELEASE SOFTWARE'), 'NX-OS 9.3(8)');
 eq('ASA', summarizeOS(null, 'Cisco Adaptive Security Appliance Version 9.16(3)'), 'ASA 9.16(3)');
 for (const d of ['16-port 10/100/1000 Gigabit Switch', 'Dell Networking X1008 1Gb Switch', 'FS Campus Switch (S5860-20SQ) By FS.COM Inc',

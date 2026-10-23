@@ -91,6 +91,48 @@ export function parseSourceDeclaration(body: Record<string, unknown>): SourcePar
 }
 
 /**
+ * What a board's glance grid is DIVIDED by (slice 67, 2026-10-23).
+ *
+ * Sections used to follow the axis that picks the devices, always. The
+ * operator's team board wanted the other one - the server team's
+ * applications, divided by where the servers are. `sectionAxis` names it:
+ * absent leaves the board's answer alone (the grid route's other fields
+ * already work that way), null or the board's own axis means "follow the
+ * groups", and the store writes both as NULL.
+ */
+export type SectionParse =
+    | { ok: true; set: false }
+    | { ok: true; set: true; axis: SourceAxis | null }
+    | { ok: false; detail: string };
+
+export function parseSectionAxis(body: Record<string, unknown>): SectionParse {
+    if (body.sectionAxis === undefined) return { ok: true, set: false };
+    if (body.sectionAxis === null) return { ok: true, set: true, axis: null };
+    if (body.sectionAxis === 'location' || body.sectionAxis === 'application') {
+        return { ok: true, set: true, axis: body.sectionAxis };
+    }
+    return { ok: false, detail: 'sectionAxis is location, application, or null to follow the board\'s own groups' };
+}
+
+/**
+ * The sections a display is told about. DECLARED ORDER only when the grid
+ * follows the board's own list - it is the order the team chose for those
+ * groups, and it says nothing about another axis's values, which sort
+ * alphabetically on the wall (sections null). Sectioned whenever there is
+ * an axis to divide by: the board's groups, or one it was given.
+ */
+export function gridSections(board: {
+    source_axis: string | null; source_values: unknown; section_axis: string | null;
+}): { sections: string[] | null; sectioned: boolean } {
+    const followsGroups = board.section_axis === null || board.section_axis === board.source_axis;
+    return {
+        sections: followsGroups && board.source_axis !== null && Array.isArray(board.source_values)
+            ? board.source_values as string[] : null,
+        sectioned: board.source_axis !== null || board.section_axis !== null,
+    };
+}
+
+/**
  * Do two declarations cover the same devices?
  *
  * ORDER-INSENSITIVE ON PURPOSE, and this is the whole reason the function

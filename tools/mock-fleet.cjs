@@ -18,6 +18,11 @@
 //                 exactly what a single 400-device process served on 16200-16299
 //   IFACES_PER    interfaces per device       (default 8)
 //   STORAGE_PER   filesystems per device      (default 3)
+//   STORAGE_SWAP  1 serves the disks at their indexes in REVERSE order - a
+//                 reboot that mounted them the other way round, as net-snmp
+//                 numbers mounts in mount order (2026-10-22: a production
+//                 GPU server traded /mnt/models and /boot/efi this way).
+//                 Restart a mock with it to drill the re-pin (default 0)
 //   CPUS_PER      processors per device       (default 2)
 //   DEAD_PCT      percent of the port range left UNBOUND (default 10)
 //   TICK_MS       counter movement interval   (default 5000)
@@ -108,6 +113,7 @@ const OFFSET   = int(process.env.INDEX_OFFSET, 0);
 const BASE     = int(process.env.BASE_PORT, 16100);
 const IFACES   = int(process.env.IFACES_PER, 8);
 const STORES   = int(process.env.STORAGE_PER, 3);
+const STORAGE_SWAP = process.env.STORAGE_SWAP === '1';
 const CPUS     = int(process.env.CPUS_PER, 2);
 const DEAD_PCT = int(process.env.DEAD_PCT, 10);
 const TICK_MS  = int(process.env.TICK_MS, 5000);
@@ -346,7 +352,7 @@ function buildDevice(i) {
     });
     mib.addTableRow('hrStorageTable', [1, '1.3.6.1.2.1.25.2.1.2', 'Physical memory', 4096, 4194304, 1594884]);
     for (let s = 1; s < STORES; s++) {
-        mib.addTableRow('hrStorageTable', [s + 2, '1.3.6.1.2.1.25.2.1.4',
+        mib.addTableRow('hrStorageTable', [STORAGE_SWAP ? STORES + 2 - s : s + 2, '1.3.6.1.2.1.25.2.1.4',
             `/mnt/vol${s}`, 4096, 122070312, 20000000 + s * 9000000]);
     }
 

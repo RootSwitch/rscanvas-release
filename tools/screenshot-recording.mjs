@@ -20,6 +20,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+/** How far ahead of the capture's start the pictures' clock stands. */
+const MARGIN_MS = 45_000;
+
 const DEMO_RANGES = [['10.20.0.0', 16], ['10.31.0.0', 16], ['172.16.0.0', 16], ['172.31.0.0', 16], ['127.0.0.0', 8]];
 // The 192.168/16 range is built from its parts ON PURPOSE: the public tree
 // rewrites every literal 192.168 address and refuses any that remain, so a
@@ -75,10 +78,13 @@ export async function openCapture(base, dir, { user, password }) {
     const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(path.join(dir, 'r'), { recursive: true });
-    // The pictures' clock: a minute and a half on from the start, so every
-    // answer captured during the run is already in the past when they are
-    // rendered - "1m ago", never "in 20s".
-    const capturedAt = new Date(Date.now() + 90_000).toISOString();
+    // The pictures' clock: a little on from the start, so every answer
+    // captured during the run is already in the past when they are rendered
+    // - "30s ago", never "in 20s". 45 s, not the 90 it was (2026-10-23):
+    // a device polled every 30 s read "last poll 2m ago" and its page said
+    // STALE (three intervals, 90 s) in the README's own pictures. A run
+    // takes about 16 s; finish() refuses one that outlasted the margin.
+    const capturedAt = new Date(Date.now() + MARGIN_MS).toISOString();
     const routes = {};
     return {
         mode: 'capture', capturedAt, missing: new Set(),
@@ -95,6 +101,10 @@ export async function openCapture(base, dir, { user, password }) {
             return JSON.parse(text);
         },
         finish() {
+            if (Date.now() > Date.parse(capturedAt)) {
+                throw new Error(`the capture outlasted its clock's ${MARGIN_MS / 1000} s margin - some answers are later `
+                    + 'than the time the pictures show and would read "in Ns"; run it again on a quieter box');
+            }
             const sorted = Object.fromEntries(Object.entries(routes).sort(([a], [b]) => (a < b ? -1 : 1)));
             fs.writeFileSync(path.join(dir, 'index.json'), JSON.stringify({
                 capturedAt, source: 'the demo network, polled by a real RSCanvas', routes: sorted,

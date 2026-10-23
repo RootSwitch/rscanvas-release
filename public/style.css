@@ -246,6 +246,11 @@ table.list td.mid, table.list th.mid { text-align: center; }
 .chart-area-b { fill: var(--se-series-out); opacity: 0.12; stroke: none; }
 .chart-area-c { fill: var(--se-down); opacity: 0.14; stroke: none; }
 .chart-area-d { fill: var(--se-warn); opacity: 0.14; stroke: none; }
+/* A reading alone between two gaps (charts.js): a path of one point draws nothing. */
+.chart-dot-a { fill: var(--se-accent); }
+.chart-dot-b { fill: var(--se-series-out); }
+.chart-dot-c { fill: var(--se-down); }
+.chart-dot-d { fill: var(--se-warn); }
 .chart-swatch-a { background: var(--se-accent); }
 .chart-swatch-b { background: var(--se-series-out); }
 .chart-swatch-c { background: var(--se-down); }
@@ -520,6 +525,12 @@ body.wide #main { max-width: none; padding-left: 28px; padding-right: 28px; }
    ellipsis and carries the full value in its title, so one verbose
    sysLocation cannot push nine other columns off the screen. */
 table.list td.clip { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ONE LINE A DEVICE (operator, 2026-10-22): a long name, or a reach pill
+   saying "down 7h ago", made production's rows two and three lines tall.
+   No cell wraps; the name is cut only past 32 characters (whole on hover),
+   and a row too wide for the window scrolls in its frame. */
+#devices td { white-space: nowrap; }
+#devices td.devname { max-width: 32ch; overflow: hidden; text-overflow: ellipsis; }
 #cols-list { display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 8px; align-items: center; margin-bottom: 8px; }
 #cols-list button { font-size: 11px; padding: 0 6px; }
 #cols-list .col-off { opacity: 0.55; }
@@ -624,6 +635,9 @@ table.list tr.total-row td { font-weight: 600; border-top: 1px solid var(--se-bo
 /* The report's rows are read across; a device name broken over two lines
  * breaks the row. The table scrolls sideways in its panel instead. */
 #report-table td { white-space: nowrap; }
+/* The services and availability reports too (2026-10-23): their date,
+   device and check cells wrapped a fortnight's table to two lines a row. */
+#svc-report-table td, #avail-table td { white-space: nowrap; }
 
 /* Service cards, made concise (2026-10-07, operator: "really dense"). Their
    own wider grid - a service says more than a sensor's one reading - every

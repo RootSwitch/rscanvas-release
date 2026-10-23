@@ -1,7 +1,7 @@
 # What RSCanvas watches, and what can alert
 
 Everything RSCanvas collects or tests, the values it keeps, the alerts each can
-raise and their shipped defaults, as of 0.1.0-alpha.10 (what that release
+raise and their shipped defaults, as of 0.1.0-alpha.11 (what alpha.10
 added is marked "alpha.10"). Thresholds are changed
 per sensor, per kind on one device, or per kind everywhere - from a sensor
 card's cog, a port's gear, or the Thresholds list on System - and an override
@@ -17,7 +17,7 @@ for 2 scans (a scan runs every 30 s) and clears after 2 normal scans.
 | **Device down** | SNMP devices: polls failing (down after 2 failed polls in a row). Ping-only devices: their reachability probe | crit, on | Never raises for a device marked **transient**; nothing at all raises for a **muted** device. While down, its interface and sensor alerts freeze rather than clear |
 | **Restarted** | sysUpTime against the last reading plus the time between, so a restart quicker than a poll is caught; the 497-day wrap is told apart | warn, **off** (turn on per device or for all) | Stays raised 30 minutes and clears without an email. Never for a restart inside a maintenance window (recorded as planned) or a transient device. It is the SNMP agent's uptime, so an agent restart counts too |
 | **Collector watchdog** | the newest poll older than 3 poll intervals, or no device ever polled | crit, on | "All quiet" and "not looking" never look the same |
-| **Changed** (alpha.10) | its OS, hardware model or boot firmware moving from one value to another | warn, **off** (turn on per device or for all) | Every change is on the device's timeline either way. Stays raised 30 minutes and clears without an email; never inside a maintenance window or for a transient device |
+| **Changed** (alpha.10) | its OS, hardware model or boot firmware moving from one value to another, as the agent reports it - its description, object ID or version moved; new words for the same report are not a change (after alpha.10) | warn, **off** (turn on per device or for all) | Every change is on the device's timeline either way. Stays raised 30 minutes and clears without an email; never inside a maintenance window or for a transient device |
 
 **What it is** (alpha.10): the OS in words from the agent's own
 description, read every poll, with a vendor's version where the description

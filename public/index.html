@@ -170,10 +170,11 @@
                             <th class="num" title="against the voice test before it">vs prev</th>
                             <th class="num" title="the lowest MOS in the last 24 hours">24 h low</th>
                             <th class="num" title="the worse direction of each, from the last voice test">loss / jitter</th>
+                            <th class="num" title="when the voice test last ran">voice ran</th>
                             <th class="num" title="the last throughput test, toward the site and from it">Mbps to / from</th>
                             <th class="num" title="against the throughput test before it, the direction that moved most">vs prev</th>
                             <th class="num" title="latency under the throughput test's load, unmarked">loaded ms</th>
-                            <th class="num">last run</th></tr></thead>
+                            <th class="num" title="when the bandwidth test last ran">bandwidth ran</th></tr></thead>
                         <tbody></tbody>
                     </table>
                 </div>
@@ -831,6 +832,9 @@
                 <button type="button" id="roster-clear">Clear selection</button>
             </div>
             <div id="roster-gate" class="hints hidden"></div>
+            <!-- One line a device (2026-10-22): the cells do not wrap, and a
+                 row too wide for the window scrolls here instead. -->
+            <div class="table-scroll">
             <table class="list" id="devices">
                 <!-- The first two headers are the row's identity and never
                      move; everything after them is rendered from the column
@@ -841,6 +845,7 @@
                 </tr></thead>
                 <tbody></tbody>
             </table>
+            </div>
         </div>
 
         <div class="panel hidden" data-section="devices" id="device-panel">
@@ -1674,6 +1679,14 @@
                     <span class="muted small">auto fits the display's own screen (the field set fixes the
                         tile height, so the arithmetic is exact); a number forces it<span class="manual-layout hidden">;
                         both blank = drawn board from coordinates</span></span>
+                </div>
+                <!-- Slice 67: sections by the board's own groups, or by the
+                     other axis - a team's applications, divided by where. -->
+                <div class="row">
+                    <label for="grid-section">divide by</label>
+                    <select id="grid-section"></select>
+                    <span class="muted small">the board's own groups keep the order they were declared in;
+                        the other axis sorts its sections by name</span>
                 </div>
                 <div id="grid-checks" class="row wrap"></div>
                 <div class="row">

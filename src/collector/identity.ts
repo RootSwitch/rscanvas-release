@@ -148,7 +148,15 @@ export function summarizeOS(
         if (v === undefined) return null;
         if (/NX-OS/.test(d)) return `NX-OS ${v}`;
         if (/Adaptive Security Appliance/.test(d)) return `ASA ${v}`;
-        if (/IOS[- ]?XE|Virtual XE|IOSXE/.test(d)) return `IOS-XE ${v}`;
+        // IOS-XE does not always say so (2026-10-21, found on the demo's
+        // ISR4331): an ISR4000 or ASR1000 says "Cisco IOS Software [...], ISR
+        // Software (X86_64_LINUX_IOSD-UNIVERSALK9-M), Version 17.9.4a", and a
+        // Catalyst 3850 on 16.x names only its image. The IOSD image is
+        // IOS-XE's, and so is every version from 16 on - classic IOS ended
+        // at 15.
+        if (/IOS[- ]?XE|Virtual XE|IOSXE|_IOSD\b|LINUX_IOSD/.test(d) || Number(/^(\d+)\./.exec(v)?.[1] ?? 0) >= 16) {
+            return `IOS-XE ${v}`;
+        }
         return `IOS ${v}`;
     }
     return null;

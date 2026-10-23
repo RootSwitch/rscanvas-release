@@ -1,0 +1,1 @@
+{"status":200,"body":{"ok":true,"axis":"location","groups":[{"value":"Branch 1","devices":"5","down":"0"},{"value":"Branch 2","devices":"7","down":"0"},{"value":"Cloud","devices":"6","down":"0"},{"value":"HQ","devices":"20","down":"1"}]}}

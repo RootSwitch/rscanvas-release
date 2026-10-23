@@ -60,6 +60,7 @@ import pg from 'pg';
 import { OPS, closeAll } from '../src/store/index.ts';
 import { changeScan, DEFAULT_RULES } from '../src/alerts/scan.ts';
 import { assertDestructiveTarget } from '../src/safety.ts';
+import { generatedShapes } from '../src/boards/reconcile.ts';
 
 process.exitCode = 1;
 let pass = 0, fail = 0;
@@ -609,8 +610,12 @@ console.log('\n17. one device\'s timeline: every kind, its own rows only, newest
     await q(`INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, last_seen_ts)
              VALUES ('tl-pending', 'pending', 'warn', 'cpu', $1, 'never raised', now(), now())`, [DEV]);
     await alert('tl-other', 'scratch-other', ', raised_ts', `, ${ago(30)}`);
+    // Its first ping (from unknown), an outage, and - 2026-10-22 - a restart
+    // of RSCanvas itself, which writes up -> unknown -> up for every device.
     await q(`INSERT INTO reachability_events (device_id, ts, from_state, to_state, rtt_ms) VALUES
+             ($1::bigint, ${ago(70)}, 'unknown', 'up', 0.5),
              ($1::bigint, ${ago(50)}, 'up', 'down', NULL), ($1::bigint, ${ago(49)}, 'down', 'up', 0.4),
+             ($1::bigint, ${ago(40)}, 'up', 'unknown', NULL), ($1::bigint, ${ago(39)}, 'unknown', 'up', 0.4),
              (990007, ${ago(45)}, 'up', 'down', NULL)`, [ID]);
     await q(`INSERT INTO reboot_events (device_id, ts, boot_ts, up_before_s, planned)
              VALUES ($1::bigint, ${ago(179)}, ${ago(180)}, 86400, false)`, [ID]);
@@ -635,8 +640,11 @@ console.log('\n17. one device\'s timeline: every kind, its own rows only, newest
     const rows = tl.ok ? tl.rows : [];
     eq('every kind, newest first, nothing of another device, no pending alert, no ack audit line',
         rows.map((r) => r.kind === 'audit' ? `audit ${String(r.data?.action)}` : r.kind),
-        ['audit threshold.set', 'audit device.mute', 'audit threshold.set', 'reach', 'reach', 'alert-clear',
+        ['audit threshold.set', 'audit device.mute', 'audit threshold.set', 'reach', 'reach', 'alert-clear', 'reach',
             'alert-escalate', 'alert-ack', 'alert-raise', 'restart', 'maintenance', 'maintenance', 'maintenance', 'alert-clear']);
+    eq('ping: the outage and the device\'s first ping, marked first; RSCanvas\'s own restart (to and from unknown) is not the device\'s',
+        rows.filter((x) => x.kind === 'reach').map((x) => [x.data?.from, x.data?.to, x.data?.first]),
+        [['down', 'up', false], ['up', 'down', false], ['unknown', 'up', true]]);
     const a = rows.find((r) => r.kind === 'alert-ack');
     eq('an acknowledgement carries who and the note; a clear its reason',
         [a?.data?.by, a?.data?.note, rows.find((r) => r.kind === 'alert-clear')?.data?.reason], ['alice', 'ticket 9', 'normal']);
@@ -910,8 +918,9 @@ console.log('\n21. the identity is stored by the poll write, and a change from o
     const ident = (o: Partial<{ sysObjectId: string; osVersion: string; hwModel: string; fwVersion: string; fwUpgrade: string }>) => ({
         sysObjectId: null, osVersion: null, hwModel: null, fwVersion: null, fwUpgrade: null, ...o,
     });
-    const poll = (ok: boolean, identity: ReturnType<typeof ident> | null, os: string | null) => OPS.recordDevicePoll(
-        ID, ok, null, 'RouterOS CRS354-48G-4S+2Q+', null, false, null, null, null, 1000, null, null, null, null, null, null,
+    const poll = (ok: boolean, identity: ReturnType<typeof ident> | null, os: string | null,
+        descr = 'RouterOS CRS354-48G-4S+2Q+') => OPS.recordDevicePoll(
+        ID, ok, null, descr, null, false, null, null, null, 1000, null, null, null, null, null, null,
         identity, os);
     const changes = async () => q<{ field: string; old_value: string; new_value: string; planned: boolean }>(
         `SELECT field, old_value, new_value, planned FROM device_changes WHERE device_id = $1::bigint ORDER BY id`, [ID]);
@@ -939,6 +948,18 @@ console.log('\n21. the identity is stored by the poll write, and a change from o
         [['os', 'RouterOS 7.20.6', 'RouterOS 7.24.5 (stable)', false], ['firmware', '7.7', '7.24.5', false]]);
     eq('and the device row carries it for the scan', [(await row()).changed, (await row()).change_planned], [true, false]);
 
+    // BETTER WORDS ARE NOT A CHANGE (2026-10-21): the same report, worded
+    // differently by a later release - as the ISR rule's fix rewords IOS to
+    // IOS-XE on every such router - is stored, and nothing is recorded.
+    await poll(true, null, 'RouterOS 7.24.5 (stable channel)');
+    eq('the same report in new words: stored, not recorded',
+        [(await row()).os_summary, (await changes()).length], ['RouterOS 7.24.5 (stable channel)', 2]);
+    await poll(true, null, 'RouterOS 7.24.5 (stable)');
+    eq('...and back, the same', [(await row()).os_summary, (await changes()).length], ['RouterOS 7.24.5 (stable)', 2]);
+    await poll(true, ident({ hwModel: 'CRS354-48G-4S+2Q+ (refurb)' }), 'RouterOS 7.24.5 (stable)');
+    eq('a model read differently with the description and object ID unmoved: stored, not recorded (the price)',
+        [(await row()).hw_model, (await changes()).length], ['CRS354-48G-4S+2Q+ (refurb)', 2]);
+
     const failed = await poll(false, ident({ hwModel: 'SOMETHING-ELSE' }), 'Something else');
     eq('a FAILED poll records no change and keeps the OS words', [failed.ok, (await changes()).length, (await row()).os_summary],
         [true, 2, 'RouterOS 7.24.5 (stable)']);
@@ -954,15 +975,15 @@ console.log('\n21. the identity is stored by the poll write, and a change from o
     const startedAgo = (await q<{ t: string }>(
         `SELECT to_char((now() AT TIME ZONE 'UTC') - interval '5 minutes', 'HH24:MI') AS t`))[0]!.t;
     const sched = await OPS.createMaintenanceSchedule('device', DEV, [1, 2, 3, 4, 5, 6, 7], startedAgo, 30, 'UTC', 'scratch', 'test');
-    await poll(true, ident({ hwModel: 'CRS354-48G-4S+2Q+ (rev 2)' }), 'RouterOS 7.24.5 (stable)');
-    eq('a part swapped inside a maintenance window is recorded as planned',
+    await poll(true, ident({ hwModel: 'CRS354-48G-4S+2Q+ (rev 2)' }), 'RouterOS 7.24.5 (stable)', 'RouterOS CRS354-48G-4S+2Q+ (rev 2)');
+    eq('a part swapped inside a maintenance window - its description moved - is recorded as planned',
         (await changes()).slice(-1).map((c) => [c.field, c.new_value, c.planned]), [['hardware', 'CRS354-48G-4S+2Q+ (rev 2)', true]]);
     eq('and the device row says so', (await row()).change_planned, true);
     if (sched.ok && sched.rows[0]) await OPS.cancelMaintenanceSchedule(sched.rows[0].id);
 
     // A runaway agent - a description that changes every poll - is held to
     // twenty rows a field a day.
-    for (let i = 0; i < 25; i++) await poll(true, null, `Flapping OS ${i}`);
+    for (let i = 0; i < 25; i++) await poll(true, null, `Flapping OS ${i}`, `Flapping agent ${i}`);
     eq('twenty rows a field a day, then nothing more for that field',
         (await changes()).filter((c) => c.field === 'os').length, 20);
 
@@ -1012,6 +1033,88 @@ console.log('\n22. a stale interface can be removed, with its history and its ow
     await q(`DELETE FROM threshold_overrides WHERE note = 'scratch'`);
     await q(`DELETE FROM rollup_purge WHERE entity_id = 990301`);
     await OPS.deleteDevices([DEV]);
+}
+
+// --- 23. disks that trade indexes move together (2026-10-22) --------------------------
+console.log('\n23. a re-pin plan lands whole - a swap past the unique index - or not at all:');
+{
+    const DEV = 'scratch-swap';
+    await q(`INSERT INTO devices (id, name, host) VALUES (990008, $1, '192.0.2.8')`, [DEV]);
+    const fx = (i: number): string => JSON.stringify({ style: 'hr-storage', allocUnits: 4096,
+        usedOid: `1.3.6.1.2.1.25.2.3.1.6.${i}`, sizeOid: `1.3.6.1.2.1.25.2.3.1.5.${i}` });
+    await q(`INSERT INTO entities (id, device_id, kind, snmp_index, name, code, tracked, extra) VALUES
+             (990401, 990008, 'fs', '52', '/mnt/models', 'SWP1', true, $1::jsonb),
+             (990402, 990008, 'fs', '53', '/boot/efi', 'SWP2', true, $2::jsonb),
+             (990403, 990008, 'fs', '37', '/', 'SWP3', true, $3::jsonb)`, [fx(52), fx(53), fx(37)]);
+    const pins = async () => (await q<{ name: string; snmp_index: string | null; used: string }>(
+        `SELECT name, snmp_index, extra->>'usedOid' AS used FROM entities WHERE device_id = 990008 ORDER BY id`))
+        .map((r) => [r.name, r.snmp_index, r.used.split('.').pop()]);
+    const swap = await OPS.repinSensors('990008', [
+        { id: '990401', snmpIndex: '53', extra: fx(53) }, { id: '990402', snmpIndex: '52', extra: fx(52) }]);
+    eq('the swap lands: both rows pinned, past the unique index a row-at-a-time write trips',
+        [swap.ok && swap.rows.map((r) => r.id).sort(), await pins()],
+        [['990401', '990402'], [['/mnt/models', '53', '53'], ['/boot/efi', '52', '52'], ['/', '37', '37']]]);
+    // A lost race: one row's target is held by a row the plan did not move.
+    const raced = await OPS.repinSensors('990008', [
+        { id: '990401', snmpIndex: '52', extra: fx(52) }, { id: '990402', snmpIndex: '37', extra: fx(37) }]);
+    eq('a plan that cannot land whole lands not at all - nothing parked, nothing half-moved',
+        [raced.ok && raced.rows.length, await pins()],
+        [0, [['/mnt/models', '53', '53'], ['/boot/efi', '52', '52'], ['/', '37', '37']]]);
+    const other = await OPS.repinSensors('990008', [{ id: '990403', snmpIndex: '99', extra: fx(99) }].map((m) => ({ ...m, id: '1' })));
+    eq('a row of another device is never touched', other.ok && other.rows.length, 0);
+    await OPS.deleteDevices([DEV]);
+}
+
+// --- 24. a raw bucket's worst (2026-10-22) -------------------------------------------
+console.log('\n24. a raw history bucket carries its average and its worst:');
+{
+    const DEV = 'scratch-worst';
+    await q(`INSERT INTO devices (id, name, host) VALUES (990009, $1, '192.0.2.9')`, [DEV]);
+    await q(`INSERT INTO entities (id, device_id, kind, snmp_index, name, code, tracked) VALUES
+             (990501, 990009, 'if', '1', 'ether1', 'WST1', true)`);
+    await q(`INSERT INTO samples (entity_id, ts, status, v0, v1) VALUES
+             (990501, date_trunc('hour', now()) - interval '50 minutes', 1, 10e6, 1e6),
+             (990501, date_trunc('hour', now()) - interval '49 minutes', 1, 30e6, 3e6)`);
+    const from = new Date(Date.now() - 3 * 3600_000);
+    const h = await OPS.entityHistoryRaw('WST1', 3600, from, new Date());
+    eq('two readings in one bucket: the mean and, beside it, the worst of each direction',
+        h.ok && h.rows.map((r) => [r.v0, r.m0, r.v1, r.m1]), [[20e6, 30e6, 2e6, 3e6]]);
+    await OPS.deleteDevices([DEV]);
+}
+
+// --- 25. a board divided by the other axis (sql/slice67.sql) ---------------------------
+console.log('\n25. a team board\'s grid divided by its groups, or by where its devices are:');
+{
+    const DEVS = ['scratch-srv', 'scratch-web', 'scratch-web-nowhere', 'scratch-stray'];
+    await q(`INSERT INTO devices (id, name, host, location, application) VALUES
+             (990010, 'scratch-srv', '192.0.2.10', 'HQ', 'Servers'),
+             (990011, 'scratch-web', '192.0.2.11', 'Cloud', 'Web'),
+             (990012, 'scratch-web-nowhere', '192.0.2.12', NULL, 'Web'),
+             (990013, 'scratch-stray', '192.0.2.13', 'HQ', 'Network')`);
+    const made = await OPS.createBoard('scratch-team', 'wall', null, 'application', ['Servers', 'Web']);
+    const id = made.ok ? String(made.rows[0]?.id) : '0';
+    await OPS.rawSetBoardDoc(id, JSON.stringify({ shapes: generatedShapes(DEVS) }));
+    const sections = async () => {
+        const p = await OPS.boardProjection(id);
+        const shapes = (p.ok ? p.rows[0]?.shapes : []) as Array<{ label: string; section?: string }>;
+        return Object.fromEntries(shapes.map((s) => [s.label, s.section ?? null]));
+    };
+    const grid = await OPS.setBoardGrid(id, 0, JSON.stringify(['cpu']));
+    eq('a grid set without a section axis follows the board\'s groups; a stray from another group trails',
+        [grid.ok && grid.rows[0]?.section_axis, await sections()],
+        [null, { 'scratch-srv': 'Servers', 'scratch-web': 'Web', 'scratch-web-nowhere': 'Web', 'scratch-stray': null }]);
+    const byWhere = await OPS.setBoardGrid(id, 0, null, { axis: 'location' });
+    eq('divided by location: each tile its own location, the stray too; no location trails',
+        [byWhere.ok && byWhere.rows[0]?.section_axis, await sections()],
+        ['location', { 'scratch-srv': 'HQ', 'scratch-web': 'Cloud', 'scratch-web-nowhere': null, 'scratch-stray': 'HQ' }]);
+    const untouched = await OPS.setBoardGrid(id, 0, JSON.stringify(['cpu', 'mem']));
+    eq('a later grid save that does not say leaves the division alone',
+        untouched.ok && untouched.rows[0]?.section_axis, 'location');
+    const own = await OPS.setBoardGrid(id, 0, null, { axis: 'application' });
+    eq('naming the board\'s own axis is stored as following its groups',
+        [own.ok && own.rows[0]?.section_axis, (await sections())['scratch-srv']], [null, 'Servers']);
+    await OPS.deleteBoard(id);
+    await OPS.deleteDevices(DEVS);
 }
 
 await db.end();

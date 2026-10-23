@@ -120,6 +120,14 @@ console.log('\nthe sites table - one row per site, voice and bandwidth side by s
     eq('  and which one it was', a.tput.deltaDir, 'from');
     eq('Branch C has bandwidth and no voice', [rows.find((r) => r.device === 'Branch C')!.voice, rows.find((r) => r.device === 'Branch C')!.tput?.code], [null, 't-c']);
     eq('worst MOS first when nothing is alerting', rows.map((r) => r.device), ['Branch A', 'Branch B', 'Branch C']);
+    // Each test's own last run (2026-10-21): one for the row read as the
+    // hourly bandwidth test's while it was the five-minute voice test's.
+    const ran = siteRows([
+        voice({ code: 'v-r', device: 'Branch R', lv_ts: '2026-10-21T20:55:00Z' }),
+        tput({ code: 't-r', device: 'Branch R', lv_ts: '2026-10-21T20:05:00Z' }),
+    ], none)[0]!;
+    eq('each test keeps its own last run, and the row has none of its own',
+        [ran.voice.lastTs, ran.tput.lastTs, 'lastTs' in ran], ['2026-10-21T20:55:00Z', '2026-10-21T20:05:00Z', false]);
 
     const loud = alertsByCode([{ code: 't-c', kind: 'path-tput', severity: 'warn', state: 'active' }]);
     eq('...but an alerting site comes before a low MOS', siteRows(checks, loud).map((r) => r.device)[0], 'Branch C');

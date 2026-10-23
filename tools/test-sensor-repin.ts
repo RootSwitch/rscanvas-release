@@ -112,5 +112,45 @@ console.log('\nclaims are exclusive:');
         plan, []);
 }
 
+console.log('\ndisks that trade indexes (2026-10-22):');
+{
+    // A production GPU server, literally: a kernel update's reboot mounted /boot/efi before
+    // /mnt/models, and net-snmp numbers mounts in mount order. Rule 1 kept
+    // each row on its old index - now the other disk's - so the models disk
+    // filling up was raised as "/boot/efi".
+    const rows = [row('r37', 'fs', '37', '/', fsX(37)), row('r51', 'fs', '51', '/boot', fsX(51)),
+        row('models', 'fs', '52', '/mnt/models', fsX(52)), row('efi', 'fs', '53', '/boot/efi', fsX(53))];
+    const plan = planSensorRepin([find('fs', '37', '/', fsX(37)), find('fs', '51', '/boot', fsX(51)),
+        find('fs', '52', '/boot/efi', fsX(52)), find('fs', '53', '/mnt/models', fsX(53))], rows);
+    eq('production\'s swap: both rows follow their names, together; the unmoved two plan nothing',
+        plan.map((u) => [u.id, u.snmpIndex, u.extra.usedOid]).sort(),
+        [['efi', '52', `${ST}.6.52`], ['models', '53', `${ST}.6.53`]]);
+}
+{
+    const plan = planSensorRepin(
+        [find('fs', '2', '/a', fsX(2)), find('fs', '3', '/b', fsX(3)), find('fs', '1', '/c', fsX(1))],
+        [row('a', 'fs', '1', '/a', fsX(1)), row('b', 'fs', '2', '/b', fsX(2)), row('c', 'fs', '3', '/c', fsX(3))]);
+    eq('three rotating: all three move', plan.map((u) => [u.id, u.snmpIndex]).sort(), [['a', '2'], ['b', '3'], ['c', '1']]);
+}
+{
+    // /a wants 2, /b wants 3 - but 3 is held by /gone, whose disk is not
+    // there to follow. /gone stays put, so /b cannot move, so /a cannot.
+    const plan = planSensorRepin(
+        [find('fs', '2', '/a', fsX(2)), find('fs', '3', '/b', fsX(3))],
+        [row('a', 'fs', '1', '/a', fsX(1)), row('b', 'fs', '2', '/b', fsX(2)), row('gone', 'fs', '3', '/gone', fsX(3))]);
+    eq('a move blocked by a row staying put blocks the move that needed its index - settled, not half-written',
+        plan, []);
+}
+{
+    const plan = planSensorRepin(
+        [find('mem', '6', 'Memory: Physical memory', fsX(6))],
+        [row('m', 'mem', '6', 'Memory: Swap space', fsX(6))]);
+    eq('an hrStorage index that now holds another name is not the same row by index', plan, []);
+    const sym = planSensorRepin(
+        [find('cpu', 'cpu', 'CPU (8 cores)', cpuX(1, 2))],
+        [row('c', 'cpu', 'cpu', 'CPU (4 cores)', cpuX(1))]);
+    eq('...while a symbolic index still is, whatever its name says', sym.map((u) => u.id), ['c']);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

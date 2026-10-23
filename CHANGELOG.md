@@ -1,5 +1,105 @@
 # Changelog
 
+## Unreleased
+
+## 0.1.0-alpha.11 - 2026-10-23
+
+A short release, most of it from the operator's own network and the demo
+built in the week before it. A disk that trades its index with another at
+a reboot keeps its own readings; an hourly test's chart draws at every
+range; and better words for a device are no longer recorded as a change
+to it, which let IOS-XE be named as IOS-XE. The Devices list keeps a
+device to one line, a chart shows its worst wherever its points blend
+readings, and a board can be divided by the axis it is not picked by - a
+server team's applications, by where the servers are. There is a live
+demo now, linked from the README. Built from the public tree on a fresh
+Linux clone, and an alpha.10 install upgraded to it in one step.
+
+### Added
+
+- **A board can be divided by the other axis.** A board's sections always
+  followed the groups that pick its devices, so a team board of
+  applications could only be divided by application. The grid settings
+  now have "divide by": the board's own groups (in their declared order,
+  as before), or location or application, sections sorted by name. A
+  server team's board - its applications - can show its servers by where
+  they are. A hand-drawn board can be divided too. Every existing board
+  keeps its sections.
+
+### Fixed
+
+- **Better words for a device are no longer a change to it.** The OS and
+  hardware are RSCanvas's words for what a device's agent reports, and
+  alpha.10 recorded a change whenever the words moved - so any release
+  that improved a rule would have shown every affected device as changed,
+  and raised an alert where change alerts are on. A change is now recorded
+  only when the agent's own report moved: its description or object ID,
+  and for the OS the version its tree reports. New words for the same
+  report are stored without a record.
+- **IOS-XE is named as IOS-XE.** An ISR4000 or ASR1000 reports its IOSD
+  image and a Catalyst 3850 on 16.x only its image name, so they read as
+  "IOS 17.9.4a". The IOSD image, and any version from 16 on, is now
+  IOS-XE; classic IOS ended at 15. Found on the demo's ISR4331. Upgrading
+  rewords them without recording a change.
+- **A test that runs hourly draws its line at every range.** A chart breaks
+  its line where readings are more than 2.5 buckets apart, so that an
+  outage shows as a gap; a short range's buckets are a minute to a quarter
+  of an hour, so an hourly bandwidth test (or a five-minute voice test at
+  6 hours) was all gap and drew nothing below 7 days. The chart now judges
+  a gap by the slower of its bucket and how often the entity is meant to
+  have a reading - a check's interval, a device's poll interval - so a
+  missed run still breaks the line. A reading alone between two gaps is
+  drawn as a dot rather than not at all.
+- **Disks that trade places at a reboot keep their own readings.** A Linux
+  agent numbers filesystems in mount order, so a reboot can hand one disk's
+  index to another - a production GPU server's models disk and its EFI
+  partition traded indexes at a kernel update, and from then each row read
+  the other's numbers: the models disk filling up was warned about as
+  "/boot/efi". The daily re-pin matched by index first, and could not move
+  two rows onto each other's index at all. Now a filesystem follows its
+  name, rows that trade or rotate indexes move together in one transaction,
+  and the re-pin also runs on the poll that sees a restart, before that
+  poll's readings, so not one reading is crossed.
+- **Each site test says when it last ran.** The Dashboard's Sites row had one
+  "last run" at its end, under the bandwidth columns, which was the newer of
+  the two tests - nearly always the five-minute voice test's. Voice and
+  bandwidth now each have their own, beside their own numbers.
+- **A bundle leaves out what git ignores.** `tools/make-bundle.sh` packed
+  whole directories, so a file git ignores - a local, uncommitted settings
+  file in `tools/`, say - went into the tarball with everything else. It
+  now leaves out exactly what git ignores, says how many, and reads the
+  archive back to refuse one that still has any.
+
+### Changed
+
+- **One line a device.** The Devices list keeps every row on one line: a
+  long name or a reach pill no longer wraps a row to two or three lines. A
+  name is cut only past 32 characters (whole on hover), the reach pill
+  says "down 7h" (the time is on hover), and a list wider than the window
+  scrolls sideways in its frame.
+- **A chart's worst line at every range that hides peaks.** The 30-day view
+  drew each hour's worst beside its average; 24 hours to 7 days averaged up
+  to 68 polls a point and showed none. Now any point that blends more than
+  two readings carries its worst - 24 hours and up for a device polled every
+  30 seconds - and 6 hours, a reading or two a point, stays as it was.
+- **RSCanvas's own restarts are not on a device's timeline.** Stopping and
+  starting RSCanvas once wrote a ping change to and from "unknown" for every
+  device, and they showed on every chart as "ping unknown to up". They are
+  left out; a device's first ping reads "first ping: up".
+- **The README's pictures show the demo network** - a small company of 38
+  devices polled by a real RSCanvas for two weeks - in place of the dressed
+  30,000-entity load-test fleet, and the README links the live demo.
+
+### Upgrading
+
+One schema change (`sql/slice67.sql`, additive: one column on boards),
+applied by the installer as usual; every board keeps its sections.
+
+A device that read "IOS" while running IOS-XE is reworded on its next poll,
+and nothing is recorded as a change. Filesystems that traded indexes at an
+earlier reboot are put back on their own rows at the next daily inventory;
+readings already stored crossed stay as they were.
+
 ## 0.1.0-alpha.10 - 2026-10-21
 
 A short release, most of it asked for by the operator's own network in the

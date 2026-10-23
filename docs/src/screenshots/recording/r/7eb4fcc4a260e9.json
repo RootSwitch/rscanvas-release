@@ -1,0 +1,1 @@
+{"status":200,"body":{"ok":true,"storeReady":true,"profiles":[{"id":"1","name":"fleet-v2c","version":"2c","hasCommunity":true,"v3User":null,"v3Level":null,"v3AuthProto":null,"hasV3AuthKey":false,"v3PrivProto":null,"hasV3PrivKey":false,"devices":24,"decryptable":true,"createdTs":"2026-10-08T22:05:34.096Z","updatedTs":"2026-10-08T22:05:34.096Z"}],"envRefs":["SNMP_COMMUNITY"]}}

@@ -1318,10 +1318,14 @@ const ROSTER_COLS = [
             // hover-only fact violates the state-gets-a-shape rule, and
             // reach_since_ts was already in the payload doing nothing
             // visible.
-            const age = d.reach_since_ts ? ` ${fmtAgo(d.reach_since_ts)}` : '';
+            // "down 7h", not "down 7h ago" (2026-10-22): the "ago" wrapped
+            // production's rows to three lines; the hover has the time.
+            const age = d.reach_since_ts ? ` ${fmtAgo(d.reach_since_ts).replace(/ ago$/, '')}` : '';
             const c = pill(`${d.reach_state}${age}`,
                 `badge ${d.reach_state === 'down' ? 'fail' : d.reach_state === 'degraded' ? 'warn' : ''}`);
-            if (d.reach_since_ts) c.title = `since ${fmtAgo(d.reach_since_ts)}`;
+            if (d.reach_since_ts) {
+                c.title = `${d.reach_state} since ${new Date(d.reach_since_ts).toLocaleString()} (${fmtAgo(d.reach_since_ts)})`;
+            }
             return c;
         }
         const c = cell('');
@@ -1675,11 +1679,12 @@ function renderDevices(data) {
         // state for it. The truth stays on screen; only the classification
         // changed, and a person changed it.
         const off = d.transient === true && d.status === 'down';
-        const tr = rowEl([
-            boxCell,
-            dotCell(d.name, unpolled ? '' : off ? 'off' : d.status === 'up' ? 'ok' : d.status === 'down' ? 'bad' : ''),
-            ...cols.map((c) => c.cell(d)),
-        ]);
+        const nameCell = dotCell(d.name, unpolled ? '' : off ? 'off' : d.status === 'up' ? 'ok' : d.status === 'down' ? 'bad' : '');
+        // One line a device (2026-10-22): a name past 32 characters ends in
+        // an ellipsis (style.css), whole on hover.
+        nameCell.className = 'devname';
+        nameCell.title = d.name;
+        const tr = rowEl([boxCell, nameCell, ...cols.map((c) => c.cell(d))]);
         tr.className = 'clickable';
         // The row still opens the drill-down, but a click on the checkbox must
         // not - selecting forty devices by accidentally opening forty panels
@@ -1997,7 +2002,7 @@ async function openChart(entity) {
             : 'no readings in this window');
     Charts.render($('chart-body'), {
         series, from: r.from, to: r.to, unit: spec.unit,
-        yMax: spec.yMax, bucketSec: r.bucketSec, ...marks,
+        yMax: spec.yMax, bucketSec: r.bucketSec, stepSec: r.stepSec, ...marks,
     });
     renderErrorChart(entity, r, marks);
 }
@@ -2039,7 +2044,7 @@ function renderErrorChart(entity, r, marks = {}) {
     }
     $('chart-errs-sub').textContent = 'own scale - the traffic chart above is Gb/s, this is counts per second';
     Charts.render($('chart-errs'), {
-        from: r.from, to: r.to, unit: 'pps', bucketSec: r.bucketSec, ...marks,
+        from: r.from, to: r.to, unit: 'pps', bucketSec: r.bucketSec, stepSec: r.stepSec, ...marks,
         series: [
             // c and d, not a and b: the severity palette, because this
             // chart only exists when something is wrong and the traffic
@@ -4422,7 +4427,10 @@ function timelineWords(e) {
         case 'alert-escalate': return ['escalated to crit', e.text || ''];
         case 'alert-clear': return ['cleared', `${e.text || ''}${d.reason ? ` (${d.reason})` : ''}`];
         case 'alert-ack': return ['acknowledged', `${e.text || ''} - by ${d.by || 'someone'}${d.note ? `: ${d.note}` : ''}`];
-        case 'reach': return [`ping ${d.from} to ${d.to}`, d.rtt != null ? `${Number(d.rtt).toFixed(1)} ms` : ''];
+        // A device's first ping comes from "unknown"; RSCanvas's own
+        // restarts, the other changes to or from it, the server leaves out.
+        case 'reach': return [d.first ? `first ping: ${d.to}` : `ping ${d.from} to ${d.to}`,
+            d.rtt != null ? `${Number(d.rtt).toFixed(1)} ms` : ''];
         case 'restart': return ['restarted', `the device or its SNMP agent, after at least ${fmtRuntime(d.upBefore)} up`
             + (d.planned ? ' - inside a maintenance window, so it raised nothing' : '')];
         // Slice 66: its OS, hardware or boot firmware, old and new.
@@ -4523,7 +4531,7 @@ function chartMarks(tl, code) {
         const d = e.data || {};
         if (e.kind === 'restart') {
             markers.push({ t, cls: 'restart', label: 'restarted (device or SNMP agent)' });
-        } else if (e.kind === 'reach' && (d.to === 'down' || d.to === 'up')) {
+        } else if (e.kind === 'reach' && !d.first && (d.to === 'down' || d.to === 'up')) {
             markers.push({ t, cls: d.to, label: `ping ${d.from} to ${d.to}` });
         } else if ((e.kind === 'alert-raise' || e.kind === 'alert-clear')
             && ((code && d.code === code) || DEVICE_LEVEL_ALERTS.has(d.alertKind))) {
@@ -6294,9 +6302,14 @@ function renderDashServices(checks) {
         if (t && t.loadedMs !== null) {
             loaded.title = `idle ${svcNum(t.idleMs)} ms, under load ${svcNum(t.loadedMs)} ms, under load marked EF ${svcNum(t.efMs)} ms`;
         }
+        // Each test's own last run, beside its own numbers (2026-10-21): one
+        // "last run" at the row's end read as the bandwidth test's, while it
+        // was the newer of the two - voice's, every five minutes, against
+        // an hourly bandwidth test.
+        const ran = (x) => cell(x?.lastTs ? fmtAgo(x.lastTs) : '', 'num muted small');
         const tr = rowEl([
             dotCell(s.device, SVC_DOT[s.state]), s.location ? cell(s.location) : cell('-', 'muted'),
-            mos, dMos, low, lj, mbps, dT, loaded, cell(s.lastTs ? fmtAgo(s.lastTs) : '-', 'num muted small'),
+            mos, dMos, low, lj, ran(v), mbps, dT, loaded, ran(t),
         ]);
         tr.className = 'clickable';
         tr.title = `open ${s.device}`;
@@ -7306,10 +7319,11 @@ function renderBoards(boards, gridFields, gridDefaults, manual) {
         const row = rowEl([
             cell(b.name),
             cell(b.collection, 'muted'),
-            cell(b.source_axis === null ? ''
+            cell((b.source_axis === null ? ''
                 : Array.isArray(b.source_values) && b.source_values.length > 1
                     ? `${b.source_axis}: ${b.source_values.slice(0, 2).join(', ')}${b.source_values.length > 2 ? ` +${b.source_values.length - 2}` : ''}`
-                    : `${b.source_axis}: ${b.source_value ?? 'all'}`, 'muted'),
+                    : `${b.source_axis}: ${b.source_value ?? 'all'}`)
+                + (b.section_axis ? `${b.source_axis === null ? '' : ', '}by ${b.section_axis}` : ''), 'muted'),
             cell(''),
             cell(''),
             cell(`${b.live_tokens} of ${b.tokens}`, 'num'),
@@ -7425,6 +7439,18 @@ function showGridEditor(b) {
     $('grid-cols').value = b.grid_cols === 0 ? '' : (b.grid_cols ?? '');
     $('grid-cols').disabled = b.grid_cols === 0;
     $('grid-msg').textContent = '';
+    // Slice 67: the board's own groups (stored as null), or the other axis.
+    const divide = $('grid-section');
+    divide.replaceChildren();
+    for (const axis of [null, 'location', 'application']) {
+        if (axis !== null && axis === b.source_axis) continue;
+        const opt = document.createElement('option');
+        opt.value = axis ?? '';
+        opt.textContent = axis !== null ? axis
+            : b.source_axis !== null ? `${b.source_axis} - the board's own groups` : 'nothing - one grid';
+        divide.appendChild(opt);
+    }
+    divide.value = b.section_axis ?? '';
     const checks = $('grid-checks');
     checks.replaceChildren();
     // FIRST TIME ONLY (slice 34): a board that has never had a grid opens
@@ -7476,10 +7502,11 @@ $('grid-save').addEventListener('click', async () => {
     // otherwise a board always lays itself out, and blank means auto.
     const cols = $('grid-auto').checked ? 0 : raw === '' ? (manualLayout ? null : 0) : Number(raw);
     const fields = [...$('grid-checks').querySelectorAll('input:checked')].map((x) => x.dataset.key);
+    const sectionAxis = $('grid-section').value || null;
     const r = await api(`/api/boards/${encodeURIComponent(gridBoard.id)}/grid`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cols, fields }),
+        body: JSON.stringify({ cols, fields, sectionAxis }),
     });
     if (r.status === 401) { showLogin(); return; }
     $('grid-msg').textContent = r.ok

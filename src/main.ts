@@ -52,7 +52,7 @@ import { fanStopState, FAN_STOPPED_KIND } from './alerts/fanstop.ts';
 import { estimateGrowth } from './store/growth.ts';
 import { expandCidr } from './devices/cidr.ts';
 import { guessStencil, STENCIL_NAMES } from './export/stencil.ts';
-import { parseSourceDeclaration, sameCoverage } from './boards/source.ts';
+import { gridSections, parseSectionAxis, parseSourceDeclaration, sameCoverage } from './boards/source.ts';
 import { generatedShapes, appendMissing, dropMoved } from './boards/reconcile.ts';
 import { workHealth } from './health/work.ts';
 import { serializeMetrics } from './health/metrics.ts';
@@ -1438,30 +1438,39 @@ const server = createWebServer(tlsPair, (req, res) => {
             const bucketSec = useRaw
                 ? Math.max(60, Math.round(hours * 3600 / 300 / 60) * 60)
                 : 3600;
-            const r = useRaw
-                ? await OPS.entityHistoryRaw(code, bucketSec, from, to)
-                : await OPS.entityHistoryHourly(code, from, to);
+            const [r, step] = await Promise.all([
+                useRaw ? OPS.entityHistoryRaw(code, bucketSec, from, to) : OPS.entityHistoryHourly(code, from, to),
+                OPS.entityStep(code),
+            ]);
             if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
             sendJson(res, 200, {
                 ok: true,
                 from: Math.floor(from.getTime() / 1000),
                 to: Math.floor(to.getTime() / 1000),
                 bucketSec,
+                // How often the entity is meant to have a reading, so the
+                // chart can tell a slow cadence from an outage (OPS.entityStep).
+                // Null when it could not be read: the chart then judges by the
+                // bucket alone, as before.
+                stepSec: step.ok ? (step.rows[0]?.step_s ?? null) : null,
                 // NAMED, so the chart can say which it is drawing rather than
                 // leaving an operator to wonder why yesterday looks smoother
                 // than this morning.
                 source: useRaw ? 'raw samples' : 'hourly rollup',
                 // [ts, v0, v1, v2, v3, v4, v5, status, m0?, m1?] - the sample
                 // row's own column order, so a reader comparing this against
-                // the schema is not translating. m0/m1 (the hour's traffic
-                // MAXIMA) ride only on rollup rows - raw buckets are already
-                // near the resolution of the truth, and the client adds the
-                // worst-series only when the elements exist, so the payload
-                // shape says which view this is as plainly as `source` does.
+                // the schema is not translating. m0/m1 are each point's
+                // MAXIMA, and the client draws a worst line when they are
+                // there. Rollup rows carry them always; raw rows only where a
+                // bucket blends more than two readings (2026-10-22) - 24 h
+                // and longer for a 30 s poll. Before, only the 30-day view
+                // had them, while 24 h to 7 d averaged up to 68 polls a point
+                // and showed no peak at all; at 6 h a point is one or two
+                // readings, and a worst line would sit on the average.
                 points: r.rows.map((p) => [
                     Number(p.b), p.v0, p.v1, p.v2, p.v3, p.v4, p.v5, p.st,
-                    ...(useRaw ? [] : [(p as { m0?: number | null }).m0 ?? null,
-                        (p as { m1?: number | null }).m1 ?? null]),
+                    ...(!useRaw || bucketSec > 2 * ((step.ok ? step.rows[0]?.step_s : null) ?? 30)
+                        ? [p.m0 ?? null, p.m1 ?? null] : []),
                 ]),
             });
             return;
@@ -4989,13 +4998,19 @@ const server = createWebServer(tlsPair, (req, res) => {
                 }
                 fieldsJson = JSON.stringify(fields);
             }
-            const r = await OPS.setBoardGrid(boardGrid[1] as string, cols, fieldsJson);
+            // Slice 67: what the grid is divided by, when the body says.
+            const section = parseSectionAxis(body);
+            if (!section.ok) { sendJson(res, 400, { ok: false, detail: section.detail }); return; }
+            const r = await OPS.setBoardGrid(boardGrid[1] as string, cols, fieldsJson,
+                section.set ? { axis: section.axis } : undefined);
             if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
             if (r.rowCount === 0) { sendJson(res, 404, { ok: false, detail: 'no such board' }); return; }
+            const sectionAxis = r.rows[0]?.section_axis ?? null;
             await auth.audit(principal, 'board.setGrid', boardGrid[1] as string,
-                { cols, fields: fieldsJson === null ? undefined : JSON.parse(fieldsJson) },
+                { cols, fields: fieldsJson === null ? undefined : JSON.parse(fieldsJson),
+                    sectionAxis: section.set ? sectionAxis : undefined },
                 inetOrNull(clientIp(req)));
-            sendJson(res, 200, { ok: true, cols });
+            sendJson(res, 200, { ok: true, cols, sectionAxis });
             return;
         }
 
@@ -5178,10 +5193,9 @@ const server = createWebServer(tlsPair, (req, res) => {
                         // (flat grid) and on the all-fleet board (sections
                         // from the values present, alphabetically - the only
                         // case where alphabetical is honest, since nobody
-                        // declared an order).
-                        sections: board.source_axis !== null && Array.isArray(board.source_values)
-                            ? board.source_values : null,
-                        sectioned: board.source_axis !== null,
+                        // declared an order). Slice 67: a grid divided by
+                        // the other axis is the second such case.
+                        ...gridSections(board),
                     },
                 } : {}),
             });

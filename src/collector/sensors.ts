@@ -470,14 +470,21 @@ export function sensorSample(
 // Two match rules, in order:
 //   1. SAME (kind, index) - the symbolically-indexed kinds (cpu is always
 //      'cpu'): the row is the same sensor by construction, so a drifted
-//      instruction is simply refreshed in place.
+//      instruction is simply refreshed in place. NOT for an hrStorage row
+//      whose index now holds another name (2026-10-22): there the index is
+//      the volatile part, and a production GPU server's reboot traded
+//      /mnt/models and /boot/efi between indexes 52 and 53 - rule 1 kept
+//      each row on its old index, now the other disk's, and the warning for
+//      the models disk filling up was raised as "/boot/efi".
 //   2. SAME (kind, name), both sides unique - the hr-indexed kinds (fs, mem)
 //      whose INDEX is the volatile part: "C:\ Label:..." at a new index is
 //      the same disk renumbered, so the row follows it, index and all.
 //      Ambiguity refuses (two disks with one label is a guess), and a target
-//      index another row still holds refuses too (the SQL guard would refuse
-//      anyway; refusing here keeps the daily plan quiet instead of retrying
-//      a write that cannot land).
+//      index a row STAYING PUT still holds refuses too (the SQL guard would
+//      refuse anyway; refusing here keeps the plan quiet instead of retrying
+//      a write that cannot land). A target held by a row that is itself
+//      moving is fine: two disks trading indexes, or three rotating, move
+//      together (OPS.repinSensors parks them first, in one transaction).
 //
 // NEVER inserts, never deletes, never touches tracked: the discover-if-NONE
 // rule exists so a deleted junk sensor stays deleted, and a repin pass that
@@ -500,6 +507,9 @@ function canonical(x: unknown): string {
         `${JSON.stringify(k)}:${canonical((x as Record<string, unknown>)[k])}`).join(',')}}`;
 }
 
+/** The index of an hrStorage row is the agent's mount order, not its identity. */
+const indexIsVolatile = (x: { extra: SensorExtra | null }): boolean => x.extra?.style === 'hr-storage';
+
 export function planSensorRepin(
     discovered: RepinDiscovered[], existing: RepinExisting[],
 ): Array<{ id: string; snmpIndex: string; name: string; extra: SensorExtra }> {
@@ -514,6 +524,8 @@ export function planSensorRepin(
     for (const d of discovered) {
         const row = byKindIdx.get(`${d.kind}\u0000${d.snmpIndex}`);
         if (row === undefined || claimedRows.has(row.id)) continue;
+        // Another name at this hrStorage index is another disk: rule 2 decides.
+        if ((indexIsVolatile(row) || indexIsVolatile(d)) && row.name !== d.name) continue;
         claimedRows.add(row.id);
         claimedFinds.add(d);
         if (canonical(row.extra) !== canonical(d.extra)) {
@@ -535,16 +547,27 @@ export function planSensorRepin(
     const restFinds = discovered.filter((d) => !claimedFinds.has(d));
     const rowCounts = countByKindName(restRows);
     const findCounts = countByKindName(restFinds);
-    const takenIdx = new Set(existing
-        .filter((e) => !claimedRows.has(e.id) && e.snmp_index !== null)
-        .map((e) => `${e.kind}\u0000${e.snmp_index}`));
+    const moves = new Map<string, { row: RepinExisting; d: RepinDiscovered }>();
     for (const d of restFinds) {
         const key = `${d.kind}\u0000${d.name}`;
         if (rowCounts.get(key) !== 1 || findCounts.get(key) !== 1) continue;
         const row = restRows.find((e) => e.kind === d.kind && e.name === d.name);
         if (row === undefined) continue;
-        // The renumbered index must be FREE among the rows staying put.
-        if (takenIdx.has(`${d.kind}\u0000${d.snmpIndex}`)) continue;
+        moves.set(row.id, { row, d });
+    }
+    // The renumbered index must be FREE among the rows STAYING PUT - every
+    // row except those moving with this plan. Refusing one move makes its
+    // row stay, which can refuse another, so settle before writing.
+    for (let changed = true; changed;) {
+        changed = false;
+        const held = new Set(existing
+            .filter((e) => !moves.has(e.id) && e.snmp_index !== null)
+            .map((e) => `${e.kind}\u0000${e.snmp_index}`));
+        for (const [id, m] of moves) {
+            if (held.has(`${m.d.kind}\u0000${m.d.snmpIndex}`)) { moves.delete(id); changed = true; }
+        }
+    }
+    for (const { row, d } of moves.values()) {
         claimedRows.add(row.id);
         out.push({ id: row.id, snmpIndex: d.snmpIndex, name: d.name, extra: d.extra });
     }

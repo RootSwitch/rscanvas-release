@@ -1344,8 +1344,28 @@ export const OPS = {
         -- judged. PLANNED is decided now, against the device's windows and
         -- schedules at this moment - slice62.sql says why not at delivery.
         WITH cur AS (
-            SELECT id, name, location, application, os_summary, hw_model, fw_version
+            SELECT id, name, location, application, os_summary, hw_model, fw_version,
+                   sys_descr, sys_object_id, os_version
               FROM devices WHERE id = $1::bigint
+        ),
+        -- WHAT THE AGENT SAID, against what it said last time (2026-10-21).
+        -- The OS and hardware are RSCanvas's words for what the agent
+        -- reports, so better words in a later release would otherwise read
+        -- as every affected device changing at once: the ISR rule that
+        -- called IOS-XE "IOS" could not be fixed without it. A change is
+        -- recorded only when the agent's own report moved - its description
+        -- or object ID, and for the OS the version its tree reports;
+        -- otherwise the new words are stored and nothing is recorded. The
+        -- price: a part swapped for one the agent describes identically, with
+        -- the same object ID, is not recorded (KNOWN-ISSUES). The boot
+        -- firmware is the agent's own string, so it is compared as it is.
+        moved AS (
+            SELECT ($4::text IS NOT NULL AND $4::text IS DISTINCT FROM cur.sys_descr)
+                   OR ($17::jsonb->>'sysObjectId' IS NOT NULL
+                       AND $17::jsonb->>'sysObjectId' IS DISTINCT FROM cur.sys_object_id) AS agent,
+                   ($17::jsonb->>'osVersion' IS NOT NULL
+                       AND $17::jsonb->>'osVersion' IS DISTINCT FROM cur.os_version) AS version
+              FROM cur
         ),
         -- THE CHANGE RECORD (sql/slice66.sql), in the statement that stores
         -- the new value, compared against the row as it stood: one row per
@@ -1361,11 +1381,11 @@ export const OPS = {
                                OR (w.scope = 'device' AND w.target = cur.name)
                                OR (w.scope = 'location' AND w.target = cur.location)
                                OR (w.scope = 'application' AND w.target = cur.application))
-              FROM cur
-              CROSS JOIN LATERAL (VALUES ('os', cur.os_summary, $18::text),
-                                         ('hardware', cur.hw_model, $17::jsonb->>'hwModel'),
-                                         ('firmware', cur.fw_version, $17::jsonb->>'fwVersion')) AS c(field, old, new)
-             WHERE $2 AND c.old IS NOT NULL AND c.new IS NOT NULL AND c.old <> c.new
+              FROM cur, moved
+              CROSS JOIN LATERAL (VALUES ('os', cur.os_summary, $18::text, moved.agent OR moved.version),
+                                         ('hardware', cur.hw_model, $17::jsonb->>'hwModel', moved.agent),
+                                         ('firmware', cur.fw_version, $17::jsonb->>'fwVersion', true)) AS c(field, old, new, reported)
+             WHERE $2 AND c.reported AND c.old IS NOT NULL AND c.new IS NOT NULL AND c.old <> c.new
                AND (SELECT count(*) FROM device_changes x
                      WHERE x.device_id = cur.id AND x.field = c.field AND x.ts > now() - interval '1 day') < 20
             RETURNING planned
@@ -2055,20 +2075,48 @@ export const OPS = {
            AND extra IS NOT NULL`, [deviceId]),
 
     /**
-     * Refresh one sensor's polling INSTRUCTION - and, for the hr-indexed
-     * kinds, follow its renumbered index - leaving identity alone: code,
-     * name binding, history, tracked flag all stay. The planner
+     * Refresh sensors' polling INSTRUCTIONS - and, for the hr-indexed kinds,
+     * follow their renumbered indexes - leaving identity alone: code, name
+     * binding, history, tracked flag all stay. The planner
      * (planSensorRepin) decides what may move; the NOT EXISTS is the same
-     * last-line race guard rekeyEntity carries, making a lost race a named
-     * zero-row no-op rather than a unique-index error.
+     * last-line race guard rekeyEntity carries.
+     *
+     * A WHOLE re-pin plan for one device, together (2026-10-22): two disks
+     * that traded indexes at a reboot cannot move one at a time - each
+     * target is the other's, and the unique index (device_id, kind,
+     * snmp_index) is checked row by row. So the moving rows are parked
+     * first (a NULL index, which the partial index does not cover - the
+     * same move an interface re-deal makes) and then pinned, in one
+     * transaction: every row lands or none does, so a lost race leaves the
+     * rows as they were rather than parked. Returns the ids pinned.
      */
-    repinSensor: (id: string, snmpIndex: string, extra: string) => laneQuery<{ id: string }>('collector', `
-        UPDATE entities e SET snmp_index = $2, extra = $3::jsonb
-         WHERE e.id = $1::bigint
-           AND NOT EXISTS (SELECT 1 FROM entities o
-                            WHERE o.device_id = e.device_id AND o.kind = e.kind
-                              AND o.snmp_index = $2 AND o.id <> e.id)
-     RETURNING e.id::text AS id`, [id, snmpIndex, extra]),
+    repinSensors: (deviceId: string, moves: Array<{ id: string; snmpIndex: string; extra: string }>) =>
+        onLane<{ id: string }>('collector', async (client) => {
+            const ids = moves.map((m) => m.id);
+            await client.query('BEGIN');
+            try {
+                await client.query(`UPDATE entities SET snmp_index = NULL
+                                     WHERE device_id = $1::bigint AND id = ANY($2::bigint[])`, [deviceId, ids]);
+                const pinned = await client.query<{ id: string }>(`
+                    UPDATE entities e SET snmp_index = u.idx, extra = u.extra::jsonb
+                      FROM unnest($2::bigint[], $3::text[], $4::text[]) AS u(id, idx, extra)
+                     WHERE e.id = u.id AND e.device_id = $1::bigint
+                       AND NOT EXISTS (SELECT 1 FROM entities o
+                                        WHERE o.device_id = e.device_id AND o.kind = e.kind
+                                          AND o.snmp_index = u.idx AND o.id <> e.id)
+                 RETURNING e.id::text AS id`,
+                [deviceId, ids, moves.map((m) => m.snmpIndex), moves.map((m) => m.extra)]);
+                if (pinned.rows.length !== moves.length) {
+                    await client.query('ROLLBACK');
+                    return { rows: [], rowCount: 0 };
+                }
+                await client.query('COMMIT');
+                return { rows: pinned.rows, rowCount: pinned.rows.length };
+            } catch (err) {
+                await client.query('ROLLBACK').catch(() => undefined);
+                throw err;
+            }
+        }),
 
     /**
      * CONVICT an advertised speed: measured traffic exceeded it past the
@@ -3746,13 +3794,13 @@ export const OPS = {
         grid_cols: number | null; grid_fields: unknown;
         tokens: string; live_tokens: string;
         source_axis: string | null; source_value: string | null;
-        source_values: unknown;
+        source_values: unknown; section_axis: string | null;
         missing: string; extra: string; broken: string;
     }>('interactive', `
         SELECT b.id::text AS id, b.name, b.collection, u.username AS owner,
                b.show_addresses, b.created_ts, b.updated_ts,
                b.grid_cols, COALESCE(b.grid_fields, '[]'::jsonb) AS grid_fields,
-               b.source_values,
+               b.source_values, b.section_axis,
                count(t.id)::text AS tokens,
                count(t.id) FILTER (WHERE t.revoked_ts IS NULL)::text AS live_tokens,
                b.source_axis, b.source_value,
@@ -3816,12 +3864,20 @@ export const OPS = {
 
     /** Slice 26: the grid declaration - cols null turns the grid off and the
      *  stored field list is kept (turning it back on restores the choices). */
-    setBoardGrid: (id: string, cols: number | null, fieldsJson: string | null) => laneQuery(
+    // The section axis (slice 67) changes only when `section` is given; the
+    // board's own axis is stored as NULL, the one way to say "follow the
+    // groups".
+    setBoardGrid: (id: string, cols: number | null, fieldsJson: string | null,
+        section?: { axis: string | null }) => laneQuery<{ section_axis: string | null }>(
         'interactive', `
         UPDATE boards SET grid_cols = $2,
                grid_fields = COALESCE($3::jsonb, grid_fields),
+               section_axis = CASE WHEN NOT $5::boolean THEN section_axis
+                                   WHEN $4::text IS NOT DISTINCT FROM source_axis THEN NULL
+                                   ELSE $4::text END,
                updated_ts = now()
-         WHERE id = $1::bigint`, [id, cols, fieldsJson]),
+         WHERE id = $1::bigint
+        RETURNING section_axis`, [id, cols, fieldsJson, section?.axis ?? null, section !== undefined]),
 
     /**
      * Tokens for one board, WITHOUT the hash.
@@ -3932,12 +3988,12 @@ export const OPS = {
     boardProjection: (boardId: string, withDevice = false) => laneQuery<{
         name: string; collection: string; shapes: unknown;
         grid_cols: number | null; grid_fields: unknown;
-        source_axis: string | null; source_values: unknown;
+        source_axis: string | null; source_values: unknown; section_axis: string | null;
     }>('interactive', `
         SELECT b.name, b.collection,
                b.grid_cols,
                COALESCE(b.grid_fields, '[]'::jsonb) AS grid_fields,
-               b.source_axis, b.source_values,
+               b.source_axis, b.source_values, b.section_axis,
                COALESCE((
                    SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                        'id',    shape->>'id',
@@ -4060,11 +4116,16 @@ export const OPS = {
                        -- all-fleet board, one every value is implicitly
                        -- declared by. A hand-bound stray from an undeclared
                        -- group gets NULL and renders in the trailing section.
-                       'section', CASE WHEN b.grid_cols IS NOT NULL AND b.source_axis IS NOT NULL
-                                        AND d.id IS NOT NULL THEN
-                           CASE WHEN b.source_values IS NULL
-                                 OR (CASE WHEN b.source_axis = 'location' THEN d.location ELSE d.application END)
-                                    IN (SELECT jsonb_array_elements_text(b.source_values))
+                       -- Slice 67: a grid divided by the OTHER axis takes
+                       -- each tile's own value on it, whatever the board's
+                       -- groups; a device with none is the trailing section.
+                       'section', CASE WHEN b.grid_cols IS NOT NULL AND d.id IS NOT NULL THEN
+                           CASE WHEN b.section_axis IS NOT NULL AND b.section_axis IS DISTINCT FROM b.source_axis
+                                THEN (CASE WHEN b.section_axis = 'location' THEN d.location ELSE d.application END)
+                                WHEN b.source_axis IS NOT NULL
+                                 AND (b.source_values IS NULL
+                                      OR (CASE WHEN b.source_axis = 'location' THEN d.location ELSE d.application END)
+                                         IN (SELECT jsonb_array_elements_text(b.source_values)))
                                 THEN (CASE WHEN b.source_axis = 'location' THEN d.location ELSE d.application END)
                            END
                        END,
@@ -5443,7 +5504,12 @@ export const OPS = {
      *                (who, the note). Pending alerts never raised and are not
      *                moments. Matched by host, which the scan sets to the
      *                device's name for every kind it raises.
-     *   reach        ping transitions (slice 12).
+     *   reach        ping transitions (slice 12). Not a change to or from
+     *                "unknown" (2026-10-22): that is RSCanvas stopping and
+     *                starting, not the device - every deploy from 09-29 to
+     *                10-05 wrote one pair for all 36 production devices at
+     *                once, and they read "ping unknown to up" on every chart.
+     *                Kept is a device's FIRST ping, from unknown, as its start.
      *   restart      at the time it came back, with how long it had been up
      *                and whether a window covered it (slice 62).
      *   change       its OS, hardware or boot firmware moving from one value
@@ -5488,9 +5554,13 @@ export const OPS = {
                  WHERE a.host = d.name AND e.ts IS NOT NULL AND e.ts >= w.lo
                 UNION ALL
                 SELECT r.ts, 'reach', NULL, NULL, NULL, NULL,
-                       jsonb_build_object('from', r.from_state, 'to', r.to_state, 'rtt', r.rtt_ms)
+                       jsonb_build_object('from', r.from_state, 'to', r.to_state, 'rtt', r.rtt_ms,
+                                          'first', r.from_state = 'unknown')
                   FROM d, w, reachability_events r
-                 WHERE r.device_id = d.id AND r.ts >= w.lo
+                 WHERE r.device_id = d.id AND r.ts >= w.lo AND r.to_state <> 'unknown'
+                   AND (r.from_state <> 'unknown'
+                        OR NOT EXISTS (SELECT 1 FROM reachability_events p
+                                        WHERE p.device_id = r.device_id AND p.ts < r.ts))
                 UNION ALL
                 SELECT r.boot_ts, 'restart', NULL, NULL, NULL, NULL,
                        jsonb_build_object('upBefore', r.up_before_s, 'planned', r.planned, 'seen', r.ts)
@@ -5672,12 +5742,28 @@ export const OPS = {
      * reads 1 ok / 2 alarm, so the LARGER value is the worse one in both.
      * A bucket that contained an outage says so.
      */
+    /**
+     * How often an entity is MEANT to have a reading (2026-10-21): a check's
+     * own interval, else its device's poll interval. The chart judges gaps
+     * against it as well as its bucket - an hourly bandwidth test's readings
+     * sat further apart than 2.5 of a short range's buckets, so each was cut
+     * off from the next and the line never drew. From the definition, never
+     * from the data, so a poller failing into sparseness still shows gaps.
+     */
+    entityStep: (code: string) => laneQuery<{ step_s: number | null }>('interactive', `
+        SELECT CASE WHEN e.source = 'probe' THEN
+                    CASE WHEN e.extra->>'intervalS' ~ '^[0-9]{1,6}$' THEN (e.extra->>'intervalS')::int END
+                    ELSE d.poll_interval_s END AS step_s
+          FROM entities e JOIN devices d ON d.id = e.device_id
+         WHERE e.code = $1
+         LIMIT 1`, [code]),
+
     entityHistoryRaw: (
         code: string, bucketSec: number, from: Date, to: Date,
     ) => laneQuery<{
         b: string; v0: number | null; v1: number | null;
         v2: number | null; v3: number | null; v4: number | null; v5: number | null;
-        st: number | null;
+        st: number | null; m0: number | null; m1: number | null;
     }>('interactive', `
         -- All six value columns, because an interface's history is two
         -- questions: how much traffic, and how much of it went wrong. v2-v5
@@ -5693,7 +5779,11 @@ export const OPS = {
                avg(s.v0)::float8 AS v0, avg(s.v1)::float8 AS v1,
                max(s.v2)::float8 AS v2, max(s.v3)::float8 AS v3,
                max(s.v4)::float8 AS v4, max(s.v5)::float8 AS v5,
-               max(s.status)::int AS st
+               max(s.status)::int AS st,
+               -- Each bucket's worst v0/v1 too (2026-10-22), as the rollup
+               -- keeps each hour's: the route sends them where a bucket
+               -- blends more than two readings.
+               max(s.v0)::float8 AS m0, max(s.v1)::float8 AS m1
           FROM samples s
           JOIN entities e ON e.id = s.entity_id
          WHERE e.code = $1 AND s.ts >= $3 AND s.ts < $4

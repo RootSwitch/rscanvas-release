@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.10).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.11).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -41,31 +41,35 @@ saved.
 
 ## What it looks like
 
-![The Dashboard: open alerts, then every location and application with its devices up and down, then the top 10 interfaces by traffic each way, errors and discards, CPU and memory over the last 24 hours, each with its change against the day before](docs/images/dashboard.png)
+![The Dashboard: one open alert, a label printer down; every location and application with its devices up and down; then service health, and the three sites' voice and bandwidth side by side](docs/images/dashboard.png)
 
-The Dashboard, where every sign-in lands. The pictures come from the
-synthetic 30,000-entity load-test fleet, whose links carry terabytes a day,
-with its devices dressed as a network would look - a mix of kinds, most of
-them clean - since the fleet itself is one mock device repeated
-(`docs/src/screenshots/` says exactly what is composed).
+The Dashboard, where every sign-in lands. The pictures come from the demo
+network: a small company - headquarters, two branches and a cloud site, 38
+devices - simulated by RSFleet (below) and polled by a
+real RSCanvas for two weeks, with a fortnight's story played into it: a power
+cut on battery, a GPU server running hot, a branch router's reload in its
+maintenance window, CRC errors on the core switch, a label printer that died,
+and one branch's congested afternoons.
 
 | | |
 |---|---|
-| ![A render workstation's device page: a warm GPU's alert, sensor cards for its CPU, memory, disks and two GPUs, and an interface's traffic chart](docs/images/device.png) | ![The device list, problems first: a transient virtual machine that is away, two devices down, three with an alert, then the clean ones](docs/images/devices.png) |
-| A device: its alert, sensors including GPUs, and an interface's chart | The device list, problems first |
-| ![An interface traffic report: GB in and out per day, peaks and coverage, with a CSV download](docs/images/report.png) | ![The System tab: health by thread and lane, with each section folded to its header](docs/images/system.png) |
+| ![Service health: each site's voice test (MOS, loss and jitter) and bandwidth test (Mbps each way, latency under load), each with when it last ran, then the web and TCP checks with their certificates](docs/images/services.png) | ![The services report: the Branch 2 voice test over a fortnight, a day a row - its congested afternoons show as amber MOS dips](docs/images/services-report.png) |
+| Service health: voice and bandwidth by site, then web and TCP | A fortnight of one voice test, a day a row |
+| ![The GPU server's page: its OS and hardware, responsiveness and availability, sensor cards for CPU, memory, disks, GPU temperatures, fans, utilisation and power, and the first GPU's temperature over 24 hours](docs/images/device.png) | ![The device list, problems first: the label printer down for two days, then the rest up, one line a device](docs/images/devices.png) |
+| A device: what it is, its sensors, a chart | The device list, problems first |
+| ![An interface traffic report: the edge firewall's two uplinks over a week, GB in and out a day, peaks and coverage, with a CSV download](docs/images/report.png) | ![The System tab: health by thread and lane, the database's state and the slowest agents, the other sections folded](docs/images/system.png) |
 | A traffic report, by day, with its CSV | System: health first, the rest folded |
 
-![A wall display: 45 devices as a glance grid fitted to the screen, each tile with its type icon, CPU, memory, top traffic and ping; most green, three amber with an alert each, two down in red, and one away transient dimmed](docs/images/wall.png)
+![The NOC wall: 38 devices in their sites - Branch 1, Branch 2, Cloud and HQ - each tile with its type icon and readings (CPU, memory, top traffic, ping; voice MOS and bandwidth on the site probes; checks passing); the dead label printer in red](docs/images/wall.png)
 
-A wall display, as a screen in a NOC would show it: a glance grid that fits
-its tiles to the screen, each with the device's type. Green is clean, amber
-carries an alert, red is down, and a transient device that is away is
-dimmed rather than alarming.
+A wall display, as a screen in a NOC would show it: the board divided by
+location, each tile with the device's type and the readings that matter for
+it. Green is clean, amber carries an alert, red is down, and a transient
+device that is away is dimmed rather than alarming.
 
 The pictures are rendered, not taken: `node tools/make-screenshots.mjs`
-serves this checkout's web client with the data in
-`docs/src/screenshots/fixture/` and photographs it in a headless browser,
+serves this checkout's web client with the recorded answers in
+`docs/src/screenshots/recording/` and photographs it in a headless browser,
 so they show the page as the code now draws it.
 
 ## What it does

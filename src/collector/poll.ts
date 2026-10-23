@@ -334,8 +334,15 @@ export async function pollDevice(
                 // inventoryTried stays true, so it is asked again tomorrow
                 // rather than on every poll forever.
             }
+        }
 
-            // THE SENSOR BACKFILL AND RE-PIN, both at the inventory cadence.
+        // THE SENSOR RE-PIN ON A RESTART, as well as daily (2026-10-22): a
+        // reboot is when an agent renumbers hrStorage, and a day of the
+        // wrong disk's readings - a production GPU server's models disk
+        // filing as /boot/efi - is a day too long. Before the sensor read
+        // below, so the restart's own poll already reads the right disks.
+        if (wantInventory || result.restart.kind === 'restarted') {
+            // THE SENSOR BACKFILL AND RE-PIN, at the inventory cadence and on a restart.
             // Backfill: devices added before the sensors slice grow sensors
             // without a rediscover button - discover-if-NONE, so an operator
             // who deleted a junk sensor does not get it back every midnight.
@@ -380,18 +387,21 @@ export async function pollDevice(
                                     name: s.name, extra: s.extra,
                                 }])),
                                 rows.rows);
-                            for (const u of plan) {
-                                // WRITE-IN-LOOP-OK: fires only when a
-                                // sensor's instruction DRIFTED (a reboot
-                                // renumbered the agent's tables) - the
-                                // steady-state plan is empty and writes
-                                // nothing, canonical-compared so jsonb key
-                                // order cannot masquerade as drift.
-                                const w = await OPS.repinSensor(
-                                    u.id, u.snmpIndex, JSON.stringify(u.extra));
-                                if (w.ok && w.rows.length > 0) {
-                                    result.rekeyed.push(
-                                        `${u.name}: sensor instruction re-pinned (the agent renumbered; readings resume, history kept)`);
+                            // ONE write for the whole plan (2026-10-22): two
+                            // disks that traded indexes move together or not
+                            // at all (OPS.repinSensors). The steady-state
+                            // plan is empty and writes nothing.
+                            if (plan.length > 0) {
+                                const moves = plan.map((u) => ({
+                                    id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra),
+                                }));
+                                const w = await OPS.repinSensors(device.id, moves);
+                                const done = new Set(w.ok ? w.rows.map((r) => r.id) : []);
+                                for (const u of plan) {
+                                    if (done.has(u.id)) {
+                                        result.rekeyed.push(
+                                            `${u.name}: sensor instruction re-pinned (the agent renumbered; readings resume, history kept)`);
+                                    }
                                 }
                             }
                         }

@@ -9,7 +9,7 @@
 // rearrange somebody's NOC board, and no test of "did it save" would catch
 // it.
 
-import { parseSourceDeclaration, sameCoverage, MAX_GROUPS } from '../src/boards/source.ts';
+import { gridSections, parseSectionAxis, parseSourceDeclaration, sameCoverage, MAX_GROUPS } from '../src/boards/source.ts';
 
 let pass = 0;
 let fail = 0;
@@ -123,6 +123,32 @@ console.log('board source declarations\n');
     if (!sameCoverage(all, some) && sameCoverage(all, { axis: 'location' as const, values: null })) {
         ok('all-fleet matches only all-fleet - today\'s list is not tomorrow\'s');
     } else bad('all-fleet was confused with a list', { all, some });
+}
+
+// --- WHAT THE GRID IS DIVIDED BY (slice 67) --------------------------------------
+{
+    const eq = (l: string, got: unknown, want: unknown): void => {
+        if (JSON.stringify(got) === JSON.stringify(want)) ok(l); else bad(l, { got, want });
+    };
+    eq('no sectionAxis in the body leaves the board\'s answer alone', parseSectionAxis({ cols: 0 }), { ok: true, set: false });
+    eq('null follows the board\'s own groups', parseSectionAxis({ sectionAxis: null }), { ok: true, set: true, axis: null });
+    eq('the other axis is taken', parseSectionAxis({ sectionAxis: 'location' }), { ok: true, set: true, axis: 'location' });
+    const odd = parseSectionAxis({ sectionAxis: 'rack' });
+    if (!odd.ok) ok('an axis that does not exist is refused, not stored'); else bad('"rack" was accepted', odd);
+
+    const team = { source_axis: 'application', source_values: ['Servers', 'Web'] };
+    eq('a team board following its groups: their declared order',
+        gridSections({ ...team, section_axis: null }), { sections: ['Servers', 'Web'], sectioned: true });
+    eq('the same board divided by location: sections by name, still sectioned',
+        gridSections({ ...team, section_axis: 'location' }), { sections: null, sectioned: true });
+    eq('its own axis named outright is the same as following the groups',
+        gridSections({ ...team, section_axis: 'application' }), { sections: ['Servers', 'Web'], sectioned: true });
+    eq('the all-fleet board: sections by name, as before',
+        gridSections({ source_axis: 'location', source_values: null, section_axis: null }), { sections: null, sectioned: true });
+    eq('a hand-drawn board stays one grid ...',
+        gridSections({ source_axis: null, source_values: null, section_axis: null }), { sections: null, sectioned: false });
+    eq('... until it is given an axis to divide by',
+        gridSections({ source_axis: null, source_values: null, section_axis: 'location' }), { sections: null, sectioned: true });
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

@@ -7,32 +7,29 @@
 // RS-PROJECT-CONVENTIONS section 10: if a PNG ships in the repo, its source
 // ships beside it, and every hero is shot at ONE canvas size. So nothing here
 // is a screenshot anyone took. It serves THIS checkout's public/ - the real
-// page - and answers its API from docs/src/screenshots/fixture/, a trimmed
-// snapshot of the 30,000-entity lab with the same identifier rules
-// tools/make-public-tree.sh applies (a PNG cannot be scrubbed afterwards).
-// Then it drives headless Chrome or Edge over the DevTools protocol with
-// Node's own WebSocket - no browser library, no dependency - at 1440x900,
-// with the clock frozen at the fixture's capture time and the zone fixed, so
-// "2d ago" and "the 24 hours to 10:00 PM" read the same on every run. Change
-// the page, re-run this, and the README shows the page as it now is.
-//
-// No sign-in happens anywhere: /api/me answers as an admin, with that role's
-// actions from src/auth/authorize.ts, and every write is refused.
-//
-// THE DEMO NETWORK (2026-10-09). The pictures are moving to the demo
-// network the online demo replays - Canvas Suite's company, polled by a real
-// RSCanvas, its NOC board divided by location, its service checks live:
+// page - and answers its API from docs/src/screenshots/recording/: the demo
+// network the online demo replays (Canvas Suite's company, polled by a real
+// RSCanvas), each answer saved, scrubbed, as a capture asked for it. Then it
+// drives headless Chrome or Edge over the DevTools protocol with Node's own
+// WebSocket - no browser library, no dependency - at 1440x900, with the clock
+// frozen at the capture's time and the zone fixed, so "2d ago" and "the 24
+// hours to 10:00 PM" read the same on every run. Change the page, re-run
+// this, and the README shows the page as it now is.
 //
 //   NODE_TLS_REJECT_UNAUTHORIZED=0 node tools/make-screenshots.mjs --capture https://<instance>:18080
 //       render every shot THROUGH that instance, saving each answer, scrubbed,
 //       to docs/src/screenshots/recording/ (tools/screenshot-recording.mjs)
 //   node tools/make-screenshots.mjs
-//       render from the recording when it exists - and fail on any request it
-//       has no answer for - else from the 30,000-entity lab's fixture/
+//       render from the recording - and fail on any request it has no answer for
 //   --recording DIR, --out DIR    elsewhere than docs/src/screenshots/recording, docs/images
 //
 // The capture signs in as SHOTS_USER / SHOTS_PASSWORD (the demo account and
 // the documented demo password unless set) - a lab instance, never a real one.
+// Rendering from the recording signs in nowhere: /api/me answers as an admin,
+// with that role's actions from src/auth/authorize.ts, and every write is
+// refused. (Until 2026-10-23 a trimmed snapshot of the 30,000-entity lab,
+// docs/src/screenshots/fixture/, stood in until the first recording; it went
+// with that recording.)
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -41,12 +38,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { actionsFor } from '../src/auth/authorize.ts';
-import { dress, extraAnswers } from '../docs/src/screenshots/dress.mjs';
 import { openCapture, openRecording } from './screenshot-recording.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC = path.join(ROOT, 'public');
-const FIXTURE = path.join(ROOT, 'docs', 'src', 'screenshots', 'fixture');
 const W = 1440, H = 900;
 const ZONE = 'America/Chicago';
 
@@ -58,34 +53,21 @@ const OUT = path.resolve(opt('--out') ?? path.join(ROOT, 'docs', 'images'));
 const RECORDING = path.resolve(opt('--recording') ?? path.join(ROOT, 'docs', 'src', 'screenshots', 'recording'));
 const CAPTURE = opt('--capture');
 
-// Where the answers come from: a live instance being captured, a recording
-// of one, or (until the recording replaces it) the lab's dressed fixture.
+// Where the answers come from: a live instance being captured, or the
+// recording of one.
+if (!CAPTURE && !fs.existsSync(path.join(RECORDING, 'index.json'))) {
+    console.error(`make-screenshots: no recording at ${RECORDING} - capture one with --capture https://<demo instance>:18080`);
+    process.exit(1);
+}
 const SOURCE = CAPTURE
     ? await openCapture(CAPTURE.replace(/\/+$/, ''), RECORDING, {
         user: process.env.SHOTS_USER || 'demo', password: process.env.SHOTS_PASSWORD || 'rscanvas-demo-2026',
     })
-    : fs.existsSync(path.join(RECORDING, 'index.json')) ? openRecording(RECORDING) : null;
+    : openRecording(RECORDING);
+const T = Date.parse(SOURCE.capturedAt);
 
-// The lab's answers as captured, and as the pictures show them: dressed by
-// docs/src/screenshots/dress.mjs, which says what it changes and why.
-const raw = (n) => JSON.parse(fs.readFileSync(path.join(FIXTURE, `${n}.json`), 'utf8'));
-const fixture = (n) => dress(n, raw(n), raw);
-const EXTRA = SOURCE ? {} : extraAnswers(raw);
-const META = SOURCE ? { capturedAt: SOURCE.capturedAt, reportCodes: [] } : raw('meta');
-const T = Date.parse(META.capturedAt);
+// --- the page's server: the real client, the recording's answers -------------------
 
-// --- the page's server: the real client, the fixture's answers ---------------------
-
-const ROUTES = {
-    '/api/alerts': 'alerts', '/api/devices': 'devices', '/api/health': 'health',
-    '/api/reachability/events': 'reach', '/api/maintenance': 'maint', '/api/policy': 'policy',
-    '/api/device/groups': 'groups', '/api/device/rtt': 'rtt', '/api/entity/history': 'history',
-    '/api/report/traffic': 'report', '/api/admin/retention': 'retention', '/api/users': 'users',
-    '/api/audit': 'audit', '/api/credentials': 'credentials', '/api/thresholds': 'thresholds',
-    '/api/boards': 'boards', '/api/alert-rules': 'rules',
-    // The wall's one call: a board's projection, as a display would get it.
-    '/api/display/board': 'wall',
-};
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
     '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
 
@@ -106,24 +88,14 @@ async function serve(req, res) {
         json(200, { ok: true, authenticated: true, user: { username: 'admin', role: 'admin', can: actionsFor('admin') } });
         return;
     }
-    if (SOURCE) {
-        try {
-            const got = await SOURCE.answer(url);
-            if (got) json(got.status, got.body);
-            else json(404, { ok: false, detail: `screenshot server: the recording has no ${p}` });
-        } catch (err) {
-            SOURCE.missing.add(`${p}: ${err.message}`);
-            json(502, { ok: false, detail: 'screenshot server: capture failed' });
-        }
-        return;
+    try {
+        const got = await SOURCE.answer(url);
+        if (got) json(got.status, got.body);
+        else json(404, { ok: false, detail: `screenshot server: the recording has no ${p}` });
+    } catch (err) {
+        SOURCE.missing.add(`${p}: ${err.message}`);
+        json(502, { ok: false, detail: 'screenshot server: capture failed' });
     }
-    if (p === '/api/dashboard') { json(200, fixture(`dash-${url.searchParams.get('window') ?? '24'}`)); return; }
-    if (p === '/api/device') { json(200, { ...fixture('device'), device: url.searchParams.get('name') }); return; }
-    if (p === '/api/syslog/export') { json(200, { ok: true, jobs: [] }); return; }
-    if (p === '/api/syslog/search') { json(200, { ok: true, rows: [], returned: 0, total: 0, timing: {} }); return; }
-    if (EXTRA[p]) { json(200, EXTRA[p]); return; }
-    if (ROUTES[p]) { json(200, fixture(ROUTES[p])); return; }
-    json(404, { ok: false, detail: `screenshot server: no ${p}` });
 }
 
 // --- a browser, and just enough of the DevTools protocol ----------------------------
@@ -174,7 +146,7 @@ class Cdp {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// The page's clock, frozen at the fixture's capture time: every relative time
+// The page's clock, frozen at the capture's time: every relative time
 // on screen is computed against it, so a re-run renders the same words.
 const freezeClock = `(() => {
     const T = ${T}; const Real = Date;
@@ -185,14 +157,12 @@ const freezeClock = `(() => {
 
 // --- the shots -------------------------------------------------------------------------
 
-const deviceJson = SOURCE ? null : fixture('device');
-const reportNames = SOURCE ? [] : META.reportCodes.map((c) => deviceJson.entities.find((e) => e.code === c)?.name).filter(Boolean);
 const wait = 'const wait = (ms) => new Promise((r) => setTimeout(r, ms));';
 // Scroll a panel to just under the sticky top bar - scrolling it to the very
 // top left its heading behind the bar.
 const under = (id) => `(() => { document.getElementById('${id}').scrollIntoView({ block: 'start' }); window.scrollBy(0, -(document.getElementById('topbar').offsetHeight + 12)); })()`;
 
-// The demo network's pictures (a capture or its recording).
+// The demo network's pictures.
 const SHOTS = [
     {
         name: 'dashboard', path: '/',
@@ -224,6 +194,12 @@ const SHOTS = [
             const box = pick?.querySelector('input');
             if (box && !box.checked) { box.checked = true; box.dispatchEvent(new Event('change')); }
             set('svc-report-period', 'last-14');
+            // At the Wide width (2026-10-23): a fortnight's fourteen columns,
+            // one line a row, are wider than the normal page, and the last
+            // would be cut at the frame's edge. The class only - setWide()
+            // would save it, and the shots after this one are normal width.
+            document.body.classList.add('wide');
+            document.getElementById('width-select').value = 'wide';
             document.getElementById('svc-report-run').click();
             for (let i = 0; i < 40 && !document.querySelector('#svc-report-table tbody tr'); i++) await wait(100);
             ${under('svc-report-panel')};
@@ -290,78 +266,6 @@ const SHOTS = [
     },
 ];
 
-// The 30,000-entity lab's pictures, from fixture/ - until the recording
-// replaces them.
-const LEGACY_SHOTS = [
-    {
-        name: 'dashboard', path: '/',
-        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.querySelectorAll('#dash-alerts tbody tr').length > 0"
-            + " && document.querySelectorAll('#dash-loc tbody tr').length > 0",
-        setup: 'window.scrollTo(0, 0)',
-    },
-    {
-        name: 'device', path: '/#device=lab-node-16100',
-        ready: "document.querySelectorAll('#entities tbody tr').length >= 2 && document.querySelectorAll('#sensor-cards .card').length > 0",
-        // An interface's chart open, the view an operator drills into.
-        setup: `(async () => {
-            document.querySelector('#entities tbody tr.clickable, #entities tbody tr').click();
-            for (let i = 0; i < 60 && !document.querySelector('#chart-body svg'); i++) await new Promise((r) => setTimeout(r, 100));
-            window.scrollTo(0, 0);
-        })()`,
-    },
-    {
-        name: 'devices', path: '/',
-        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10",
-        setup: `(async () => {
-            document.querySelector('.navbtn[data-section=devices]').click();
-            for (let i = 0; i < 40 && document.querySelectorAll('#devices tbody tr').length < 20; i++) await new Promise((r) => setTimeout(r, 100));
-            window.scrollTo(0, 0);
-        })()`,
-    },
-    {
-        name: 'report', path: '/',
-        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10 && document.getElementById('report-devices').childElementCount > 0",
-        // Two interfaces of one device over the fixture's recorded range
-        // (meta.json reportFrom/reportTo), shown on the page.
-        setup: `(async () => {
-            const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-            const dev = document.getElementById('report-device');
-            dev.value = 'lab-node-16100'; dev.dispatchEvent(new Event('change'));
-            for (let i = 0; i < 40 && !document.querySelector('#report-pick input'); i++) await wait(100);
-            for (const name of ${JSON.stringify(reportNames)}) {
-                const label = [...document.querySelectorAll('#report-pick label')].find((l) => l.textContent.trim().startsWith(name + ' '));
-                const box = label?.querySelector('input');
-                if (box && !box.checked) { box.checked = true; box.dispatchEvent(new Event('change')); }
-            }
-            const per = document.getElementById('report-period'); per.value = 'custom';
-            document.getElementById('report-from').value = ${JSON.stringify(META.reportFrom)};
-            document.getElementById('report-to').value = ${JSON.stringify(META.reportTo)};
-            per.dispatchEvent(new Event('change'));
-            document.getElementById('report-run').click();
-            for (let i = 0; i < 40 && !document.querySelector('#report-table tbody tr'); i++) await wait(100);
-            document.getElementById('report-panel').scrollIntoView({ block: 'start' });
-            window.scrollBy(0, -12);
-        })()`,
-    },
-    {
-        // The wall display: the fixture's 45 devices as a board drawn by the
-        // product's own generatedShapes() (drawn mode - its tiles are .node),
-        // opened the way a signed-in screen opens it (?board=).
-        name: 'wall', path: '/wall.html?board=1',
-        ready: "document.querySelectorAll('#wall .gtile').length >= 45",
-        setup: 'window.scrollTo(0, 0)',
-    },
-    {
-        name: 'system', path: '/',
-        ready: "document.querySelectorAll('#dash-rx tbody tr').length >= 10",
-        setup: `(async () => {
-            document.querySelector('.navbtn[data-section=system]').click();
-            for (let i = 0; i < 40 && !document.getElementById('health-verdict').textContent; i++) await new Promise((r) => setTimeout(r, 100));
-            window.scrollTo(0, 0);
-        })()`,
-    },
-];
-
 function pngSize(buf) {
     const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     if (buf.length < 24 || SIG.some((b, i) => buf[i] !== b)) return null;
@@ -369,7 +273,7 @@ function pngSize(buf) {
 }
 
 async function main() {
-    const ALL = SOURCE ? SHOTS : LEGACY_SHOTS;
+    const ALL = SHOTS;
     const shots = WANTED.length ? ALL.filter((s) => WANTED.includes(s.name)) : ALL;
     if (shots.length === 0) throw new Error(`no such shot; have ${ALL.map((s) => s.name).join(', ')}`);
     const browser = CANDIDATES.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
@@ -387,7 +291,15 @@ async function main() {
     try {
         const portFile = path.join(profile, 'DevToolsActivePort');
         for (let i = 0; i < 100 && !fs.existsSync(portFile); i++) await sleep(100);
-        const port = fs.readFileSync(portFile, 'utf8').split('\n')[0];
+        // Read it once the browser has let go: on Windows the file can exist
+        // and still be locked while Chrome writes it (EBUSY, 2026-10-23).
+        let port = '';
+        for (let i = 0; i < 50 && port === ''; i++) {
+            try { port = fs.readFileSync(portFile, 'utf8').split('\n')[0]; } catch (err) {
+                if (err.code !== 'EBUSY' && err.code !== 'EPERM') throw err;
+                await sleep(100);
+            }
+        }
         const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
         const pageTarget = targets.find((t) => t.type === 'page');
         const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
@@ -443,13 +355,11 @@ async function main() {
             console.warn(`  (could not remove the browser profile ${profile}: ${err.message})`);
         }
     }
-    if (SOURCE) {
-        if (SOURCE.missing.size > 0) {
-            throw new Error(`the ${SOURCE.mode} could not answer ${SOURCE.missing.size} request(s):\n  ${[...SOURCE.missing].join('\n  ')}`);
-        }
-        SOURCE.finish();
+    if (SOURCE.missing.size > 0) {
+        throw new Error(`the ${SOURCE.mode} could not answer ${SOURCE.missing.size} request(s):\n  ${[...SOURCE.missing].join('\n  ')}`);
     }
-    const from = SOURCE ? `the ${SOURCE.mode === 'capture' ? 'capture' : 'recording'} at ${META.capturedAt}` : `the fixture captured ${META.capturedAt}`;
+    SOURCE.finish();
+    const from = `the ${SOURCE.mode === 'capture' ? 'capture' : 'recording'} at ${SOURCE.capturedAt}`;
     console.log(`done - ${shots.length} shot(s) at ${W}x${H} in ${path.relative(ROOT, OUT) || OUT}, from ${from}`);
 }
 

@@ -190,6 +190,21 @@ chmod 0644 "$HERE/BUNDLE-MANIFEST.txt"
 FILES=("${PAYLOAD[@]}" BUNDLE-MANIFEST.txt)
 [ "$WITH_DEPS" = 1 ] && FILES+=(node_modules)
 
+# NOTHING GIT IGNORES (2026-10-23). The payload names DIRECTORIES, and a
+# directory carried whatever lay in it: tools/screenshots.local.mjs - the
+# lab's own names, kept out of git on purpose - rode in every production
+# bundle from 2026-10-10 until this. Named-not-discovered stopped at the
+# directory; this takes it the rest of the way. The list is asked of the
+# payload paths only, so node_modules (ignored, and shipped on purpose) is
+# untouched. Literal names (--no-wildcards), so a file called `*` is that file.
+IGNORED_LIST="$(mktemp)"
+git ls-files --others --ignored --exclude-standard -- "${PAYLOAD[@]}" > "$IGNORED_LIST" 2>/dev/null || true
+IGNOREDN=$(wc -l < "$IGNORED_LIST" | tr -d ' ')
+if [ "$IGNOREDN" != "0" ]; then
+    echo "  left out: ${IGNOREDN} file(s) git ignores"
+    head -5 "$IGNORED_LIST" | sed 's/^/    /'
+fi
+
 # set -o pipefail is at the top FOR THIS LINE. The 2026-08-14 full-scale
 # drill found the cold-backup procedure reporting success while tar printed
 # warnings, because tar's exit rode into a pipe and the compressor's 0 was
@@ -202,12 +217,13 @@ tar -czf "$TAR" \
     --exclude='node_modules/.cache' \
     --exclude='*.log' \
     --exclude='__pycache__' \
+    --no-wildcards --exclude-from="$IGNORED_LIST" \
     "${FILES[@]}"
 RC=$?
 rm -f "$HERE/BUNDLE-MANIFEST.txt" "$MANIFEST"
 # A failed tar can still leave a file with the bundle's name, and a file with
 # the right name is what the next person copies to the target.
-if [ "$RC" != "0" ]; then echo "  TAR FAILED (exit $RC) - no bundle written"; rm -f "$TAR"; exit 1; fi
+if [ "$RC" != "0" ]; then echo "  TAR FAILED (exit $RC) - no bundle written"; rm -f "$TAR" "$IGNORED_LIST"; exit 1; fi
 
 # VERIFY THE CARGO, NOT THE CARRIER: read the critical paths back OUT of the
 # artifact. "tar exited 0" is the claim; this is the check. A bundle missing
@@ -232,6 +248,11 @@ if [ "$WITH_DEPS" = 1 ]; then
         grep -q "^${want}/" <<< "$LIST" || { echo "  MISSING: $want"; MISSING=1; }
     done
 fi
+# ...and nothing git ignores came along (above): read back, not assumed.
+while IFS= read -r ignored; do
+    [ -n "$ignored" ] && grep -qxF -- "$ignored" <<< "$LIST" && { echo "  IGNORED FILE SHIPPED: $ignored"; MISSING=1; }
+done < "$IGNORED_LIST"
+rm -f "$IGNORED_LIST"
 SQLN=$(grep -c '^sql/.*\.sql$' <<< "$LIST")
 # Every slice file has to travel: a bundle one migration short builds a
 # database that is subtly the wrong shape, which is install break 2 wearing
