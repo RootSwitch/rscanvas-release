@@ -1,8 +1,8 @@
 # What RSCanvas watches, and what can alert
 
 Everything RSCanvas collects or tests, the values it keeps, the alerts each can
-raise and their shipped defaults, as of 0.1.0-alpha.11 (what alpha.10
-added is marked "alpha.10"). Thresholds are changed
+raise and their shipped defaults, as of 0.1.0-alpha.12 (what alpha.12
+added is marked "alpha.12"). Thresholds are changed
 per sensor, per kind on one device, or per kind everywhere - from a sensor
 card's cog, a port's gear, or the Thresholds list on System - and an override
 always beats the default.
@@ -17,7 +17,8 @@ for 2 scans (a scan runs every 30 s) and clears after 2 normal scans.
 | **Device down** | SNMP devices: polls failing (down after 2 failed polls in a row). Ping-only devices: their reachability probe | crit, on | Never raises for a device marked **transient**; nothing at all raises for a **muted** device. While down, its interface and sensor alerts freeze rather than clear |
 | **Restarted** | sysUpTime against the last reading plus the time between, so a restart quicker than a poll is caught; the 497-day wrap is told apart | warn, **off** (turn on per device or for all) | Stays raised 30 minutes and clears without an email. Never for a restart inside a maintenance window (recorded as planned) or a transient device. It is the SNMP agent's uptime, so an agent restart counts too |
 | **Collector watchdog** | the newest poll older than 3 poll intervals, or no device ever polled | crit, on | "All quiet" and "not looking" never look the same |
-| **Changed** (alpha.10) | its OS, hardware model or boot firmware moving from one value to another, as the agent reports it - its description, object ID or version moved; new words for the same report are not a change (after alpha.10) | warn, **off** (turn on per device or for all) | Every change is on the device's timeline either way. Stays raised 30 minutes and clears without an email; never inside a maintenance window or for a transient device |
+| **Changed** (alpha.10) | its OS, hardware model or boot firmware moving from one value to another, as the agent reports it - its description, object ID or version moved; new words for the same report are not a change (alpha.11) | warn, **off** (turn on per device or for all) | Every change is on the device's timeline either way. Stays raised 30 minutes and clears without an email; never inside a maintenance window or for a transient device |
+| **Ping loss** (alpha.12) | an outside target (below) losing 10% or more of its pings over the last 5 minutes | warn, **off** (turn on per device or for every outside target) | Never while the target is down - all lost is device-down's alert - and not for a muted or transient device. Its loss is on the roster, its page and its timeline either way |
 
 **What it is** (alpha.10): the OS in words from the agent's own
 description, read every poll, with a vendor's version where the description
@@ -30,6 +31,16 @@ after a restart, and when the description changes.
 device): up, **degraded** (round trip at or over 150 ms), or down. It drives
 device-down for ping-only devices; for SNMP devices it is shown beside the poll
 state, and degraded is shown, never alerted.
+
+An **outside target** (alpha.12) - a device with a public address, or
+one marked so on its page - gets 5 pings a sweep, a second apart, because
+across the internet some loss is the path's weather: it is down only when
+all 5 are lost, and **degraded** when the last minute's 30 pings lose 10% or
+more (until under 5%), with the loss shown on the roster, its page and its
+timeline. A busy internet link reads "degraded 15% loss" rather than
+flapping down. Loss is what it lost while it answered: a sweep with every
+ping lost is down time, counted by availability, so a target back from an
+outage reads up, not degraded on the outage's own pings.
 
 ## 2. Interfaces (IF-MIB, 64-bit counters)
 

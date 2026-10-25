@@ -26,7 +26,8 @@ import {
     step, parseFpingLine, sweepReadings, applySweep, validatePingInterval,
     partitionChecks, SUPPORTED_CHECKS, tcpKey,
     PING_FLOOR_S, DEGRADED_EXIT_RATIO,
-    type ReachState, type ProbeReading,
+    isOutsideTarget, pushLossSample, windowLossPct, stepOutside, followsOutage,
+    type ReachState, type ProbeReading, type LossSample,
 } from '../src/collector/reach.ts';
 
 let pass = 0;
@@ -195,8 +196,172 @@ function main(): void {
         eq('a tcp key cannot collide with an IPv6 icmp host',
             tcpKey('fe80::1', 443), 'fe80::1#443');
     }
+
+    outsideTargets();
     console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
     process.exit(fail === 0 ? 0 : 1);
+}
+
+// --- OUTSIDE TARGETS, judged by loss (slice 68) ----------------------------------
+//
+// Production, 2026-10-23: its two outside targets lost about one ping in six
+// while a model downloaded, and with one ping a sweep each read down and up
+// dozens of times. These hold the plan's done-when offline: that loss is
+// degraded and never down, a clean path is quiet, an outage is down at once.
+
+/** A seeded generator (mulberry32), so the simulations below are the same
+ *  numbers on every run. */
+function seeded(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+/** One outside sweep of `n` pings, each lost with probability `p`. */
+function sweepOf(rand: () => number, n: number, p: number): ProbeReading {
+    const rtts: number[] = [];
+    for (let i = 0; i < n; i++) if (rand() >= p) rtts.push(22 + rand() * 50);
+    rtts.sort((a, b) => a - b);
+    return { alive: rtts.length > 0, rttMs: rtts.length > 0 ? rtts[Math.floor(rtts.length / 2)] as number : null, sent: n, answered: rtts.length };
+}
+
+/** Run `sweeps` outside sweeps through the window and stepOutside, as the
+ *  collector does: window of 6 (a minute at 10 s), enter 10%, leave under 5%. */
+function runOutside(rand: () => number, sweeps: number, p: number, start: ReachState = 'up'): ReachState[] {
+    const out: ReachState[] = [];
+    let window: LossSample[] = [];
+    let s = start;
+    for (let i = 0; i < sweeps; i++) {
+        const r = sweepOf(rand, 5, p);
+        window = pushLossSample(window, r, 6);
+        s = stepOutside(s, r, windowLossPct(window, 6), D, 10, 5);
+        out.push(s);
+    }
+    return out;
+}
+
+function outsideTargets(): void {
+    console.log('\noutside targets (slice 68)');
+
+    eq('auto: a public address is outside', isOutsideTarget('auto', '203.0.113.4'), true);
+    eq('auto: a private one is not', isOutsideTarget('auto', '10.20.0.1'), false);
+    eq("'yes' marks a private address outside", isOutsideTarget('yes', '10.1.2.3'), true);
+    eq("'no' keeps a public one in", isOutsideTarget('no', '198.51.100.8'), false);
+
+    eq('five pings, two lost: answered 3 of 5, the median rtt',
+        parseFpingLine('203.0.113.4 : 22.10 - 23.40 22.80 -'),
+        { host: '203.0.113.4', reading: { alive: true, rttMs: 22.8, sent: 5, answered: 3 } });
+    eq('five pings, all lost: silent, not unknown',
+        parseFpingLine('203.0.113.4 : - - - - -'),
+        { host: '203.0.113.4', reading: { alive: false, rttMs: null, sent: 5, answered: 0 } });
+    eq('an even count takes the middle two',
+        parseFpingLine('203.0.113.4 : 20.0 30.0 - -'),
+        { host: '203.0.113.4', reading: { alive: true, rttMs: 25, sent: 4, answered: 2 } });
+    eq('a word among the values is fping explaining: unknown',
+        parseFpingLine('203.0.113.4 : 22.1 duplicate 23.0'), { host: '203.0.113.4', reading: null });
+    eq('one ping still parses as before, without counts',
+        parseFpingLine('10.0.0.1 : 5.42'), { host: '10.0.0.1', reading: { alive: true, rttMs: 5.42 } });
+
+    let w: LossSample[] = [];
+    for (let i = 0; i < 5; i++) w = pushLossSample(w, { alive: true, rttMs: 20, sent: 5, answered: 4 }, 6);
+    eq('the window says nothing until it is full - one blip after a restart is not 20%', windowLossPct(w, 6), null);
+    w = pushLossSample(w, { alive: true, rttMs: 20, sent: 5, answered: 5 }, 6);
+    eq('full: 5 lost of 30 is 16.7%', Math.round((windowLossPct(w, 6) ?? 0) * 10) / 10, 16.7);
+    w = pushLossSample(w, null, 6);
+    eq('an unreadable sweep adds nothing', w.length, 6);
+    const afterSilent = pushLossSample(w, { alive: false, rttMs: null, sent: 5, answered: 0 }, 6);
+    eq('a silent sweep is an outage, not loss: the window starts again, marked', [afterSilent, followsOutage(afterSilent)], [[{ sent: 0, lost: 0 }], true]);
+    eq('the first answer after it, if it lost any, straddled the outage: left out',
+        pushLossSample(afterSilent, { alive: true, rttMs: 20, sent: 5, answered: 2 }, 6), []);
+    eq('a clean first answer starts the new window',
+        pushLossSample(afterSilent, { alive: true, rttMs: 20, sent: 5, answered: 5 }, 6), [{ sent: 5, lost: 0 }]);
+    eq('the marker alone says nothing about loss', windowLossPct(afterSilent, 6), null);
+    w = pushLossSample(w, { alive: true, rttMs: 20, sent: 5, answered: 5 }, 6);
+    eq('the oldest sweep leaves as one arrives', [w.length, Math.round((windowLossPct(w, 6) ?? 0) * 10) / 10], [6, 13.3]);
+
+    const silent: ProbeReading = { alive: false, rttMs: null, sent: 5, answered: 0 };
+    const fine: ProbeReading = { alive: true, rttMs: 22, sent: 5, answered: 5 };
+    eq('every ping lost is down, whatever the window', stepOutside('up', silent, 0, D, 10, 5), 'down');
+    eq('3 of 30 (10%) enters degraded', stepOutside('up', fine, 10, D, 10, 5), 'degraded');
+    eq('2 of 30 (6.7%) does not enter it', stepOutside('up', fine, 20 / 3, D, 10, 5), 'up');
+    eq('degraded holds at 2 of 30 (above the 5% exit)', stepOutside('degraded', fine, 20 / 3, D, 10, 5), 'degraded');
+    eq('degraded leaves at 1 of 30', stepOutside('degraded', fine, 10 / 3, D, 10, 5), 'up');
+    eq('a filling window cannot make it degraded', stepOutside('up', fine, null, D, 10, 5), 'up');
+    eq('the latency rule still holds', stepOutside('up', { ...fine, rttMs: 200 }, 0, D, 10, 5), 'degraded');
+    eq('an unreadable sweep is unknown', stepOutside('up', null, 0, D, 10, 5), 'unknown');
+
+    // 10-23's downloads, simulated: 15% of pings lost, for 10,000 minutes.
+    // The alert scan reads the state every 30 s (three sweeps); device-down
+    // needs two scans in a row to find it down.
+    const lossy = runOutside(seeded(1023), 60_000, 0.15);
+    const firstMinute = 6;
+    const settled = lossy.slice(firstMinute);
+    const scansDownTwice = settled.filter((s, i) => i % 3 === 0 && s === 'down' && settled[i + 3] === 'down').length;
+    eq('15% loss, 10,000 minutes: two scans in a row never find it down', scansDownTwice, 0);
+    const downSweeps = settled.filter((s) => s === 'down').length;
+    if (downSweeps < 30) ok(`15% loss: a silent sweep is rare (${downSweeps} of ${settled.length}; about 0.15^5 each)`);
+    else bad('15% loss silenced too many sweeps', downSweeps);
+    const degradedShare = settled.filter((s) => s === 'degraded').length / settled.length;
+    if (degradedShare > 0.9) ok(`15% loss reads degraded (${Math.round(degradedShare * 100)}% of sweeps)`);
+    else bad('15% loss was not degraded most of the time', degradedShare);
+
+    // The same path, quiet: production's 0.3% everyday loss, for a week.
+    const quiet = runOutside(seeded(7), 7 * 24 * 360, 0.003);
+    const entries = quiet.filter((s, i) => s === 'degraded' && quiet[i - 1] !== 'degraded').length;
+    if (entries <= 4) ok(`0.3% loss for a week enters degraded ${entries} time(s) - about once a week by chance`);
+    else bad('a quiet path flapped into degraded', entries);
+    eq('0.3% loss for a week is never down', quiet.filter((s) => s === 'down').length, 0);
+
+    // A real outage: every ping lost from the first silent sweep.
+    const outage = runOutside(seeded(21), 12, 1, 'up');
+    eq('an outage is down on its first silent sweep, and stays down', outage, Array(12).fill('down'));
+
+    // ...and comes back UP, not degraded on its own silent pings (the lab
+    // drill's finding): the window started again at the first silent sweep.
+    {
+        let win: LossSample[] = [];
+        let st: ReachState = 'up';
+        const trace: ReachState[] = [];
+        const seq = [...Array(6).fill(fine), ...Array(6).fill(silent), ...Array(8).fill(fine)];
+        for (const r of seq) {
+            win = pushLossSample(win, r, 6);
+            st = stepOutside(st, r, windowLossPct(win, 6), D, 10, 5);
+            trace.push(st);
+        }
+        eq('after an outage the path reads up on its first answer - no degraded tail',
+            trace.slice(11), ['down', 'up', 'up', 'up', 'up', 'up', 'up', 'up', 'up']);
+        // The drill's second run: the outage ended mid-sweep, so the first
+        // answer lost four of five - and a minute later read "degraded 13%".
+        win = []; st = 'up';
+        const straddle = [...Array(6).fill(fine), silent, { alive: true, rttMs: 20, sent: 5, answered: 1 }, ...Array(10).fill(fine)];
+        const t2: ReachState[] = [];
+        for (const r of straddle) {
+            win = pushLossSample(win, r, 6);
+            st = stepOutside(st, r, windowLossPct(win, 6), D, 10, 5);
+            t2.push(st);
+        }
+        eq('a first answer that straddled the outage\'s end never makes it degraded a minute later',
+            t2.slice(6), ['down', ...Array(11).fill('up')]);
+    }
+
+    // applySweep routes an outside device through its window; the LAN
+    // device beside it is untouched, and the window is the caller's.
+    const windows = new Map<string, LossSample[]>([['o', Array(6).fill({ sent: 5, lost: 1 })]]);
+    const r = applySweep(
+        [{ id: 'o', host: '203.0.113.4', prev: 'up', outside: true }, { id: 'l', host: '10.0.0.9', prev: 'up' }],
+        new Map<string, ProbeReading | null>([['203.0.113.4', { alive: true, rttMs: 30, sent: 5, answered: 4 }], ['10.0.0.9', DEAD]]),
+        D, { windows, size: 6, enterPct: 10, exitPct: 5 });
+    eq('applySweep: the outside target degrades on its window, with the loss on the transition; the LAN device goes down on one ping',
+        r.transitions, [
+            { id: 'o', from: 'up', to: 'degraded', rttMs: 30, lossPct: 20 },
+            { id: 'l', from: 'up', to: 'down', rttMs: null, lossPct: null },
+        ]);
+    eq('applySweep keeps the window in the caller\'s map, and reports the loss', [windows.get('o')?.length, r.losses.get('o'), r.losses.has('l')], [6, 20, false]);
 }
 
 main();

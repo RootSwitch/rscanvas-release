@@ -205,7 +205,7 @@ let allClear = null;
 // fitAxis shipped an operator-reported defect and was rewritten with still
 // zero tests. This file keeps the DOM, the fetch loop, and the state.
 import {
-    PREF_SPEC, clampNum, fmtAge, chooseCols, tileLineCount, visibleFields,
+    PREF_SPEC, clampNum, fmtAge, chooseCols, tileLineCount, visibleFields, shownFields,
     pickFcols, fitAxis, themeRoster, shuffled, nextShift,
 } from './wall-logic.js';
 
@@ -249,6 +249,32 @@ function applyPrefs() {
 }
 
 const hiddenFields = () => new Set(prefs.hide === '' ? [] : prefs.hide.split(','));
+/**
+ * Show or stop showing one allowed field on THIS display (2026-10-24). One
+ * of the board's defaults is hidden with `hide`; any other allowed field is
+ * added with `show` - each list only ever holds what departs from the
+ * board, so a board whose defaults change carries its displays with it.
+ */
+function setFieldShown(k, on) {
+    const defaults = Array.isArray(lastBoard?.grid?.shown) ? lastBoard.grid.shown : null;
+    const hide = hiddenFields();
+    const show = addedFields();
+    if (defaults === null || defaults.includes(k)) {
+        if (on) hide.delete(k); else hide.add(k);
+        show.delete(k);
+    } else {
+        if (on) show.add(k); else show.delete(k);
+        hide.delete(k);
+    }
+    prefs.hide = [...hide].join(',');
+    setPref('show', [...show].join(','));
+    setPref('hide', prefs.hide);
+}
+/** Allowed fields this display added beyond its board's defaults (2026-10-24). */
+const addedFields = () => new Set(prefs.show === '' ? [] : prefs.show.split(','));
+/** What this display shows of what its board allows: wall-logic.js shownFields. */
+const shownOn = (board) => shownFields((board?.grid?.fields || []).filter((k) => Object.hasOwn(FIELD_FMT, k)),
+    Array.isArray(board?.grid?.shown) ? board.grid.shown : null, hiddenFields(), addedFields());
 
 function message(text) {
     const el = $('wall-msg');
@@ -309,6 +335,9 @@ const FIELD_FMT = {
     hardware: { label: 'hw', fmt: (v) => String(v) },
     cpu: { label: 'CPU', fmt: (v) => `${v}%` },
     mem: { label: 'mem', fmt: (v) => `${v}%` },
+    // Every GPU's load on ONE line, busiest first (2026-10-24): a tile's
+    // height is counted in lines, so two cards may not take two.
+    gpu: { label: 'GPU', fmt: (v) => fmtGpu(v) },
     top: { label: 'top', fmt: (v) => fmtBps(v) },
     topif: { label: 'if', fmt: (v) => String(v) },
     fs: { label: 'fs', fmt: (v) => `${v}%` },
@@ -327,6 +356,14 @@ const FIELD_FMT = {
     bw: { label: 'bw', fmt: (v) => fmtMbps(v) },
     svc: { label: 'svc', fmt: (v) => `${v.ok}/${v.n}` },
 };
+
+/** "87%", "87 / 12%" - each card's load, busiest first, up to four. */
+function fmtGpu(v) {
+    const loads = (Array.isArray(v) ? v : [v]).map(Number).filter(Number.isFinite).sort((a, b) => b - a);
+    if (loads.length === 0) return '';
+    const shown = loads.slice(0, 4).map((n) => Math.round(n));
+    return `${shown.join(' / ')}%${loads.length > 4 ? ` +${loads.length - 4}` : ''}`;
+}
 
 function fmtMbps(v) {
     const n = Number(v);
@@ -639,16 +676,14 @@ function renderGrid(board) {
         // header. Read after unhiding, which is when it has a height.
         $('wall').style.setProperty('--gw-banner', `${bar.offsetHeight}px`);
     }
-    // DECLARED, then filtered by this display's own hide list (slice 31). The
-    // order matters and is the safety argument: the board decides what may be
-    // shown, the screen decides what it wants of that.
-    const hidden = hiddenFields();
-    const declared = (board.grid.fields || [])
-        // hasOwn: a field key of 'constructor' would find an inherited
-        // function here, survive this filter, and throw at .fmt inside
-        // gridTile - where poll's catch would mislabel the render error
-        // "cannot reach the server".
-        .filter((k) => Object.hasOwn(FIELD_FMT, k) && !hidden.has(k));
+    // ALLOWED, then what this display shows of it (slice 31, and since
+    // 2026-10-24 the board's own defaults with the display's hide and show
+    // on top). The order matters and is the safety argument: the board
+    // decides what may be shown, the screen decides what it wants of that.
+    // hasOwn (in shownOn): a field key of 'constructor' would find an
+    // inherited function, survive, and throw at .fmt inside gridTile - where
+    // poll's catch would mislabel the render error "cannot reach the server".
+    const declared = shownOn(board);
     const canvas = $('wall-canvas');
     canvas.replaceChildren();
 
@@ -1059,25 +1094,21 @@ function buildPanel() {
     const declared = declaredAll.filter((k) => k !== 'stencil');
     if (declared.length > 0) {
         heading(panel, 'values on each tile');
-        const hidden = hiddenFields();
+        const shown = new Set(shownOn(lastBoard));
         const box = el('div', 'fields');
         for (const k of declared) {
             const lab = el('label');
             const cb = document.createElement('input');
             cb.type = 'checkbox';
-            cb.checked = !hidden.has(k);
-            cb.addEventListener('change', () => {
-                const next = hiddenFields();
-                if (cb.checked) next.delete(k); else next.add(k);
-                setPref('hide', [...next].join(','));
-            });
+            cb.checked = shown.has(k);
+            cb.addEventListener('change', () => setFieldShown(k, cb.checked));
             lab.appendChild(cb);
             lab.appendChild(el('span', null, FIELD_FMT[k].label));
             box.appendChild(lab);
         }
         panel.appendChild(box);
         panel.appendChild(el('div', 'note',
-            'Only what this board publishes can appear here - unticking hides it on this screen alone.'));
+            'Every value this board allows is here, ticked if this screen shows it - a tick changes this screen alone.'));
     }
 
     // Both halves of the icon, together, because they are one decision.
@@ -1087,11 +1118,7 @@ function buildPanel() {
     if (declaredAll.includes('stencil')) {
         heading(panel, 'device icon');
         selectRow(panel, 'icon', [['show', 'show'], ['hide', 'hide']],
-            hiddenFields().has('stencil') ? 'hide' : 'show', (v) => {
-                const next = hiddenFields();
-                if (v === 'hide') next.add('stencil'); else next.delete('stencil');
-                setPref('hide', [...next].join(','));
-            });
+            shownOn(lastBoard).includes('stencil') ? 'show' : 'hide', (v) => setFieldShown('stencil', v === 'show'));
         // The operator measured these against their own mockup: 40 reasonably
         // legible, 60 very visible, 80 starting to push it at a normal width.
         sliderRow(panel, 'size', 'icon', 16, 96, 2, 'px');

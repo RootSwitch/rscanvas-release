@@ -32,7 +32,7 @@ import { pollDevice } from '../collector/poll.ts';
 import { probeAll, type ProbeResult } from '../collector/probe.ts';
 import {
     applySweep, validatePingInterval, type ReachState, type ProbeReading,
-    partitionChecks, SUPPORTED_CHECKS, tcpKey,
+    partitionChecks, SUPPORTED_CHECKS, tcpKey, isOutsideTarget, followsOutage, type LossSample,
 } from '../collector/reach.ts';
 import { tcpSweep } from '../collector/tcpcheck.ts';
 import { downBudget, liveBudget } from '../collector/lanes.ts';
@@ -768,6 +768,12 @@ let sweepInFlight = false;
 /** When the last ping HISTORY row was written (slice 36) - the sweep runs
  *  every 10s, the history writes every 60s. */
 let lastPingSampleMs = 0;
+/** OUTSIDE TARGETS (slice 68): each one's last minute of sweeps, for its
+ *  loss (reach.ts LossJudge), and its pings since the last history row, so
+ *  the minute row counts every sweep once. In memory only: a restart starts
+ *  both empty, and the loss says nothing until the window fills. */
+const lossWindows = new Map<string, LossSample[]>();
+const pingsSinceRow = new Map<string, { sent: number; lost: number }>();
 
 async function reachSweep(): Promise<void> {
     const t0 = performance.now();
@@ -778,7 +784,7 @@ async function reachSweep(): Promise<void> {
     // the worse of the two available mistakes.
     const { probe, tcp, unsupported } = partitionChecks(fleet.rows.map((d) => ({
         id: d.id, host: d.host, prev: d.reach_state as ReachState, check: d.reach_check,
-        port: d.reach_port,
+        port: d.reach_port, outside: isOutsideTarget(d.reach_outside, d.host),
     })));
     reachUnsupported = [...unsupported.values()].reduce((a, b) => a + b, 0);
     for (const [check, n] of unsupported) {
@@ -790,8 +796,11 @@ async function reachSweep(): Promise<void> {
             + "plus 'none' to opt out of probing entirely.");
     }
     // DEDUPE BY HOST for the probe list (the parent's rule); the fanout back
-    // to every device row sharing a host lives in applySweep.
-    const hosts = [...new Set(probe.map((d) => d.host))];
+    // to every device row sharing a host lives in applySweep. OUTSIDE
+    // targets (slice 68) go in a run of their own with several pings each;
+    // a host two devices disagree about goes there, and both read its pings.
+    const outsideHosts = new Set(probe.filter((d) => d.outside === true).map((d) => d.host));
+    const hosts = [...new Set(probe.map((d) => d.host))].filter((h) => !outsideHosts.has(h));
     // THE TCP LANE (ruling 6, rung 1) runs CONCURRENTLY with fping, keyed by
     // tcpKey(host, port) - so two devices declaring the same host:port share
     // one probe, the same host on two ports is honestly two, and the merged
@@ -805,15 +814,19 @@ async function reachSweep(): Promise<void> {
         return [key, { key, host: d.host, port: d.port }];
     })).values()];
     const tcpDevices = tcp.map((d) => ({ id: d.id, host: tcpKey(d.host, d.port), prev: d.prev }));
-    const [icmpReadings, tcpReadings] = await Promise.all([
+    const [icmpReadings, outsideReadings, tcpReadings] = await Promise.all([
         hosts.length > 0 && fpingPresent
             ? runFpingSweep(hosts, CONFIG.pingTimeoutMs)
+            : Promise.resolve(new Map<string, ProbeReading | null>()),
+        outsideHosts.size > 0 && fpingPresent
+            ? runFpingSweep([...outsideHosts], CONFIG.pingTimeoutMs,
+                { count: Math.max(1, CONFIG.pingOutsideCount), periodMs: CONFIG.pingOutsidePeriodMs })
             : Promise.resolve(new Map<string, ProbeReading | null>()),
         tcpTargets.length > 0
             ? tcpSweep(tcpTargets, CONFIG.tcpCheckTimeoutMs, CONFIG.tcpCheckSpacingMs)
             : Promise.resolve(new Map<string, ProbeReading | null>()),
     ]);
-    if (icmpReadings === null) {
+    if (icmpReadings === null || outsideReadings === null) {
         // fping was ended by a signal before it printed - a restart's stop
         // reaches it in the same instant as this process. A sweep it did not
         // finish says nothing, not "every host unknown"; the next one decides
@@ -822,9 +835,49 @@ async function reachSweep(): Promise<void> {
         log('reach sweep cut short (fping ended by a signal) - nothing applied');
         return;
     }
-    const readings = new Map([...icmpReadings, ...tcpReadings]);
+    const readings = new Map([...icmpReadings, ...outsideReadings, ...tcpReadings]);
     const swept = [...probe, ...tcpDevices];
-    const { transitions } = applySweep(swept, readings, CONFIG.pingDegradedMs);
+    // An outside target's window is a minute of sweeps; one that stopped
+    // being outside (or left the fleet) drops its window and its count.
+    const outsideIds = new Set(probe.filter((d) => d.outside === true).map((d) => d.id));
+    for (const id of [...lossWindows.keys()]) if (!outsideIds.has(id)) lossWindows.delete(id);
+    for (const id of [...pingsSinceRow.keys()]) if (!outsideIds.has(id)) pingsSinceRow.delete(id);
+    // Read BEFORE the sweep moves the windows: which targets were silent
+    // last sweep, so a first answer that straddles the outage's end is left
+    // out of the minute's counts as it is left out of the window.
+    const afterOutage = new Set([...outsideIds].filter((id) => followsOutage(lossWindows.get(id) ?? [])));
+    const { transitions, losses } = applySweep(swept, readings, CONFIG.pingDegradedMs, {
+        windows: lossWindows,
+        size: Math.max(1, Math.round(60 / CONFIG.pingIntervalS)),
+        enterPct: CONFIG.pingLossDegradedPct,
+        exitPct: CONFIG.pingLossClearPct,
+    });
+    for (const d of probe) {
+        if (d.outside !== true) continue;
+        const r = readings.get(d.host);
+        // A silent sweep is an outage, not loss (reach.ts pushLossSample):
+        // it is the row's NULL rtt and availability's miss, and adds nothing
+        // to the pings it counts as lost.
+        if (r === undefined || r === null || !r.alive) continue;
+        if (afterOutage.has(d.id) && (r.answered ?? 1) < (r.sent ?? 1)) continue;
+        const sent = r.sent ?? 1;
+        const c = pingsSinceRow.get(d.id) ?? { sent: 0, lost: 0 };
+        c.sent += sent;
+        c.lost += sent - (r.answered ?? (r.alive ? 1 : 0));
+        pingsSinceRow.set(d.id, c);
+    }
+    // The LIVE LOSS (slice 68) of every ICMP device, change-only like the
+    // rtt below: an outside target's last minute, NULL for every other - so
+    // a device that stops being outside sheds its number at the next sweep,
+    // and a fleet whose numbers did not move writes nothing.
+    {
+        const ids = probe.map((d) => d.id);
+        const pcts = probe.map((d) => losses.get(d.id) ?? null);
+        if (ids.length > 0) {
+            const w = await OPS.recordPingLoss(ids, pcts);
+            if (!w.ok) log(`ping loss batch refused (${w.reason})`);
+        }
+    }
     // The LIVE ping RTT for every device that answered, one change-only
     // statement per sweep. Separate from the transition write on purpose:
     // that one is rare and carries state, this one is every sweep and carries
@@ -850,17 +903,26 @@ async function reachSweep(): Promise<void> {
     // sixth one is written down, because "is it up" and "how slow is it
     // today" want completely different resolutions and the expensive one is
     // not the one that has to be quick.
+    // An outside target's row also carries the pings sent and lost since
+    // the last row (slice 68), every sweep counted once; its rtt is still
+    // this sweep's, NULL only when the sweep was silent - so availability
+    // keeps meaning "could it be reached", and loss is reported beside it.
     if (Date.now() - lastPingSampleMs >= 60_000) {
         lastPingSampleMs = Date.now();
         const ids: string[] = [], rtts: Array<number | null> = [];
+        const sents: Array<number | null> = [], losts: Array<number | null> = [];
         for (const d of swept) {
             const r = readings.get(d.host);
             if (r === undefined) continue;   // not probed: NO ROW, which is not a miss
             ids.push(d.id);
             rtts.push(r === null ? null : r.rttMs);
+            const c = pingsSinceRow.get(d.id);
+            sents.push(c ? c.sent : null);
+            losts.push(c ? c.lost : null);
         }
+        pingsSinceRow.clear();
         if (ids.length > 0) {
-            const w = await OPS.insertPingSamples(ids, rtts);
+            const w = await OPS.insertPingSamples(ids, rtts, sents, losts);
             if (!w.ok) log(`ping history batch refused (${w.reason})`);
         }
     }
@@ -870,6 +932,7 @@ async function reachSweep(): Promise<void> {
             transitions.map((t) => t.id),
             transitions.map((t) => t.to),
             transitions.map((t) => t.rttMs),
+            transitions.map((t) => t.lossPct),
         );
         if (w.ok) reachTransitions += transitions.length;
     }

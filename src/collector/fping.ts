@@ -49,16 +49,19 @@ export function fpingAvailable(): Promise<boolean> {
  * it too - and the caller then applies nothing (reach.ts, sweepReadings).
  */
 export function runFpingSweep(
-    hosts: string[], timeoutMs: number,
+    hosts: string[], timeoutMs: number, pings: { count: number; periodMs: number } = { count: 1, periodMs: 1000 },
 ): Promise<Map<string, ProbeReading | null> | null> {
     return new Promise((resolve, reject) => {
         if (hosts.length === 0) { resolve(new Map()); return; }
 
-        const p = spawn(
-            'fping',
-            ['-C', '1', '-q', '-r', '0', '-t', String(timeoutMs)],
-            { stdio: ['pipe', 'ignore', 'pipe'] },
-        );
+        // SEVERAL PINGS A TARGET (slice 68) for the outside targets' own run:
+        // `-C N` sends N, `-p` spaces them, and the line that comes back
+        // carries one value or dash each (reach.ts parses it). Still -r 0:
+        // a lost ping is counted, never retried. The run takes about
+        // (N - 1) x period plus the timeout; the fleet's run stays -C 1.
+        const args = ['-C', String(pings.count), '-q', '-r', '0', '-t', String(timeoutMs)];
+        if (pings.count > 1) args.push('-p', String(pings.periodMs));
+        const p = spawn('fping', args, { stdio: ['pipe', 'ignore', 'pipe'] });
         let stderr = '';
         p.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
         p.on('error', (err) => reject(err));

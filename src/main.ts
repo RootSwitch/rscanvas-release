@@ -59,7 +59,9 @@ import { serializeMetrics } from './health/metrics.ts';
 // Pure module, zero imports of its own: the constant is the sweep's own
 // vocabulary, so the reach-check route cannot drift from what the collector
 // can actually probe.
-import { SUPPORTED_CHECKS } from './collector/reach.ts';
+import { SUPPORTED_CHECKS, isOutsideTarget } from './collector/reach.ts';
+import { planSensorRepin, type SensorExtra } from './collector/sensors.ts';
+import { PING_LOSS_KIND } from './alerts/pingloss.ts';
 import {
     defaultCheckName, isCheckKind, isPathKind, OUTCOME_TEXT, outcomeName, parseCheckDef, parseCheckName, storedDef,
     throughputFits,
@@ -1540,7 +1542,8 @@ const server = createWebServer(tlsPair, (req, res) => {
                 // than an absent one.
                 ping: p.rows.map((x) => [
                     Number(x.b), x.med_ms, x.max_ms,
-                    x.n > 0 ? Math.round((x.misses / x.n) * 100) : null,
+                    x.sent !== null && x.sent > 0 ? Math.round(((x.lost ?? 0) / x.sent) * 100)
+                        : x.n > 0 ? Math.round((x.misses / x.n) * 100) : null,
                 ]),
             });
             return;
@@ -2213,6 +2216,17 @@ const server = createWebServer(tlsPair, (req, res) => {
                 on: boolean; source: string; fleetOn: boolean;
                 deviceRowId: string | null; fleetRowId: string | null;
             } | null = null;
+            // Slice 68: whether the device is pinged as an outside target -
+            // its setting and the verdict, decided here by the collector's
+            // own rule - and its ping-loss alerts, the same shape again.
+            let pingLoss: {
+                setting: string; outside: boolean; host: string;
+                pings: number; levelPct: number; minutes: number;
+                alerts: {
+                    on: boolean; source: string; fleetOn: boolean;
+                    deviceRowId: string | null; fleetRowId: string | null;
+                } | null;
+            } | null = null;
             // CHANGE FROM NORMAL (slice 65), the device's part: whether its
             // own row has taken it out, and the fleet's two switches (one
             // sensor, a room) with their rows' ids. Each temperature's own
@@ -2256,6 +2270,25 @@ const server = createWebServer(tlsPair, (req, res) => {
                     fleetOn: chFleet.source !== 'none' && !chFleet.muted,
                     deviceRowId: chRow(name), fleetRowId: chRow(null),
                 };
+                const reach = await OPS.deviceReachSetting(name);
+                const rs = reach.ok ? reach.rows[0] : undefined;
+                if (rs !== undefined) {
+                    const pl = resolveRuleInfo(idx, cfg, PING_LOSS_KIND, null, name);
+                    const plFleet = resolveRuleInfo(buildOverrideIndex((cfg.overrides ?? []).filter((o) =>
+                        !(o.kind === PING_LOSS_KIND && o.scope === 'host-kind' && o.host === name))), cfg, PING_LOSS_KIND, null, name);
+                    const plRow = (host: string | null) => (orows.ok
+                        ? orows.rows.find((o) => o.kind === PING_LOSS_KIND && o.host === host && o.code === null)?.id ?? null : null);
+                    const outside = rs.reach_check === 'icmp' && isOutsideTarget(rs.reach_outside, rs.host);
+                    pingLoss = {
+                        setting: rs.reach_outside, outside, host: rs.host,
+                        pings: CONFIG.pingOutsideCount, levelPct: CONFIG.pingLossAlertPct, minutes: CONFIG.pingLossAlertMin,
+                        alerts: outside ? {
+                            on: pl.source !== 'none' && !pl.muted, source: pl.source,
+                            fleetOn: plFleet.source !== 'none' && !plFleet.muted,
+                            deviceRowId: plRow(name), fleetRowId: plRow(null),
+                        } : null,
+                    };
+                }
                 const tcRow = (kind: string, host: string | null) => (orows.ok
                     ? orows.rows.find((o) => o.kind === kind && o.host === host && o.code === null) ?? null : null);
                 const tcDev = tcRow(TEMP_CHANGE_KIND, name);
@@ -2385,7 +2418,7 @@ const server = createWebServer(tlsPair, (req, res) => {
             // read; a refusal costs the list (null), never the page.
             const restarts = await OPS.deviceRestarts(name, DEVICE_RESTARTS_SHOWN);
             sendJson(res, 200, {
-                ok: true, device: name, entities, ifRuleDefaults, linkDown, restartAlerts, changeAlerts, tempChange,
+                ok: true, device: name, entities, ifRuleDefaults, linkDown, restartAlerts, changeAlerts, tempChange, pingLoss,
                 restarts: restarts.ok ? restarts.rows : null,
                 entitiesCapped: rows.rows.length >= UI_DEVICE_ENTITY_CAP,
                 availability24h: probes > 0
@@ -2644,6 +2677,38 @@ const server = createWebServer(tlsPair, (req, res) => {
                     continue;
                 }
                 const ents = (r.entities ?? []) as Array<Record<string, unknown>>;
+
+                // THE RE-PIN FIRST, as the poll runs it daily and on a restart
+                // (2026-10-25). Rediscover is what an operator reaches for
+                // after resizing a VM, and it could refresh neither a
+                // sensor's instruction nor the counted CPU name: production's
+                // GPU server read "CPU (4 cores)" at 10 vCPUs after one. FIRST,
+                // because the inserts below would add a renumbered disk as a
+                // second row, and the gone check would untrack the first.
+                let repinned: string[] = [];
+                // WRITE-IN-LOOP-OK: a READ, one per device an operator named.
+                const pinRows = await OPS.sensorRowsForRepin(d.id);
+                if (pinRows.ok) {
+                    const plan = planSensorRepin(ents.flatMap((e) => (
+                        e.kind === undefined || e.kind === 'if' || !e.extra ? [] : [{
+                            kind: String(e.kind), snmpIndex: String(e.snmpIndex),
+                            name: String(e.name), extra: e.extra as SensorExtra,
+                        }])), pinRows.rows);
+                    if (plan.length > 0) {
+                        // WRITE-IN-LOOP-OK: one transaction per DEVICE (the
+                        // plan unnests inside it), over devices an operator
+                        // named; the steady-state plan is empty and writes
+                        // nothing.
+                        const w = await OPS.repinSensors(d.id, plan.map((u) => ({
+                            id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra),
+                            name: u.rename?.to ?? null,
+                        })));
+                        const done = new Set(w.ok ? w.rows.map((x) => x.id) : []);
+                        repinned = plan.filter((u) => done.has(u.id))
+                            .map((u) => (u.rename !== undefined ? `${u.rename.from} is now ${u.rename.to}` : u.name));
+                    }
+                }
+
                 const added: string[] = [];
                 for (const e of ents) {
                     const code = generateCode(d.name, String(e.name), takenCodes);
@@ -2715,6 +2780,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                     startedTracking: moved.filter((m) => m.tracked).map((m) => m.name),
                     goneUntracked,
                     goneAnswering,
+                    repinned,
                 });
                 for (const n of goneUntracked) untrackedGone.push(`${d.name}: ${n}`);
             }
@@ -4018,6 +4084,30 @@ const server = createWebServer(tlsPair, (req, res) => {
             sendJson(res, 200, { ok: true, name, transient: body.transient });
             return;
         }
+
+        // OUTSIDE TARGET (slice 68): 'auto' pings a public address as an
+        // outside target - several pings a sweep, judged by loss - and 'yes'
+        // or 'no' says so where the address cannot. Behind the transient
+        // flag's permission, from the same corner of the device page, and
+        // audited the same way.
+        if (path === '/api/device/outside' && method === 'POST') {
+            if (!enforce(res, principal, 'device.group')) return;
+            const body = await readBodyOr400(req, res);
+            if (body === null) return;
+            const name = typeof body.name === 'string' ? body.name : '';
+            if (name === '') { sendJson(res, 400, { ok: false, detail: 'name is required' }); return; }
+            const outside = body.outside;
+            if (outside !== 'auto' && outside !== 'yes' && outside !== 'no') {
+                sendJson(res, 400, { ok: false, detail: "outside is 'auto' (by its address), 'yes' or 'no'" });
+                return;
+            }
+            const r = await OPS.setDeviceOutside(name, outside);
+            if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
+            if (r.rows.length === 0) { sendJson(res, 404, { ok: false, detail: 'no such device' }); return; }
+            await auth.audit(principal, 'device.outside', name, { outside }, inetOrNull(clientIp(req)));
+            sendJson(res, 200, { ok: true, name, outside });
+            return;
+        }
         // BULK TRANSIENT (slice 30): the roster selection, one statement. The
         // per-device route stays - it is where the decision is made while
         // looking at one machine - but a gaming parlor is declared as a SET,
@@ -5001,14 +5091,30 @@ const server = createWebServer(tlsPair, (req, res) => {
             // Slice 67: what the grid is divided by, when the body says.
             const section = parseSectionAxis(body);
             if (!section.ok) { sendJson(res, 400, { ok: false, detail: section.detail }); return; }
+            // Slice 69: which of the allowed fields its displays show until
+            // their viewer changes it. Absent leaves it; null is every allowed
+            // field. Kept even where it names a field no longer allowed - the
+            // projection trims it to the allowed ones on every read, so
+            // narrowing the fields can never strand a display.
+            let shown: { json: string | null } | undefined;
+            if (body.shown !== undefined) {
+                const known = new Set(GRID_FIELDS.map((f) => f.key));
+                if (body.shown !== null && (!Array.isArray(body.shown)
+                    || body.shown.some((f) => typeof f !== 'string' || !known.has(f)))) {
+                    sendJson(res, 400, { ok: false, detail: 'shown must be null (every allowed field) or an array of field keys' });
+                    return;
+                }
+                shown = { json: body.shown === null ? null : JSON.stringify(body.shown) };
+            }
             const r = await OPS.setBoardGrid(boardGrid[1] as string, cols, fieldsJson,
-                section.set ? { axis: section.axis } : undefined);
+                section.set ? { axis: section.axis } : undefined, shown);
             if (!r.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${r.reason})` }); return; }
             if (r.rowCount === 0) { sendJson(res, 404, { ok: false, detail: 'no such board' }); return; }
             const sectionAxis = r.rows[0]?.section_axis ?? null;
             await auth.audit(principal, 'board.setGrid', boardGrid[1] as string,
                 { cols, fields: fieldsJson === null ? undefined : JSON.parse(fieldsJson),
-                    sectionAxis: section.set ? sectionAxis : undefined },
+                    sectionAxis: section.set ? sectionAxis : undefined,
+                    shown: shown === undefined ? undefined : shown.json === null ? null : JSON.parse(shown.json) },
                 inetOrNull(clientIp(req)));
             sendJson(res, 200, { ok: true, cols, sectionAxis });
             return;
@@ -5187,6 +5293,11 @@ const server = createWebServer(tlsPair, (req, res) => {
                 ...(board.grid_cols !== null ? {
                     grid: {
                         cols: board.grid_cols, fields: board.grid_fields,
+                        // Slice 69: what its displays show until their viewer
+                        // changes it, trimmed to what the board allows; null
+                        // is every allowed field, as before.
+                        shown: Array.isArray(board.grid_shown) && Array.isArray(board.grid_fields)
+                            ? (board.grid_shown as string[]).filter((k) => (board.grid_fields as string[]).includes(k)) : null,
                         // Slice 27: the declared groups IN DECLARED ORDER -
                         // the renderer's section ordering, chosen by the team
                         // that owns the board. null on an unsourced board

@@ -51,7 +51,14 @@ export interface DeviceSummary {
     state_sensors: number;
     batt_pct: number | null;
     runtime_s: number | null;
+    /** Each GPU's load in percent, in the agent's own order (GPU0, GPU1, ...);
+     *  null for a device with none (2026-10-24, the wall's GPU field). */
+    gpu_pcts: number[] | null;
 }
+
+/** A GPU's load gauge as the agents name it - "Util: GPU", "Util: GPU0" -
+ *  and NOT "Util: fan-GPU0", which is its fan's speed. */
+export const GPU_LOAD_NAME = /^Util: GPU\d*$/i;
 
 const maxOf = (a: number | null, b: number | null): number | null =>
     a === null ? b : b === null ? a : Math.max(a, b);
@@ -68,8 +75,9 @@ export function summarizeReadings(ifs: IfReading[], sensors: SensorReading[]): D
         cpu_pct: null, mem_pct: null, fs_pct: null, fs_name: null, temp_c: null,
         down_ports: 0, if_count: 0, if_errs: null,
         top_if: null, top_bps: null, top_speed: null,
-        alarms: 0, state_sensors: 0, batt_pct: null, runtime_s: null,
+        alarms: 0, state_sensors: 0, batt_pct: null, runtime_s: null, gpu_pcts: null,
     };
+    const gpus: Array<[string, number]> = [];
     for (const i of ifs) {
         if (!i.tracked) continue;
         s.if_count++;
@@ -110,6 +118,9 @@ export function summarizeReadings(ifs: IfReading[], sensors: SensorReading[]): D
             case 'runtime':
                 if (r.v0 !== null) s.runtime_s = maxOf(s.runtime_s, r.v0);
                 break;
+            case 'gauge':
+                if (r.v0 !== null && GPU_LOAD_NAME.test(r.name)) gpus.push([r.name, r.v0]);
+                break;
             default:
                 break;
         }
@@ -117,5 +128,10 @@ export function summarizeReadings(ifs: IfReading[], sensors: SensorReading[]): D
     const r1 = (v: number | null): number | null => (v === null ? null : Math.round(v * 10) / 10);
     s.cpu_pct = r1(s.cpu_pct); s.mem_pct = r1(s.mem_pct); s.fs_pct = r1(s.fs_pct);
     s.temp_c = r1(s.temp_c); s.if_errs = r1(s.if_errs);
+    // GPU0 before GPU1 before GPU10: the cards keep their places here, and
+    // the wall orders them busiest first when it draws them.
+    if (gpus.length > 0) {
+        s.gpu_pcts = gpus.sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true })).map(([, v]) => r1(v) as number);
+    }
     return s;
 }

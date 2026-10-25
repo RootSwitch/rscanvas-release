@@ -115,10 +115,13 @@ BEGIN
          WHERE extract(isodow FROM g.day)::smallint = ANY (s.days)
            AND o.starts < hi AND o.starts + make_interval(mins => s.minutes) > lo
     )
-    INSERT INTO ping_hourly (device_id, hour_ts, probes, misses, planned_probes, planned_misses)
+    -- sent/lost (sql/slice68.sql): an outside target's pings, summed; NULL
+    -- for a device whose rows carry none.
+    INSERT INTO ping_hourly (device_id, hour_ts, probes, misses, planned_probes, planned_misses, sent, lost)
     SELECT p.device_id, date_trunc('hour', p.ts),
            count(*), count(*) FILTER (WHERE p.rtt_ms IS NULL),
-           count(*) FILTER (WHERE m.planned), count(*) FILTER (WHERE m.planned AND p.rtt_ms IS NULL)
+           count(*) FILTER (WHERE m.planned), count(*) FILTER (WHERE m.planned AND p.rtt_ms IS NULL),
+           sum(p.sent), sum(p.lost)
       FROM ping_samples p
       JOIN devices d ON d.id = p.device_id
       CROSS JOIN LATERAL (
@@ -133,7 +136,8 @@ BEGIN
      GROUP BY 1, 2
     ON CONFLICT (device_id, hour_ts) DO UPDATE
        SET probes = excluded.probes, misses = excluded.misses,
-           planned_probes = excluded.planned_probes, planned_misses = excluded.planned_misses;
+           planned_probes = excluded.planned_probes, planned_misses = excluded.planned_misses,
+           sent = excluded.sent, lost = excluded.lost;
     GET DIAGNOSTICS n = ROW_COUNT;
 
     INSERT INTO job_state (job, through_ts, last_run_ts, last_ok_ts, runs)

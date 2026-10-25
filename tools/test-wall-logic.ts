@@ -14,9 +14,10 @@ interface Dials {
 interface WallShape { status?: string | null; fields?: Record<string, unknown>; alerts?: number }
 const {
     clampNum, PREF_SPEC, fmtAge, chooseCols, wallHeightNeeded,
-    visibleFields, tileLineCount, pickFcols, fitAxis, themeRoster, shuffled, nextShift,
+    visibleFields, tileLineCount, pickFcols, fitAxis, themeRoster, shuffled, nextShift, shownFields,
 } = await import('../public/wall-logic.js' as string) as {
     clampNum: (raw: unknown, lo: number, hi: number, def: number) => number;
+    shownFields: (allowed: string[], shownDefault: string[] | null, hide: Set<string>, show: Set<string>) => string[];
     PREF_SPEC: Record<string, { def: unknown; parse: (v: string) => unknown }>;
     fmtAge: (ms: number) => string;
     chooseCols: (sectionLines: number[][], dials: Dials, prevCols?: number) => number;
@@ -339,6 +340,22 @@ console.log('\nnextShift - where the wall jumps:');
     const shrunk = nextShift(4, { x: 20, y: 20 }, lcg(3));
     eq('an offset from a wider band comes back inside a narrower one',
         Math.abs(shrunk.x) <= 4 && Math.abs(shrunk.y) <= 4, true);
+}
+
+// WHAT A DISPLAY SHOWS of what its board allows (2026-10-24, slice 69).
+{
+    const allowed = ['stencil', 'cpu', 'mem', 'gpu', 'temp', 'ping'];
+    const none = new Set<string>();
+    eq('a board with no defaults shows everything it allows - every board before the split',
+        shownFields(allowed, null, none, none), allowed);
+    eq('a board with defaults shows those, in the allowed order',
+        shownFields(allowed, ['ping', 'cpu', 'stencil'], none, none), ['stencil', 'cpu', 'ping']);
+    eq('a display hides a default and adds another allowed field',
+        shownFields(allowed, ['stencil', 'cpu', 'ping'], new Set(['ping']), new Set(['gpu'])), ['stencil', 'cpu', 'gpu']);
+    eq('a display can never show what its board withheld, whatever its URL says',
+        shownFields(allowed, ['cpu', 'address'], none, new Set(['hardware', 'address'])), ['cpu']);
+    eq('an old wall URL with only hide still means what it meant',
+        shownFields(allowed, null, new Set(['mem', 'temp']), none), ['stencil', 'cpu', 'gpu', 'ping']);
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);

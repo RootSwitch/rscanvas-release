@@ -58,5 +58,20 @@ eq('state sensors: counted, alarms by status 2', [sen.state_sensors, sen.alarms]
 eq('UPS charge and runtime', [sen.batt_pct, sen.runtime_s], [88, 1234]);
 eq('a kind the roster does not show changes nothing', sen.if_count, 0);
 
+// GPUs on a wall (2026-10-24): each card's load, in the agent's order, and
+// never a fan's speed that shares the word.
+const gpu = summarizeReadings([], [
+    S({ kind: 'gauge', name: 'Util: GPU1', v0: 12.34 }),
+    S({ kind: 'gauge', name: 'Util: GPU0', v0: 87 }),
+    S({ kind: 'gauge', name: 'Util: fan-GPU0', v0: 55 }),
+    S({ kind: 'gauge', name: 'Util: GPU10', v0: 3 }),
+    S({ kind: 'gauge', name: 'Util: GPU2', v0: null }),
+    S({ kind: 'cpu', name: 'Util: GPU3', v0: 99 }),
+]);
+eq('each GPU gauge\'s load, GPU0 before GPU1 before GPU10; a fan, a silent card and another kind left out',
+    gpu.gpu_pcts, [87, 12.3, 3]);
+eq('one card named plainly ("Util: GPU") counts', summarizeReadings([], [S({ kind: 'gauge', name: 'Util: GPU', v0: 41 })]).gpu_pcts, [41]);
+eq('no GPU is null, not an empty list', sen.gpu_pcts, null);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail === 0 ? 0 : 1;

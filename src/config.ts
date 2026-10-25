@@ -334,6 +334,25 @@ export const CONFIG = {
     /** Answering at or over this rtt is `degraded`; exit is 80% of it. */
     pingDegradedMs: num('PING_DEGRADED_MS', 150),
     /**
+     * OUTSIDE TARGETS (slice 68, SLICE-OUTSIDE-LOSS-PLAN.md): a device whose
+     * address is public, or one marked outside, gets this many pings a sweep
+     * this far apart - spread over seconds so a one-second burst of loss
+     * cannot silence a whole sweep, and inside the 10s sweep at these
+     * defaults (about 4s plus the timeout). Down is every ping lost; the
+     * last minute's pings losing PING_LOSS_DEGRADED_PCT or more is degraded,
+     * held until under PING_LOSS_CLEAR_PCT. 10% of 30 pings is 3: at 0.3%
+     * everyday loss that happens by chance about once a week, where 5% (2 of
+     * 30) would be about five times a day.
+     */
+    pingOutsideCount: num('PING_OUTSIDE_COUNT', 5),
+    pingOutsidePeriodMs: num('PING_OUTSIDE_PERIOD_MS', 1000),
+    pingLossDegradedPct: num('PING_LOSS_DEGRADED_PCT', 10),
+    pingLossClearPct: num('PING_LOSS_CLEAR_PCT', 5),
+    /** The ping-loss alert (off unless turned on): a warn when an outside
+     *  target's last PING_LOSS_ALERT_MIN minutes lost this much or more. */
+    pingLossAlertPct: num('PING_LOSS_ALERT_PCT', 10),
+    pingLossAlertMin: num('PING_LOSS_ALERT_MIN', 5),
+    /**
      * The TCP reach lane (ruling 6, rung 1). Timeout is per connect and
      * looser than ICMP's on purpose: a lost SYN retransmits at ~1s, so 2s
      * gives one retransmission its chance where 800ms would call a lossy

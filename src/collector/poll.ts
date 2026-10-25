@@ -300,8 +300,11 @@ export async function pollDevice(
         // attempt is recorded either way so the caller can back off.
         //
         // Walk the processor table for indices, then read the matching
-        // description. One walk of N cores plus one get, once a day.
-        if (wantInventory) {
+        // description. One walk of N cores plus one get, once a day - and
+        // after a restart (2026-10-25), as the identity read and the re-pin
+        // already were: a VM resized is a VM rebooted, and its cores and
+        // memory trailed the resize by up to a day.
+        if (wantInventory || result.restart.kind === 'restarted') {
             result.inventoryTried = true;
             try {
                 const procs = await walk(session, HR.hrProcessorLoad);
@@ -394,14 +397,15 @@ export async function pollDevice(
                             if (plan.length > 0) {
                                 const moves = plan.map((u) => ({
                                     id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra),
+                                    name: u.rename?.to ?? null,
                                 }));
                                 const w = await OPS.repinSensors(device.id, moves);
                                 const done = new Set(w.ok ? w.rows.map((r) => r.id) : []);
                                 for (const u of plan) {
-                                    if (done.has(u.id)) {
-                                        result.rekeyed.push(
-                                            `${u.name}: sensor instruction re-pinned (the agent renumbered; readings resume, history kept)`);
-                                    }
+                                    if (!done.has(u.id)) continue;
+                                    result.rekeyed.push(u.rename !== undefined
+                                        ? `${u.rename.from} is now ${u.rename.to}: the agent's processor count changed (history kept)`
+                                        : `${u.name}: sensor instruction re-pinned (the agent renumbered; readings resume, history kept)`);
                                 }
                             }
                         }

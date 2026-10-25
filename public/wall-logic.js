@@ -25,6 +25,7 @@ export function clampNum(raw, lo, hi, def) {
 export const PREF_SPEC = {
     cols: { def: '', parse: (v) => v },              // '' = the board's own choice
     hide: { def: '', parse: (v) => v },              // csv of field keys hidden HERE
+    show: { def: '', parse: (v) => v },              // csv of allowed keys shown HERE beyond the board's defaults
     gap: { def: 8, parse: (v) => clampNum(v, 0, 40, 8) },
     pad: { def: 6, parse: (v) => clampNum(v, 2, 24, 6) },
     minh: { def: 0, parse: (v) => clampNum(v, 0, 400, 0) },
@@ -329,4 +330,22 @@ export function fitAxis(los, his) {
     return above > below
         ? { lo: sorted[at], hi }
         : { lo, hi: Math.max(...his.filter((v, i) => los[i] < sorted[at])) };
+}
+
+/**
+ * WHICH FIELDS THIS DISPLAY SHOWS (2026-10-24, IDEAS-2026-10-24 item 7).
+ *
+ * A board ALLOWS some fields (its exposure: nothing else ever reaches a
+ * display) and shows some of those BY DEFAULT; `shownDefault` null means all
+ * of them, which is how every board behaved before. A display then hides
+ * some of the defaults (`hide`) and adds some of the others (`show`), both
+ * kept in its URL. Allowed always bounds the answer: a display can never
+ * show what its board withheld, whatever its URL says.
+ */
+export function shownFields(allowed, shownDefault, hide, show) {
+    const allow = new Set(allowed);
+    const base = shownDefault === null || shownDefault === undefined ? [...allow] : shownDefault.filter((k) => allow.has(k));
+    const out = new Set(base.filter((k) => !hide.has(k)));
+    for (const k of show) if (allow.has(k)) out.add(k);
+    return allowed.filter((k) => out.has(k));
 }

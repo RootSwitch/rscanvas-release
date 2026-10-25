@@ -918,6 +918,8 @@ export const GRID_FIELDS: ReadonlyArray<{ key: string; label: string; identity: 
     // is a layout decision as much as a vocabulary.
     { key: 'cpu', label: 'CPU %', identity: false },
     { key: 'mem', label: 'memory %', identity: false },
+    // Slice 69: every GPU's load on one line, busiest first on the wall.
+    { key: 'gpu', label: 'GPU load (each card)', identity: false },
     { key: 'top', label: 'top interface usage', identity: false },
     { key: 'fs', label: 'fullest filesystem %', identity: false },
     { key: 'temp', label: 'temperature', identity: false },
@@ -1415,6 +1417,8 @@ export const OPS = {
                fs_pct        = CASE WHEN $9::jsonb IS NULL THEN fs_pct ELSE ($9::jsonb->>'fs_pct')::real END,
                fs_name       = CASE WHEN $9::jsonb IS NULL THEN fs_name ELSE $9::jsonb->>'fs_name' END,
                temp_c        = CASE WHEN $9::jsonb IS NULL THEN temp_c ELSE ($9::jsonb->>'temp_c')::real END,
+               -- Slice 69: each GPU's load, a JSON array; JSON null is SQL NULL.
+               gpu_pcts      = CASE WHEN $9::jsonb IS NULL THEN gpu_pcts ELSE nullif($9::jsonb->'gpu_pcts', 'null'::jsonb) END,
                down_ports    = CASE WHEN $9::jsonb IS NULL THEN down_ports ELSE ($9::jsonb->>'down_ports')::int END,
                if_count      = CASE WHEN $9::jsonb IS NULL THEN if_count ELSE ($9::jsonb->>'if_count')::int END,
                if_errs       = CASE WHEN $9::jsonb IS NULL THEN if_errs ELSE ($9::jsonb->>'if_errs')::real END,
@@ -1583,6 +1587,17 @@ export const OPS = {
            AND round(coalesce(d.ping_rtt_ms, -1)::numeric) IS DISTINCT FROM round(coalesce(v.rtt, -1)::numeric)`,
         [ids, rtts]),
 
+    /** An outside target's loss over its last minute (slice 68), NULL for
+     *  every other device - the same change-only shape as recordPingRtts, to
+     *  the tenth of a percent, so a fleet whose numbers held writes nothing. */
+    recordPingLoss: (ids: string[], pcts: Array<number | null>) => laneQuery('collector', `
+        UPDATE devices d
+           SET reach_loss_pct = v.pct
+          FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::real[]) AS pct) v
+         WHERE d.id = v.id
+           AND round(d.reach_loss_pct::numeric, 1) IS DISTINCT FROM round(v.pct::numeric, 1)`,
+        [ids, pcts]),
+
     /**
      * SNMP round-trip over the last hour for one device: median and worst,
      * from samples.rtt_ms which every interface row carries. Median so a single
@@ -1656,10 +1671,10 @@ export const OPS = {
      */
     reachFleet: () => laneQuery<{
         id: string; host: string; reach_state: string; reach_check: string;
-        reach_port: number | null;
+        reach_port: number | null; reach_outside: string;
     }>(
         'collector', `
-        SELECT id::text AS id, host(host) AS host, reach_state, reach_check, reach_port
+        SELECT id::text AS id, host(host) AS host, reach_state, reach_check, reach_port, reach_outside
           FROM devices
          WHERE enabled = true AND reach_check <> 'none'`),
 
@@ -1674,15 +1689,16 @@ export const OPS = {
      * other timestamp on the row - the one-clock rule from alertScanDevices.
      */
     recordReachTransitions: (
-        ids: string[], states: string[], rtts: Array<number | null>,
+        ids: string[], states: string[], rtts: Array<number | null>, losses: Array<number | null>,
     ) => laneQuery<never>('collector', `
         WITH t AS (
             SELECT unnest($1::bigint[]) AS device_id,
                    unnest($2::text[])   AS to_state,
-                   unnest($3::real[])   AS rtt_ms
+                   unnest($3::real[])   AS rtt_ms,
+                   unnest($4::real[])   AS loss_pct
         ),
         prev AS (
-            SELECT t.device_id, d.reach_state AS from_state, t.to_state, t.rtt_ms
+            SELECT t.device_id, d.reach_state AS from_state, t.to_state, t.rtt_ms, t.loss_pct
               FROM t JOIN devices d ON d.id = t.device_id
         ),
         upd AS (
@@ -1694,9 +1710,9 @@ export const OPS = {
              WHERE d.id = p.device_id
          RETURNING d.id
         )
-        INSERT INTO reachability_events (device_id, from_state, to_state, rtt_ms)
-        SELECT device_id, from_state, to_state, rtt_ms FROM prev`,
-        [ids, states, rtts]),
+        INSERT INTO reachability_events (device_id, from_state, to_state, rtt_ms, loss_pct)
+        SELECT device_id, from_state, to_state, rtt_ms, loss_pct FROM prev`,
+        [ids, states, rtts, losses]),
 
     /**
      * Slice 36: one minute's ping latencies, one statement. Arrays rather
@@ -1707,10 +1723,13 @@ export const OPS = {
      * "probed and silent" is a reading, and only an absent ROW means nobody
      * was looking.
      */
-    insertPingSamples: (ids: string[], rtts: Array<number | null>) => laneQuery<never>(
+    insertPingSamples: (
+        ids: string[], rtts: Array<number | null>, sents: Array<number | null>, losts: Array<number | null>,
+    ) => laneQuery<never>(
         'collector', `
-        INSERT INTO ping_samples (device_id, rtt_ms)
-        SELECT unnest($1::bigint[]), unnest($2::real[])`, [ids, rtts]),
+        INSERT INTO ping_samples (device_id, rtt_ms, sent, lost)
+        SELECT unnest($1::bigint[]), unnest($2::real[]), unnest($3::smallint[]), unnest($4::smallint[])`,
+        [ids, rtts, sents, losts]),
 
     /**
      * The series behind the latency chart. Bucketed like the SNMP one, and
@@ -1720,12 +1739,16 @@ export const OPS = {
      */
     pingSeries: (deviceName: string, hours: number, bucketSec: number) => laneQuery<{
         b: string; med_ms: number | null; max_ms: number | null; n: number; misses: number;
+        sent: number | null; lost: number | null;
     }>('interactive', `
         SELECT floor(extract(epoch FROM p.ts) / $3) * $3 AS b,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY p.rtt_ms)::float8 AS med_ms,
                max(p.rtt_ms)::float8 AS max_ms,
                count(*)::int AS n,
-               count(*) FILTER (WHERE p.rtt_ms IS NULL)::int AS misses
+               count(*) FILTER (WHERE p.rtt_ms IS NULL)::int AS misses,
+               -- An outside target's pings (slice 68): its loss is these,
+               -- where a one-ping device's is its silent minutes.
+               sum(p.sent)::int AS sent, sum(p.lost)::int AS lost
           FROM ping_samples p
           JOIN devices d ON d.id = p.device_id
          WHERE d.name = $1
@@ -2089,8 +2112,11 @@ export const OPS = {
      * same move an interface re-deal makes) and then pinned, in one
      * transaction: every row lands or none does, so a lost race leaves the
      * rows as they were rather than parked. Returns the ids pinned.
+     *
+     * `name` is set only where the planner renames (the counted CPU row,
+     * 2026-10-25); absent or null keeps the row's own.
      */
-    repinSensors: (deviceId: string, moves: Array<{ id: string; snmpIndex: string; extra: string }>) =>
+    repinSensors: (deviceId: string, moves: Array<{ id: string; snmpIndex: string; extra: string; name?: string | null }>) =>
         onLane<{ id: string }>('collector', async (client) => {
             const ids = moves.map((m) => m.id);
             await client.query('BEGIN');
@@ -2098,14 +2124,15 @@ export const OPS = {
                 await client.query(`UPDATE entities SET snmp_index = NULL
                                      WHERE device_id = $1::bigint AND id = ANY($2::bigint[])`, [deviceId, ids]);
                 const pinned = await client.query<{ id: string }>(`
-                    UPDATE entities e SET snmp_index = u.idx, extra = u.extra::jsonb
-                      FROM unnest($2::bigint[], $3::text[], $4::text[]) AS u(id, idx, extra)
+                    UPDATE entities e SET snmp_index = u.idx, extra = u.extra::jsonb, name = coalesce(u.nm, e.name)
+                      FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[]) AS u(id, idx, extra, nm)
                      WHERE e.id = u.id AND e.device_id = $1::bigint
                        AND NOT EXISTS (SELECT 1 FROM entities o
                                         WHERE o.device_id = e.device_id AND o.kind = e.kind
                                           AND o.snmp_index = u.idx AND o.id <> e.id)
                  RETURNING e.id::text AS id`,
-                [deviceId, ids, moves.map((m) => m.snmpIndex), moves.map((m) => m.extra)]);
+                [deviceId, ids, moves.map((m) => m.snmpIndex), moves.map((m) => m.extra),
+                    moves.map((m) => m.name ?? null)]);
                 if (pinned.rows.length !== moves.length) {
                     await client.query('ROLLBACK');
                     return { rows: [], rowCount: 0 };
@@ -3640,18 +3667,28 @@ export const OPS = {
          WHERE e.source = 'probe' AND d.enabled = true
          ORDER BY d.name, e.kind, e.name`),
 
+    // DEGRADED (2026-10-24, the operator's polish notes): up, but with an
+    // alert raised against it or a degraded ping - slow, or an outside
+    // target losing pings - so "up" counts the clean ones and the columns
+    // still add up to the group. The open alerts are one set joined by
+    // name, not a lookup per device.
     groupHealth: () =>
-        laneQuery<{ axis: 'location' | 'application'; value: string | null; up: number; down: number; other: number }>('interactive', `
-        WITH s AS (
+        laneQuery<{ axis: 'location' | 'application'; value: string | null; up: number; degraded: number; down: number; other: number }>('interactive', `
+        WITH open AS (
+            SELECT DISTINCT host FROM alerts WHERE state IN ('active', 'clearing') AND host IS NOT NULL
+        ), s AS (
             SELECT nullif(btrim(d.location), '') AS location,
                    nullif(btrim(d.application), '') AS application,
-                   ${deviceStatusSql('d')} AS st
+                   ${deviceStatusSql('d')} AS st,
+                   (d.reach_state = 'degraded' OR open.host IS NOT NULL) AS troubled
               FROM devices d
+              LEFT JOIN open ON open.host = d.name
              WHERE d.enabled = true AND d.transient IS NOT TRUE
         )
         SELECT CASE WHEN GROUPING(location) = 0 THEN 'location' ELSE 'application' END AS axis,
                CASE WHEN GROUPING(location) = 0 THEN location ELSE application END AS value,
-               count(*) FILTER (WHERE st = 'up')::int AS up,
+               count(*) FILTER (WHERE st = 'up' AND NOT troubled)::int AS up,
+               count(*) FILTER (WHERE st = 'up' AND troubled)::int AS degraded,
                count(*) FILTER (WHERE st = 'down')::int AS down,
                count(*) FILTER (WHERE st IS DISTINCT FROM 'up' AND st IS DISTINCT FROM 'down')::int AS other
           FROM s
@@ -3791,7 +3828,7 @@ export const OPS = {
     uiBoards: () => laneQuery<{
         id: string; name: string; collection: string; owner: string | null;
         show_addresses: boolean; created_ts: Date; updated_ts: Date;
-        grid_cols: number | null; grid_fields: unknown;
+        grid_cols: number | null; grid_fields: unknown; grid_shown: unknown;
         tokens: string; live_tokens: string;
         source_axis: string | null; source_value: string | null;
         source_values: unknown; section_axis: string | null;
@@ -3799,7 +3836,7 @@ export const OPS = {
     }>('interactive', `
         SELECT b.id::text AS id, b.name, b.collection, u.username AS owner,
                b.show_addresses, b.created_ts, b.updated_ts,
-               b.grid_cols, COALESCE(b.grid_fields, '[]'::jsonb) AS grid_fields,
+               b.grid_cols, COALESCE(b.grid_fields, '[]'::jsonb) AS grid_fields, b.grid_shown,
                b.source_values, b.section_axis,
                count(t.id)::text AS tokens,
                count(t.id) FILTER (WHERE t.revoked_ts IS NULL)::text AS live_tokens,
@@ -3867,17 +3904,21 @@ export const OPS = {
     // The section axis (slice 67) changes only when `section` is given; the
     // board's own axis is stored as NULL, the one way to say "follow the
     // groups".
+    // Slice 69: what its displays show by default changes only when `shown`
+    // is given; its json NULL means every allowed field, as before.
     setBoardGrid: (id: string, cols: number | null, fieldsJson: string | null,
-        section?: { axis: string | null }) => laneQuery<{ section_axis: string | null }>(
+        section?: { axis: string | null }, shown?: { json: string | null }) => laneQuery<{ section_axis: string | null }>(
         'interactive', `
         UPDATE boards SET grid_cols = $2,
                grid_fields = COALESCE($3::jsonb, grid_fields),
                section_axis = CASE WHEN NOT $5::boolean THEN section_axis
                                    WHEN $4::text IS NOT DISTINCT FROM source_axis THEN NULL
                                    ELSE $4::text END,
+               grid_shown = CASE WHEN NOT $7::boolean THEN grid_shown ELSE $6::jsonb END,
                updated_ts = now()
          WHERE id = $1::bigint
-        RETURNING section_axis`, [id, cols, fieldsJson, section?.axis ?? null, section !== undefined]),
+        RETURNING section_axis`, [id, cols, fieldsJson, section?.axis ?? null, section !== undefined,
+            shown?.json ?? null, shown !== undefined]),
 
     /**
      * Tokens for one board, WITHOUT the hash.
@@ -3987,12 +4028,12 @@ export const OPS = {
      */
     boardProjection: (boardId: string, withDevice = false) => laneQuery<{
         name: string; collection: string; shapes: unknown;
-        grid_cols: number | null; grid_fields: unknown;
+        grid_cols: number | null; grid_fields: unknown; grid_shown: unknown;
         source_axis: string | null; source_values: unknown; section_axis: string | null;
     }>('interactive', `
         SELECT b.name, b.collection,
                b.grid_cols,
-               COALESCE(b.grid_fields, '[]'::jsonb) AS grid_fields,
+               COALESCE(b.grid_fields, '[]'::jsonb) AS grid_fields, b.grid_shown,
                b.source_axis, b.source_values, b.section_axis,
                COALESCE((
                    SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
@@ -4148,6 +4189,7 @@ export const OPS = {
                                ('fs',       CASE WHEN d.status = 'up' THEN to_jsonb(round(d.fs_pct::numeric)) END),
                                ('fsname',   CASE WHEN d.status = 'up' THEN to_jsonb(d.fs_name) END),
                                ('temp',     CASE WHEN d.status = 'up' THEN to_jsonb(round(d.temp_c::numeric)) END),
+                               ('gpu',      CASE WHEN d.status = 'up' THEN d.gpu_pcts END),
                                ('errs',     CASE WHEN d.status = 'up' THEN to_jsonb(round(d.if_errs::numeric, 1)) END),
                                ('uptime',   CASE WHEN d.status = 'up' THEN to_jsonb(d.uptime_s) END),
                                ('ping',     CASE WHEN d.reach_state IN ('up', 'degraded') THEN to_jsonb(round(d.ping_rtt_ms::numeric)) END),
@@ -5203,6 +5245,23 @@ export const OPS = {
         UPDATE devices SET transient = $2 WHERE name = $1 RETURNING name`,
         [name, transient]),
 
+    // --- outside targets (slice 68) ---------------------------------------------
+
+    /** 'auto', 'yes' or 'no': whether the device is pinged as an outside
+     *  target. The collector reads it every sweep; the loss it had goes NULL
+     *  at the next sweep when it stops being one. */
+    setDeviceOutside: (name: string, outside: string) => laneQuery<{ name: string }>(
+        'interactive', `
+        UPDATE devices SET reach_outside = $2 WHERE name = $1 RETURNING name`,
+        [name, outside]),
+
+    /** What the device page needs to say whether a device is an outside
+     *  target: its address, its setting and its probe. */
+    deviceReachSetting: (name: string) => laneQuery<{ host: string; reach_outside: string; reach_check: string }>(
+        'interactive', `
+        SELECT host(host) AS host, reach_outside, reach_check FROM devices WHERE name = $1`,
+        [name]),
+
     // THE MAINTENANCE GATE, HERE AND NOWHERE ELSE (slice 22). Because a
     // suppressed raise keeps its debt unsettled, an alert still active when
     // its window expires is delivered by this same query on the next pass -
@@ -5555,7 +5614,7 @@ export const OPS = {
                 UNION ALL
                 SELECT r.ts, 'reach', NULL, NULL, NULL, NULL,
                        jsonb_build_object('from', r.from_state, 'to', r.to_state, 'rtt', r.rtt_ms,
-                                          'first', r.from_state = 'unknown')
+                                          'loss', r.loss_pct, 'first', r.from_state = 'unknown')
                   FROM d, w, reachability_events r
                  WHERE r.device_id = d.id AND r.ts >= w.lo AND r.to_state <> 'unknown'
                    AND (r.from_state <> 'unknown'
@@ -6072,6 +6131,8 @@ export const OPS = {
         reach_state: string; reach_since_ts: Date | null; reach_rtt_ms: number | null;
         poll_lag_ms: number | null; ping_rtt_ms: number | null;
         snmp_rtt_ms: number | null;
+        /** Slice 68: the outside setting, and an outside target's last minute of loss. */
+        reach_outside: string; reach_loss_pct: number | null;
         credential_ref: string; snmp_enabled: boolean;
         /** The device page's name line shows it when it is not 161 (2026-10-16). */
         snmp_port: number;
@@ -6124,6 +6185,7 @@ export const OPS = {
                -- rather than the scan's merged verdict, because "host pings
                -- but the agent is dead" is a diagnosis the merge erases.
                d.reach_state, d.reach_since_ts, d.reach_rtt_ms,
+               d.reach_outside, d.reach_loss_pct::float8 AS reach_loss_pct,
                d.poll_lag_ms::float8 AS poll_lag_ms, d.ping_rtt_ms::float8 AS ping_rtt_ms,
                -- Easy-win E9: same blank-when-not-up rule as the summary
                -- columns - a slow reading from before the device went down
@@ -6224,7 +6286,7 @@ export const OPS = {
      * collector) out of a scan that would otherwise open hundreds of
      * device-down alerts about synthetic hardware.
      */
-    alertScanDevices: () => laneQuery<{
+    alertScanDevices: (lossMinutes: number) => laneQuery<{
         name: string; host: string; status: string; transient: boolean;
         alerts_muted: boolean; snmp_enabled: boolean;
         poll_age_s: number; poll_interval_s: number;
@@ -6232,6 +6294,8 @@ export const OPS = {
         reboot_age_s: number | null; reboot_up_before_s: number | null; reboot_planned: boolean | null;
         /** Slice 66: the last identity change, aged the same way, and in words. */
         change_age_s: number | null; change_planned: boolean | null; change_text: string | null;
+        /** Slice 68: an outside target's loss over the last lossMinutes; NULL otherwise. */
+        ping_loss_pct: number | null;
     }>('alerts', `
         -- EFFECTIVE status merges both instruments (slice 9): ICMP-down wins
         -- over SNMP-up because ping notices in seconds what the 30s poll
@@ -6269,13 +6333,22 @@ export const OPS = {
                                      || ' ' || c.old_value || ' -> ' || c.new_value, '; ' ORDER BY c.id)
                      FROM device_changes c
                     WHERE c.device_id = devices.id AND c.ts >= devices.change_seen_ts - interval '1 second')
-               END AS change_text
+               END AS change_text,
+               -- Slice 68: an outside target's loss over the ping-loss
+               -- alert's window, from its minute rows' own counts. Only a
+               -- device with a live loss (an outside target) reads its rows.
+               CASE WHEN reach_loss_pct IS NOT NULL THEN (
+                   SELECT (100.0 * sum(p.lost) / nullif(sum(p.sent), 0))::float8
+                     FROM ping_samples p
+                    WHERE p.device_id = devices.id AND p.sent IS NOT NULL
+                      AND p.ts > now() - make_interval(mins => $1::int))
+               END AS ping_loss_pct
           FROM devices
          WHERE enabled = true
            -- Slice 35: last_poll_ts is the SNMP poll's stamp, so gating on it
            -- would exclude every ping-only device from the alert scan
            -- entirely - they would go down and nothing would ever raise.
-           AND (snmp_enabled = false OR last_poll_ts IS NOT NULL)`),
+           AND (snmp_enabled = false OR last_poll_ts IS NOT NULL)`, [lossMinutes]),
 
     /**
      * ENABLED versus POLLED, so the scan can tell a decision from a fault.

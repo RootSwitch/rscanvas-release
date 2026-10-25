@@ -28,6 +28,58 @@ const can = (action) => myCan.has(action);
 /** data-can may name alternatives separated by spaces: shown if ANY is held. */
 const canAny = (spec) => String(spec || '').split(/\s+/).filter(Boolean).some(can);
 
+// THE (i) (2026-10-24): every `.more-text` - the rest of an explanation -
+// gets a small button beside it and is shown on hover, on keyboard focus or
+// a tap, and closed by Esc or a click elsewhere (style.css says why). Run
+// at load for the page, and by whatever writes an explanation later. The
+// button names its text with aria-describedby, which a bare title does not
+// do for a phone or a screen reader.
+let moreSeq = 0;
+function enhanceExplainers(root = document) {
+    for (const text of root.querySelectorAll('.more-text:not([data-more])')) {
+        text.dataset.more = '1';
+        if (!text.id) text.id = `more-${++moreSeq}`;
+        text.setAttribute('role', 'tooltip');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'more';
+        btn.textContent = 'i';
+        btn.setAttribute('aria-label', 'more');
+        btn.setAttribute('aria-expanded', 'false');
+        btn.setAttribute('aria-describedby', text.id);
+        const wrap = document.createElement('span');
+        wrap.className = 'more-wrap';
+        text.replaceWith(wrap);
+        wrap.append(btn, text);
+        btn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const open = !btn.classList.contains('open');
+            closeExplainers();
+            if (open) { placeExplainer(wrap); btn.classList.add('open'); btn.setAttribute('aria-expanded', 'true'); }
+        });
+        wrap.addEventListener('mouseenter', () => placeExplainer(wrap));
+        btn.addEventListener('focus', () => placeExplainer(wrap));
+    }
+}
+/** Open it to the left when it would run off the window's right edge. */
+function placeExplainer(wrap) {
+    wrap.classList.remove('flip');
+    const r = wrap.getBoundingClientRect();
+    if (r.left + Math.min(544, window.innerWidth - 32) > window.innerWidth - 16) wrap.classList.add('flip');
+}
+function closeExplainers() {
+    for (const b of document.querySelectorAll('button.more.open')) {
+        b.classList.remove('open');
+        b.setAttribute('aria-expanded', 'false');
+    }
+}
+document.addEventListener('click', (ev) => {
+    if (!(ev.target instanceof Element) || !ev.target.closest('.more-wrap')) closeExplainers();
+});
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeExplainers(); });
+enhanceExplainers();
+
 async function api(path, opts) {
     const res = await fetch(path, { credentials: 'same-origin', ...opts });
     if (res.status === 401 || res.status === 403) return { ok: false, status: res.status };
@@ -1115,6 +1167,11 @@ async function rediscoverSelected(retrack) {
         if (d.goneAnswering?.length) {
             bits.push(`not listed by the agent but still reading, left tracked: ${d.goneAnswering.slice(0, 8).join(', ')}`);
         }
+        // Sensors the agent renumbered, followed with their history - and a
+        // CPU whose count changed renamed with it (2026-10-25).
+        if (d.repinned?.length) {
+            bits.push(`followed where the agent moved them (history kept): ${d.repinned.slice(0, 8).join(', ')}`);
+        }
         gate.appendChild(factLine(d.name, bits.join(' - ')));
     }
     for (const m of r.missing || []) gate.appendChild(factLine(m, 'no such device'));
@@ -1321,15 +1378,24 @@ const ROSTER_COLS = [
             // "down 7h", not "down 7h ago" (2026-10-22): the "ago" wrapped
             // production's rows to three lines; the hover has the time.
             const age = d.reach_since_ts ? ` ${fmtAgo(d.reach_since_ts).replace(/ ago$/, '')}` : '';
-            const c = pill(`${d.reach_state}${age}`,
+            // An outside target (slice 68) degraded by loss says how much:
+            // "degraded 15% loss", the age moving to the hover - the loss is
+            // the news, and the row stays one line.
+            const loss = d.reach_state === 'degraded' && d.reach_loss_pct !== null && d.reach_loss_pct !== undefined
+                ? ` ${Math.round(d.reach_loss_pct)}% loss` : null;
+            const c = pill(`${d.reach_state}${loss ?? age}`,
                 `badge ${d.reach_state === 'down' ? 'fail' : d.reach_state === 'degraded' ? 'warn' : ''}`);
             if (d.reach_since_ts) {
-                c.title = `${d.reach_state} since ${new Date(d.reach_since_ts).toLocaleString()} (${fmtAgo(d.reach_since_ts)})`;
+                c.title = `${d.reach_state} since ${new Date(d.reach_since_ts).toLocaleString()} (${fmtAgo(d.reach_since_ts)})`
+                    + (loss !== null ? ` - ${loss.trim()} of its pings over the last minute` : '');
             }
             return c;
         }
         const c = cell('');
         if (d.reach_rtt_ms !== null && d.reach_rtt_ms !== undefined) c.title = `up, ${d.reach_rtt_ms} ms at last transition`;
+        if (d.reach_loss_pct !== null && d.reach_loss_pct !== undefined) {
+            c.title = `${c.title || 'up'} - ${Math.round(d.reach_loss_pct)}% of its pings lost over the last minute`;
+        }
         return c;
     } },
     // Blank, not a placeholder: "-" in hundreds of rows says nothing, and an
@@ -3147,6 +3213,9 @@ let lastRestarts = null;
 // Slice 66, from /api/device: whether change alerts are on for the device on
 // screen - the same shape as restart alerts', null when unresolved.
 let lastChangeAlerts = null;
+/** Slice 68: the device on screen as an outside target - its setting, the
+ *  verdict, and its ping-loss alerts (null when it is not one). */
+let lastPingLoss = null;
 // Slice 65, from /api/device: the device's change-from-normal row and the
 // fleet's two switches ({ deviceOff, deviceRowId, singleOn, roomOn,
 // singleRowId, roomRowId, minHours }, null when unresolved).
@@ -3424,6 +3493,16 @@ function renderDeviceAlerts() {
     }
 }
 
+/** Why a device's ping reads degraded, in words. An outside target (slice
+ *  68) degraded by loss says how much; anything else is slow or patchy. */
+function degradedNote(dev) {
+    const since = fmtAgo(dev.reach_since_ts) || 'the last transition';
+    if (dev.reach_loss_pct !== null && dev.reach_loss_pct !== undefined) {
+        return `${Math.round(dev.reach_loss_pct)}% of its pings lost over the last minute - degraded since ${since}`;
+    }
+    return `intermittent ICMP since ${since}`;
+}
+
 function renderEntities(data) {
     // A REDRAW IS A DATA REFRESH, and an open editor is user state the data
     // knows nothing about. The 10s refresh cycle re-renders this panel, and
@@ -3449,6 +3528,8 @@ function renderEntities(data) {
         renderRestarts();
         lastChangeAlerts = data.changeAlerts ?? null;
         syncChangeControl();
+        lastPingLoss = data.pingLoss ?? null;
+        syncPingLossControls();
         lastTempChange = data.tempChange ?? null;
         syncTempChangeControl();
     }
@@ -3686,7 +3767,7 @@ function renderEntities(data) {
                 notes.push(['not answering', `no ICMP response since ${fmtAgo(dev.reach_since_ts) || 'the last transition'}`
                     + ' - this device is watched by ping only, so this is everything there is to know']);
             } else if (dev.reach_state === 'degraded') {
-                notes.push(['ping degraded', `intermittent ICMP since ${fmtAgo(dev.reach_since_ts) || 'the last transition'}`]);
+                notes.push(['ping degraded', degradedNote(dev)]);
             } else if (dev.reach_state === 'unknown') {
                 notes.push(['not probed yet', 'added, and the next ping sweep will say - within one sweep interval']);
             }
@@ -3716,7 +3797,7 @@ function renderEntities(data) {
         } else if (dev.reach_state === 'down') {
             notes.push(['not pinging', `no ICMP response since ${fmtAgo(dev.reach_since_ts) || 'the last transition'}`]);
         } else if (dev.reach_state === 'degraded') {
-            notes.push(['ping degraded', `intermittent ICMP since ${fmtAgo(dev.reach_since_ts) || 'the last transition'}`]);
+            notes.push(['ping degraded', degradedNote(dev)]);
         } else if (dev.status === 'down') {
             // The diagnosis worth naming: the box is up and its agent is not.
             notes.push(['but pinging', `the host answers ICMP, so this is the SNMP agent or its credential (${dev.credential_ref || 'fleet default'}), not the device`]);
@@ -3737,10 +3818,16 @@ function renderEntities(data) {
         // Always shown when there is anything to show, muted, because "is it
         // fine" is a question too. It becomes a NOTE - amber, in the banner
         // proper - only past a threshold, so the healthy case stays quiet.
-        const parts = [];
+        //
+        // A TABLE (2026-10-24, the operator's polish notes): one row per
+        // instrument - ping, SNMP, poll lag - with what it reads now and over
+        // its recent window, where it was one sentence of five facts joined
+        // by dashes. Availability rides the ping row it comes from.
+        const resp = [];   // [instrument, now, recent, detail, warn?]
         if (lastSnmpRtt && lastSnmpRtt.samples > 0) {
             const med = Math.round(lastSnmpRtt.medianMs);
-            parts.push(`SNMP ${med} ms median over the last hour (worst ${Math.round(lastSnmpRtt.maxMs)} ms)`);
+            resp.push(['SNMP', '', `${med} ms median, ${Math.round(lastSnmpRtt.maxMs)} ms worst (last hour)`,
+                dev.credential_ref ? `credential ${dev.credential_ref}` : '', false]);
             // Slot share only when the server told us its slot count; a
             // typed 24 here would be a constant that drifts.
             const share = lastPollSlots ? (lastSnmpRtt.medianMs / 1000) / ((dev.poll_interval_s || 30) * lastPollSlots) * 100 : null;
@@ -3750,12 +3837,26 @@ function renderEntities(data) {
                     + '. Not starvation (slots are parallel), but the number that says how close it is.']);
             }
         }
-        if (dev.ping_rtt_ms !== null && dev.ping_rtt_ms !== undefined) {
-            parts.push(`ping ${dev.ping_rtt_ms < 1 ? '<1' : Math.round(dev.ping_rtt_ms)} ms`);
+        // Availability (easy-win E4), from the misses ping_samples already
+        // distinguishes from absence: probed-and-unanswered is a NULL-rtt
+        // row, not-probed is no row, and the fraction only exists because
+        // that line was drawn at the schema. Absent history says nothing -
+        // a device with no probes must not read as 100%.
+        const avail = lastAvailability && lastAvailability.probes > 0 ? lastAvailability : null;
+        const availPct = avail ? (100 * (avail.probes - avail.misses)) / avail.probes : null;
+        const hasPingNow = dev.ping_rtt_ms !== null && dev.ping_rtt_ms !== undefined;
+        if (hasPingNow || avail) {
+            resp.unshift(['ping',
+                hasPingNow ? `${dev.ping_rtt_ms < 1 ? '<1' : Math.round(dev.ping_rtt_ms)} ms` : '',
+                avail ? `${availPct.toFixed(availPct === 100 ? 0 : 1)}% answered (24 h, ${avail.probes - avail.misses} of ${avail.probes})` : '',
+                // An outside target (slice 68): its loss over the last minute.
+                dev.reach_loss_pct !== null && dev.reach_loss_pct !== undefined
+                    ? `${Math.round(dev.reach_loss_pct)}% of its pings lost (last minute)` : '',
+                avail !== null && avail.misses > 0]);
         }
         if (dev.poll_lag_ms !== null && dev.poll_lag_ms !== undefined) {
             const lag = Math.round(dev.poll_lag_ms);
-            parts.push(`poll lag ${lag < 1000 ? `${lag} ms` : `${(lag / 1000).toFixed(1)}s`}`);
+            resp.push(['poll lag', lag < 1000 ? `${lag} ms` : `${(lag / 1000).toFixed(1)}s`, '', 'how late the last poll started', false]);
             // Lag past a third of the interval means the scheduler is not
             // reaching this device on time - either it is being starved or the
             // fleet has outgrown its slots. Either way it is a finding.
@@ -3763,13 +3864,25 @@ function renderEntities(data) {
                 notes.push(['polled late', `the last poll started ${(lag / 1000).toFixed(1)}s after it was due - the scheduler is not keeping up with this device`]);
             }
         }
-        // A ping-only device HAS no credential (slice 36) - naming one it
-        // never uses is the page describing a machine it is not looking at.
-        if (dev.credential_ref && dev.snmp_enabled !== false) parts.push(`credential ${dev.credential_ref}`);
-        if (parts.length > 0) {
-            const line = factLine('responsiveness', parts.join('  -  '));
-            line.classList.add('muted');
-            // The line is the summary; the CHART is the investigation. Two
+        // A ping-only device HAS no credential (slice 36) - the SNMP row,
+        // which names it, only exists for a device that is polled.
+        if (resp.length > 0) {
+            const table = document.createElement('table');
+            table.className = 'list compact resp-table';
+            const head = document.createElement('thead');
+            head.append(rowEl(['', 'now', 'recent', ''].map((t) => {
+                const th = document.createElement('th');
+                th.textContent = t;
+                return th;
+            })));
+            const body = document.createElement('tbody');
+            for (const [name, now, recent, detail, warn] of resp) {
+                const r = rowEl([cell(name, 'muted'), cell(now, 'num'), cell(recent), cell(detail, 'muted')]);
+                if (warn) r.children[2].classList.add('cell-warn');
+                body.appendChild(r);
+            }
+            table.append(head, body);
+            // The table is the summary; the CHART is the investigation. Two
             // instruments can fill it now, so the gate is "is there ANY
             // history" - gating on SNMP samples alone left a ping-only
             // device with no way to reach the latency chart this slice
@@ -3778,27 +3891,13 @@ function renderEntities(data) {
             const hasSnmp = lastSnmpRtt && lastSnmpRtt.samples > 0;
             const hasPing = dev.snmp_enabled === false || dev.reach_state !== 'unknown';
             if (hasSnmp || hasPing) {
-                line.classList.add('clickable');
-                line.title = hasSnmp
+                table.classList.add('clickable');
+                table.title = hasSnmp
                     ? 'click for round-trip history - SNMP and ping'
                     : 'click for ping latency history';
-                line.addEventListener('click', () => openRttChart(currentDevice));
+                table.addEventListener('click', () => openRttChart(currentDevice));
             }
-            state.appendChild(line);
-        }
-        // Availability (easy-win E4), from the misses ping_samples already
-        // distinguishes from absence: probed-and-unanswered is a NULL-rtt
-        // row, not-probed is no row, and the fraction only exists because
-        // that line was drawn at the schema. Absent history says nothing -
-        // a device with no probes must not read as 100%.
-        if (lastAvailability && lastAvailability.probes > 0) {
-            const a = lastAvailability;
-            const pct = (100 * (a.probes - a.misses)) / a.probes;
-            const line = factLine('availability (24h)',
-                `${pct.toFixed(pct === 100 ? 0 : 1)}% - answered ${a.probes - a.misses} of ${a.probes} probes`);
-            line.classList.add('muted');
-            if (a.misses > 0) line.classList.add('cell-warn');
-            state.appendChild(line);
+            state.appendChild(table);
         }
     }
     for (const [k, v] of notes) state.appendChild(factLine(k, v));
@@ -3890,24 +3989,20 @@ function renderDeviceHeader() {
     }
 }
 
-// MODIFY (2026-09-25): the edit block is folded by default and remembers the
-// choice per browser, so an operator doing a round of edits is not re-opening
-// it on every device. Browser storage can be absent (private windows), and
-// the page works the same without it - folded.
-const EDIT_OPEN_KEY = 'rscanvas.deviceEditOpen';
+// MODIFY: the edit block is folded, and opens for the device on screen. It
+// remembered being open per browser from 2026-09-25, so a round of edits did
+// not mean re-opening it on every device - and that read as the panel
+// following the operator from device to device, under a "Done" button for a
+// panel where every tick had already saved (the operator, 2026-10-24). Now
+// it closes when another device opens, and the button says "Close".
 function setDeviceEditOpen(open) {
     $('device-edit').classList.toggle('hidden', !open);
     $('device-modify').setAttribute('aria-expanded', String(open));
-    $('device-modify').textContent = open ? 'Done' : 'Modify';
+    $('device-modify').textContent = open ? 'Close' : 'Modify';
 }
 $('device-modify').addEventListener('click', () => {
-    const open = $('device-edit').classList.contains('hidden');
-    setDeviceEditOpen(open);
-    try { localStorage.setItem(EDIT_OPEN_KEY, open ? '1' : '0'); } catch { /* per-browser nicety only */ }
+    setDeviceEditOpen($('device-edit').classList.contains('hidden'));
 });
-function deviceEditRemembered() {
-    try { return localStorage.getItem(EDIT_OPEN_KEY) === '1'; } catch { return false; }
-}
 
 async function showDevice(name) {
     // currentDevice is set NOW and re-checked after the fetch: two quick row
@@ -3949,10 +4044,11 @@ async function showDevice(name) {
         lastRestartAlerts = null; lastRestarts = null; $('restart-msg').textContent = '';
         syncRestartControl(); renderRestarts();
         lastChangeAlerts = null; $('change-msg').textContent = ''; syncChangeControl();
+        lastPingLoss = null; $('outside-msg').textContent = ''; $('pingloss-msg').textContent = ''; syncPingLossControls();
         lastTempChange = null; $('tempchange-msg').textContent = ''; syncTempChangeControl();
         openCardSettings.clear();
     }
-    if (arriving) setDeviceEditOpen(deviceEditRemembered());
+    if (arriving) setDeviceEditOpen(false);
     renderDeviceHeader();
     $('grouping-msg').textContent = '';
     $('rename-msg').textContent = '';
@@ -4385,6 +4481,99 @@ $('dev-change-fleet').addEventListener('click', async () => {
     await showDevice(currentDevice);
 });
 
+// OUTSIDE TARGET and PING LOSS ALERTS for the device on screen (slice 68).
+// The setting is the device's own (auto by its address, yes, no); the
+// verdict comes from the server, which decides it by the collector's rule.
+// The alert row is change alerts' twin and shows only for an outside target.
+function syncPingLossControls() {
+    const pl = lastPingLoss;
+    const sel = $('dev-outside');
+    sel.value = pl?.setting ?? 'auto';
+    sel.disabled = pl === null;
+    $('dev-outside-verdict').textContent = pl === null ? ''
+        : pl.outside ? `outside - ${pl.pings} pings a sweep, down only when all are lost, degraded on loss`
+            : pl.setting === 'auto' ? 'not outside - a private address, one ping a sweep'
+                : 'not outside - one ping a sweep';
+    const pa = pl?.alerts ?? null;
+    $('dev-pingloss-row').classList.toggle('hidden', pa === null);
+    const box = $('dev-pingloss-alerts');
+    box.checked = pa?.on === true;
+    box.disabled = pa === null;
+    const plText = $('dev-pingloss-text');
+    plText.replaceChildren();
+    if (pl !== null) {
+        const more = document.createElement('span');
+        more.className = 'more-text';
+        more.textContent = 'Cleared when it stops losing them. Never while it is down - that is device-down\'s alert.'
+            + ' Its loss is on the roster and its timeline either way.';
+        plText.append(`a warn when it loses ${pl.levelPct}% of its pings over ${pl.minutes} minutes`, more);
+        enhanceExplainers(plText);
+    }
+    $('dev-pingloss-fleet').textContent = pa?.fleetOn ? 'turn off for every outside target' : 'turn on for every outside target';
+}
+
+$('dev-outside').addEventListener('change', async () => {
+    if (currentDevice === null || lastPingLoss === null) return;
+    const want = $('dev-outside').value;
+    const r = await api('/api/device/outside', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: currentDevice, outside: want }),
+    });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        $('dev-outside').value = lastPingLoss.setting;
+        $('outside-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('outside-msg').textContent = 'saved - the next ping sweep uses it';
+    await showDevice(currentDevice);
+});
+
+$('dev-pingloss-alerts').addEventListener('change', async () => {
+    const pa = lastPingLoss?.alerts ?? null;
+    if (currentDevice === null || pa === null) return;
+    const box = $('dev-pingloss-alerts');
+    const want = box.checked;
+    const r = want === pa.fleetOn
+        ? (pa.deviceRowId
+            ? await api('/api/thresholds/delete', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id: pa.deviceRowId }),
+            })
+            : { ok: true })
+        : await saveThreshold({ kind: 'ping-loss', host: currentDevice, code: null, warn: null, crit: null,
+            enabled: want, note: want ? 'ping loss alerts on' : 'ping loss alerts off' });
+    if (r.status === 401) { showLogin(); return; }
+    if (!r.ok) {
+        box.checked = !want;
+        $('pingloss-msg').textContent = r.detail || `refused (${r.status})`;
+        return;
+    }
+    $('pingloss-msg').textContent = want ? 'ON' : 'OFF - its loss is still on the roster and its timeline';
+    await showDevice(currentDevice);
+});
+
+$('dev-pingloss-fleet').addEventListener('click', async () => {
+    const pa = lastPingLoss?.alerts ?? null;
+    if (currentDevice === null || pa === null) return;
+    const want = !pa.fleetOn;
+    if (!window.confirm(want
+        ? 'Turn ping loss alerts on for every outside target? A big download can cost an internet path some of its pings, so expect one while a large one runs. A device given its own setting here keeps it.'
+        : 'Turn ping loss alerts off for every outside target? A device turned on here keeps its own setting.')) return;
+    const r = !want && pa.fleetRowId
+        ? await api('/api/thresholds/delete', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: pa.fleetRowId }),
+        })
+        : await saveThreshold({ kind: 'ping-loss', host: null, code: null, warn: null, crit: null,
+            enabled: want, note: want ? 'ping loss alerts on for every outside target' : 'ping loss alerts off for every outside target' });
+    if (r.status === 401) { showLogin(); return; }
+    $('pingloss-msg').textContent = r.ok
+        ? (want ? 'ON for every outside target without its own setting' : 'OFF for every outside target without its own setting')
+        : (r.detail || `refused (${r.status})`);
+    await showDevice(currentDevice);
+});
+
 // --- the device timeline (IDEAS-2026-10-15 item 4) ------------------------------
 //
 // What happened to the device on screen, newest first, from /api/device/
@@ -4430,7 +4619,10 @@ function timelineWords(e) {
         // A device's first ping comes from "unknown"; RSCanvas's own
         // restarts, the other changes to or from it, the server leaves out.
         case 'reach': return [d.first ? `first ping: ${d.to}` : `ping ${d.from} to ${d.to}`,
-            d.rtt != null ? `${Number(d.rtt).toFixed(1)} ms` : ''];
+            [d.rtt != null ? `${Number(d.rtt).toFixed(1)} ms` : '',
+                // An outside target (slice 68): its loss when the state moved.
+                d.loss != null ? `${Math.round(Number(d.loss))}% of its pings lost over the last minute` : '']
+                .filter(Boolean).join(', ')];
         case 'restart': return ['restarted', `the device or its SNMP agent, after at least ${fmtRuntime(d.upBefore)} up`
             + (d.planned ? ' - inside a maintenance window, so it raised nothing' : '')];
         // Slice 66: its OS, hardware or boot firmware, old and new.
@@ -5147,18 +5339,28 @@ let lastSearchParams = null;
  *  most recent messages each time it is opened. */
 let searchedByUser = false;
 
+// ONE LINE A MESSAGE (2026-10-24, the operator's polish notes; the Devices
+// rule of 10-22): an app of "/usr/sbin/cron" or a trap's varbinds made one
+// message three lines tall. Host and app are cut at a width, the message at
+// the window's edge, each whole on hover; a click opens the row to its full
+// text and another folds it, so nothing is lost - only folded.
 function renderResultRows(rows) {
     const tbody = $('results').querySelector('tbody');
     tbody.replaceChildren();
     for (const row of rows) {
         const ts = new Date(row.ts);
-        tbody.appendChild(rowEl([
-            cell(ts.toLocaleString(), 'ts'),
-            sevPill(row.severity),
-            cell(row.host),
-            cell(row.app),
-            cell(row.msg, 'msg'),
-        ]));
+        const host = cell(row.host, 'clip');
+        host.title = row.host ?? '';
+        const app = cell(row.app, 'clip');
+        app.title = row.app ?? '';
+        const tr = rowEl([cell(ts.toLocaleString(), 'ts'), sevPill(row.severity), host, app, cell(row.msg, 'msg')]);
+        tr.classList.add('clickable');
+        tr.title = 'click to open the whole message';
+        tr.addEventListener('click', () => {
+            const open = tr.classList.toggle('unfolded');
+            tr.title = open ? 'click to fold it back to one line' : 'click to open the whole message';
+        });
+        tbody.appendChild(tr);
     }
 }
 
@@ -5878,6 +6080,7 @@ function showSection(name) {
         renderDashAlerts();
         loadDashGroups();
         loadDashServices();
+        loadDashBoards();
         if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
     }
     // Reports (2026-10-16): the interface report's device list and chips,
@@ -6171,11 +6374,13 @@ function renderDashGroup(tableId, groups, noneLabel) {
     table.querySelector('th.dash-other').classList.toggle('hidden', !anyOther);
     if (groups.length === 0) {
         const tr = rowEl([cell('no devices yet', 'muted small')]);
-        tr.firstChild.colSpan = 4;
+        tr.firstChild.colSpan = 5;
         tbody.appendChild(tr);
         return;
     }
     for (const g of groups) {
+        // Degraded (2026-10-24): up, with an alert or a degraded ping.
+        const degraded = cell(String(g.degraded ?? 0), g.degraded > 0 ? 'num cell-warn' : 'num muted');
         const down = cell(String(g.down), g.down > 0 ? 'num cell-crit' : 'num muted');
         const other = cell(String(g.other), g.other > 0 ? 'num cell-warn' : 'num muted');
         if (!anyOther) other.classList.add('hidden');
@@ -6183,7 +6388,7 @@ function renderDashGroup(tableId, groups, noneLabel) {
             // No location or application is a group of its own, last: leaving
             // the untagged out would report better coverage than exists.
             g.value === null ? cell(noneLabel, 'muted') : cell(g.value),
-            cell(String(g.up), g.up > 0 ? 'num cell-ok' : 'num muted'), down, other,
+            cell(String(g.up), g.up > 0 ? 'num cell-ok' : 'num muted'), degraded, down, other,
         ]);
         const axis = tableId === 'dash-loc' ? 'location' : 'application';
         const what = g.value === null ? `with no ${axis}` : `in "${g.value}"`;
@@ -6196,6 +6401,39 @@ function renderDashGroup(tableId, groups, noneLabel) {
         }
         tbody.appendChild(tr);
     }
+}
+
+// THE BOARDS on the Dashboard (2026-10-24): each wall board's name, what it
+// shows, and its display a click away. Fetched when the Dashboard opens and
+// then at most every five minutes - the list's query works out each board's
+// drift too, and boards change when somebody makes one, not every 10 s.
+let dashBoardsAt = 0;
+async function loadDashBoards() {
+    if (!can('board.read') || Date.now() - dashBoardsAt < 300_000) return;
+    dashBoardsAt = Date.now();
+    const r = await api('/api/boards');
+    if (!r.ok) { dashBoardsAt = 0; return; }
+    const walls = (r.boards || []).filter((b) => b.collection === 'wall')
+        .sort((a, b) => Number(a.id) - Number(b.id));
+    const list = $('dash-boards-list');
+    list.replaceChildren();
+    for (const b of walls) {
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.href = `./wall.html?board=${encodeURIComponent(b.id)}`;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = b.name;
+        a.title = 'open its display in a new tab';
+        const what = document.createElement('span');
+        what.className = 'muted small';
+        what.textContent = b.source_axis === null ? ' drawn by hand'
+            : ` ${Array.isArray(b.source_values) ? b.source_values.join(', ') : `every ${b.source_axis}`}`
+                + (b.section_axis ? `, by ${b.section_axis}` : '');
+        li.append(a, what);
+        list.appendChild(li);
+    }
+    $('dash-boards').classList.toggle('hidden', walls.length === 0);
 }
 
 async function loadDashGroups() {
@@ -6211,9 +6449,9 @@ async function loadDashGroups() {
     // Every device sits in exactly one location group, so those rows sum to
     // the whole.
     const sum = (k) => locations.reduce((n, g) => n + (Number(g[k]) || 0), 0);
-    const up = sum('up'), down = sum('down'), other = sum('other');
-    $('dash-groups-sub').textContent = up + down + other === 0 ? ''
-        : `${up} up, ${down} down${other > 0 ? `, ${other} pending/unknown` : ''} - transient devices not counted`;
+    const up = sum('up'), degraded = sum('degraded'), down = sum('down'), other = sum('other');
+    $('dash-groups-sub').textContent = up + degraded + down + other === 0 ? ''
+        : `${up} up, ${degraded} degraded, ${down} down${other > 0 ? `, ${other} pending/unknown` : ''} - transient devices not counted`;
 }
 
 // --- service health (2026-10-07, SLICE-SERVICE-VIEWS-PLAN part A) ----------------
@@ -7453,6 +7691,7 @@ function showGridEditor(b) {
     divide.value = b.section_axis ?? '';
     const checks = $('grid-checks');
     checks.replaceChildren();
+    $('grid-shown').replaceChildren();   // this board's, not the last one's
     // FIRST TIME ONLY (slice 34): a board that has never had a grid opens
     // with the sensible value fields ticked, so switching grid mode on does
     // not produce a wall of bare names. It is a SUGGESTION, not a stored
@@ -7481,8 +7720,36 @@ function showGridEditor(b) {
             tag.title = 'Names a thing rather than measuring it - showing it widens what a display can reveal';
             lab.appendChild(tag);
         }
+        box.addEventListener('change', () => renderGridShown(gridShownTicks()));
         checks.appendChild(lab);
     }
+    // Slice 69: what its displays show by default - every allowed field
+    // until somebody says otherwise (grid_shown NULL).
+    renderGridShown(Array.isArray(b.grid_shown) ? new Set(b.grid_shown) : null);
+}
+
+/** The "shown by default" ticks (slice 69), one per ALLOWED field. null
+ *  ticks them all; a field newly allowed is ticked, so allowing a field
+ *  shows it unless somebody says otherwise. */
+function renderGridShown(ticked) {
+    const before = new Set([...$('grid-shown').querySelectorAll('input')].map((x) => x.dataset.key));
+    const box = $('grid-shown');
+    box.replaceChildren();
+    for (const allowed of $('grid-checks').querySelectorAll('input:checked')) {
+        const f = lastGridFields.find((g) => g.key === allowed.dataset.key);
+        if (!f) continue;
+        const lab = document.createElement('label');
+        lab.className = 'small';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.dataset.key = f.key;
+        cb.checked = ticked === null || ticked.has(f.key) || (before.size > 0 && !before.has(f.key));
+        lab.append(cb, ` ${f.label}`);
+        box.appendChild(lab);
+    }
+}
+function gridShownTicks() {
+    return new Set([...$('grid-shown').querySelectorAll('input:checked')].map((x) => x.dataset.key));
 }
 
 $('grid-close').addEventListener('click', () => {
@@ -7503,10 +7770,14 @@ $('grid-save').addEventListener('click', async () => {
     const cols = $('grid-auto').checked ? 0 : raw === '' ? (manualLayout ? null : 0) : Number(raw);
     const fields = [...$('grid-checks').querySelectorAll('input:checked')].map((x) => x.dataset.key);
     const sectionAxis = $('grid-section').value || null;
+    // Every allowed field ticked is "all of them" (null), so a field allowed
+    // later is shown too - the way boards behaved before the split.
+    const shownTicks = [...gridShownTicks()].filter((k) => fields.includes(k));
+    const shown = shownTicks.length === fields.length ? null : shownTicks;
     const r = await api(`/api/boards/${encodeURIComponent(gridBoard.id)}/grid`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cols, fields, sectionAxis }),
+        body: JSON.stringify({ cols, fields, sectionAxis, shown }),
     });
     if (r.status === 401) { showLogin(); return; }
     $('grid-msg').textContent = r.ok
@@ -8268,6 +8539,7 @@ async function refreshRound(opts) {
         renderDashAlerts();
         loadDashGroups();
         loadDashServices();
+        loadDashBoards();
         if (Date.now() - dashLoadedAt > 60_000) loadDashboard();
     }
     if (devices?.ok) { devicesFetchedAt = now; renderDevices(devices); }

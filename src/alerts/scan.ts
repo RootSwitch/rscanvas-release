@@ -51,9 +51,10 @@ import { mergeOverrides } from './overrides.ts';
 import { groupConditions } from './groups.ts';
 import { fanStopConditions } from './fanstop.ts';
 import { deviceChangeConditions } from './changes.ts';
+import { pingLossConditions } from './pingloss.ts';
 import {
     evaluate, buildOverrideIndex, REBOOT_DEFAULT, TEMP_CHANGE_DEFAULT, TEMP_ROOM_DEFAULT, FAN_STOPPED_DEFAULT,
-    DEVICE_CHANGE_DEFAULT,
+    DEVICE_CHANGE_DEFAULT, PING_LOSS_DEFAULT,
     type Condition, type RulesConfig, type ScanDoc, type ScanInterface, type ScanMetric, type ScanService,
 } from './rules.ts';
 import {
@@ -127,6 +128,8 @@ export const DEFAULT_RULES: RulesConfig = {
     fanStopped: FAN_STOPPED_DEFAULT,
     // A change to what a device is (slice 66): off - rules.ts DEVICE_CHANGE_DEFAULT says why.
     deviceChange: DEVICE_CHANGE_DEFAULT,
+    // An outside target losing pings (slice 68): off - rules.ts PING_LOSS_DEFAULT says why.
+    pingLoss: PING_LOSS_DEFAULT,
     overrides: [],
 };
 
@@ -154,6 +157,7 @@ export function loadRulesConfig(): RulesConfig {
         tempRoom: parsed.tempRoom ?? DEFAULT_RULES.tempRoom,
         fanStopped: parsed.fanStopped ?? DEFAULT_RULES.fanStopped,
         deviceChange: parsed.deviceChange ?? DEFAULT_RULES.deviceChange,
+        pingLoss: parsed.pingLoss ?? DEFAULT_RULES.pingLoss,
         overrides: parsed.overrides ?? [],
     };
 }
@@ -296,7 +300,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     else console.warn(`[scan] threshold_overrides unreadable (${rows.reason}) - evaluating with env/default thresholds this scan`);
     const mCfg = machineCfg();
 
-    const devices = await OPS.alertScanDevices();
+    const devices = await OPS.alertScanDevices(CONFIG.pingLossAlertMin);
     if (!devices.ok) throw new Error(`lane refused the device roster (${devices.reason})`);
     const ifaces = await OPS.alertScanInterfaces();
     if (!ifaces.ok) throw new Error(`lane refused the interface view (${ifaces.reason})`);
@@ -381,6 +385,7 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
             muted: d.alerts_muted,
             rebootAgeS: d.reboot_age_s, rebootUpBeforeS: d.reboot_up_before_s, rebootPlanned: d.reboot_planned,
             changeAgeS: d.change_age_s, changeText: d.change_text, changePlanned: d.change_planned,
+            pingLossPct: d.ping_loss_pct,
         })),
         // THE GHOST GATE (src/alerts/ghosts.ts): a row whose went-quiet
         // stamp outlived the horizon leaves the doc entirely, so its
@@ -440,6 +445,9 @@ export async function scanTick(now = new Date()): Promise<ScanResult> {
     // A CHANGE TO WHAT A DEVICE IS (slice 66), off unless turned on: the
     // roster's last recorded change, shaped like a restart (alerts/changes.ts).
     conditions.push(...deviceChangeConditions(doc, cfg));
+    // PING LOSS ON AN OUTSIDE TARGET (slice 68), off unless turned on: its
+    // loss over the alert's window, read with the roster (alerts/pingloss.ts).
+    conditions.push(...pingLossConditions(doc, cfg, CONFIG.pingLossAlertPct, CONFIG.pingLossAlertMin));
 
     // The watchdog rides the same machinery as every real alert: raised by
     // the counters, cleared by the counters, visible in history. Severity

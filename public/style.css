@@ -597,7 +597,9 @@ table.list.no-select tr > :first-child { display: none; }
  * narrow one; compact rows, because ten of them have to fit a glance. */
 .dash-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    /* min(420px, 100%): never wider than the screen - at 420 px a phone's
+       page widened to fit one widget (found 2026-10-24). */
+    grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
     gap: 12px 16px;
     margin-top: 8px;
 }
@@ -657,3 +659,83 @@ table.list tr.total-row td { font-weight: 600; border-top: 1px solid var(--se-bo
 /* The sites and web/TCP tables scroll sideways in their frames on a narrow
    screen, so a cell keeps to one line rather than stacking a name. */
 #dash-sites td, #dash-svcs td { white-space: nowrap; }
+
+/* THE (i) (2026-10-24, the operator's polish notes): a control says what it
+   is and what it does in one short line, and the rest of the explanation
+   sits behind a small (i) - open on hover, on keyboard focus, or on a tap,
+   closed by Esc or a click elsewhere (app.js enhanceExplainers adds the
+   button beside every .more-text). The text is the whole explanation, not
+   a cut of it: the details an operator needs were moved, not dropped. */
+.more-wrap { position: relative; display: inline-block; vertical-align: baseline; }
+button.more {
+    font: italic 600 10px/1 Georgia, serif;
+    width: 15px; height: 15px; padding: 0; margin: 0 2px;
+    border-radius: 50%; border: 1px solid var(--se-txt-dim);
+    color: var(--se-txt-dim); background: transparent; cursor: help;
+}
+button.more:hover, button.more:focus-visible, button.more.open { color: var(--se-txt); border-color: var(--se-txt); }
+.more-text {
+    display: none; position: absolute; top: calc(100% + 4px); left: 0; z-index: 60;
+    width: max-content; max-width: min(34rem, calc(100vw - 32px));
+    padding: 8px 10px; border: 1px solid var(--se-border); border-radius: 6px;
+    background: var(--se-panel-2); color: var(--se-txt);
+    font-size: 12px; font-style: normal; line-height: 1.45; white-space: normal; text-align: left;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+}
+.more-wrap.flip .more-text { left: auto; right: 0; }
+.more-wrap:hover .more-text, button.more:focus-visible + .more-text, button.more.open + .more-text { display: block; }
+
+/* The Modify panel's groups (2026-10-24): the device, its grouping, how it
+   is monitored, its alerts - small headings over rows that save as they
+   change. */
+.device-edit .edit-note { margin: 2px 0 6px; }
+.device-edit h3.edit-group {
+    margin: 12px 0 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--se-txt-dim);
+    border-bottom: 1px solid var(--se-border); padding-bottom: 2px;
+}
+
+/* The device page's responsiveness (2026-10-24): one row per instrument,
+   now and recent, where it was one sentence of five facts. */
+table.resp-table { width: auto; margin: 4px 0 6px; }
+table.resp-table td { white-space: nowrap; padding-right: 16px; }
+table.resp-table.clickable { cursor: pointer; }
+
+/* Logs, one line a message (2026-10-24): host and app cut at the clip
+   width, the message at the table's edge - the zero max-width lets it take
+   what the row has left and no more - and a clicked row unfolds whole. */
+#results td { white-space: nowrap; }
+#results td.msg { max-width: 0; width: 100%; overflow: hidden; text-overflow: ellipsis; }
+#results tr.unfolded td { white-space: pre-wrap; overflow-wrap: anywhere; }
+#results tr.unfolded td.clip { max-width: none; }
+
+/* The Dashboard's boards (2026-10-24), in the space beside the checks'
+   counts that was always empty. */
+.dash-svc-top { display: flex; flex-wrap: wrap; gap: 8px 28px; align-items: flex-start; }
+.dash-boards h3 { margin: 0 0 4px; }
+.dash-boards ul { margin: 0; padding-left: 18px; }
+.dash-boards li { margin: 2px 0; white-space: nowrap; }
+
+/* A phone's top bar (2026-10-24): the bar's eight controls laid out 621 px
+   wide on a 375 px screen and dragged the whole page sideways. Below 640 px
+   the mark stands without its name, the labels are kept for screen readers
+   only, and Width goes - the normal page is already wider than a phone, so
+   wide has nothing to add; a wide set earlier keeps the normal margins.
+   What is left fits one row down to 320 px: the mark and Sign out keep
+   their size, the theme menu narrows, and your name and the refresh time
+   take two lines. */
+@media (max-width: 640px) {
+    #topbar { gap: 8px; padding: 0 8px; }
+    #whoami, #refreshed, #theme-select { min-width: 0; }
+    #topbar .brand, #logout { flex-shrink: 0; }
+    #logout { white-space: nowrap; }
+    #topbar .brand-name { display: none; }
+    #topbar label {
+        position: absolute; width: 1px; height: 1px; overflow: hidden;
+        clip-path: inset(50%); white-space: nowrap;
+    }
+    #topbar label[for="width-select"], #width-select { display: none; }
+    #theme-select { max-width: 7.5rem; }
+    #whoami, #refreshed { line-height: 1.15; }
+    body.wide #main { padding-left: 16px; padding-right: 16px; }
+}

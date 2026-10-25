@@ -489,6 +489,14 @@ export function sensorSample(
 // NEVER inserts, never deletes, never touches tracked: the discover-if-NONE
 // rule exists so a deleted junk sensor stays deleted, and a repin pass that
 // resurrected it every midnight would be that rule's defeat.
+//
+// Renames ONE name (2026-10-25): the HOST-RESOURCES CPU row's, which is the
+// probe's own count ("CPU (4 cores)", probe.ts), not an identity. Production's
+// GPU server, given 10 vCPUs where it had 4, re-pinned to ten processors and went
+// on reading "CPU (4 cores)" on its card and its alerts, because the plan's
+// name was never written - and once the instruction was current the plan was
+// empty, so nothing ever would be. Nothing is keyed by it (overrides by code,
+// baselines by id). Every other name stays: a disk's IS its identity (rule 2).
 
 export interface RepinExisting {
     id: string; kind: string; snmp_index: string | null;
@@ -510,10 +518,25 @@ function canonical(x: unknown): string {
 /** The index of an hrStorage row is the agent's mount order, not its identity. */
 const indexIsVolatile = (x: { extra: SensorExtra | null }): boolean => x.extra?.style === 'hr-storage';
 
+/** The CPU row's counted name, as the probe writes it. */
+const CPU_COUNT_NAME = /^CPU \(\d+ cores?\)$/;
+
+/** The new name when a counted CPU row's count changed, else null. */
+function cpuRename(row: RepinExisting, d: RepinDiscovered): { from: string; to: string } | null {
+    if (row.kind !== 'cpu' || row.name === null || row.name === d.name) return null;
+    return CPU_COUNT_NAME.test(row.name) && CPU_COUNT_NAME.test(d.name) ? { from: row.name, to: d.name } : null;
+}
+
+export interface RepinMove {
+    id: string; snmpIndex: string; name: string; extra: SensorExtra;
+    /** Present only when the row's name changes with it (the counted CPU). */
+    rename?: { from: string; to: string };
+}
+
 export function planSensorRepin(
     discovered: RepinDiscovered[], existing: RepinExisting[],
-): Array<{ id: string; snmpIndex: string; name: string; extra: SensorExtra }> {
-    const out: Array<{ id: string; snmpIndex: string; name: string; extra: SensorExtra }> = [];
+): RepinMove[] {
+    const out: RepinMove[] = [];
     const claimedRows = new Set<string>();
     const claimedFinds = new Set<RepinDiscovered>();
 
@@ -528,8 +551,12 @@ export function planSensorRepin(
         if ((indexIsVolatile(row) || indexIsVolatile(d)) && row.name !== d.name) continue;
         claimedRows.add(row.id);
         claimedFinds.add(d);
-        if (canonical(row.extra) !== canonical(d.extra)) {
-            out.push({ id: row.id, snmpIndex: d.snmpIndex, name: d.name, extra: d.extra });
+        // A stale count alone is reason enough: the GPU server's instruction was
+        // already current when its name was found stale.
+        const rename = cpuRename(row, d);
+        if (canonical(row.extra) !== canonical(d.extra) || rename !== null) {
+            out.push({ id: row.id, snmpIndex: d.snmpIndex, name: d.name, extra: d.extra,
+                ...(rename !== null ? { rename } : {}) });
         }
     }
 

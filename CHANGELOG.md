@@ -1,6 +1,127 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.12 - 2026-10-25
+
+A release shaped by using the demo and by the author's own internet line.
+An internet ping target is now judged by how much it loses - five pings a
+sweep, down only when all five are lost, degraded at 10% - so a busy link
+no longer reads down and up dozens of times a day. The operator's notes
+from the live demo became a release of polish: one-line explanations with
+the rest behind an (i), the device page's responsiveness as a table, the
+Modify panel grouped, logs one line a message, a degraded column on Device
+health, the wall boards on the Dashboard, a board's fields allowed apart
+from shown by default, GPU load on a wall, and pages that fit a phone. A
+machine resized to more processors renames its CPU, Rediscover follows a
+renumbered sensor, and nodemailer is at 10.2.1. Built from the public tree
+on a fresh Linux clone, and an alpha.11 install upgraded to it in one step.
+
+### Changed
+
+- **An internet ping target is judged by how much it loses.** A target
+  across the internet - a device with a public address, or one marked so
+  on its page - got one ping a sweep and read down on any loss, so a busy
+  link flapped: a model downloading at 600 Mbit/s cost production's two
+  outside targets about one ping in six, and each read down and up dozens
+  of times and sent twelve emails. It now gets five pings a sweep, a
+  second apart. It is down only when all five are lost, so a real outage
+  is seen as fast as before, and degraded when the last minute's pings
+  lose 10% or more, shown as "degraded 15% loss" on the roster and with
+  its loss on its page, its chart and its timeline. Loss is what it lost
+  while it answered - an outage is down time, so a target back from one
+  reads up, not degraded. Every other device keeps one ping a sweep.
+- **Explanations are one line, the rest behind an (i).** The page carried
+  32 written explanations beside its controls, ten of them over 200
+  characters, read every time they were passed. Each control now says
+  what it does in one short line, and a small (i) beside it opens the
+  rest - on hover, on keyboard focus or a tap, closed by Esc - so the
+  details were moved, not dropped.
+- **The device page's responsiveness is a table**: ping, SNMP and poll
+  lag, each with what it reads now and over its recent window, where it
+  was one sentence of five facts. Availability sits on the ping row; a
+  click still opens the latency chart.
+- **The Modify panel is grouped, and closes when another device opens.**
+  Its rows sit under four headings - the device, grouping, monitoring,
+  alerts - with one line saying that ticks save as they change. It used
+  to stay open from device to device under a "Done" button, though every
+  tick had already saved; the button now says "Close".
+- **Logs are one line a message.** Host and app are cut at a width and the
+  message at the window's edge, each whole on hover; a click opens a
+  message to its full text and another folds it.
+
+### Added
+
+- **A ping-loss alert for outside targets**, off by default: a warn when
+  one loses 10% or more of its pings over five minutes, on per device or
+  for every outside target from the device page.
+- **Degraded on Device health**: a column between up and down for devices
+  that answer but have an alert raised against them, or a slow or lossy
+  ping. Up now counts the clean ones, and the columns still add up.
+- **The boards on the Dashboard**: each wall board's name beside the
+  service checks' counts, opening its display in a new tab - they were a
+  fold away on System.
+- **What a wall shows by default, apart from what it may show.** A
+  board's grid fields were both what its displays may reveal and what
+  every display showed, and a display could only hide, so a field a viewer
+  might want had to be on for everyone. The grid editor now has a second
+  row, "shown by default", under "allowed on its displays": a display
+  starts with the default set, and its own settings list every allowed
+  field to turn on or off (kept in that screen's address, as before).
+  Allowed is still the whole of what a display is sent. Existing boards
+  show what they showed.
+- **GPU load on a wall**: a "GPU load (each card)" grid field, every
+  card's load on one line, busiest first - "87%" for one, "87 / 12%" for
+  two, up to four and "+N" past that - from the agent's GPU gauges
+  ("Util: GPU0", "Util: GPU1"; a GPU fan's speed is not load). Read with
+  each poll, like CPU.
+
+### Fixed
+
+- **A resized machine's CPU takes its new count.** The CPU card and its
+  alerts kept the count the device was added with - "CPU (4 cores)" on a
+  VM given 10 - while the readings had already moved to all ten: nothing
+  ever rewrote the name, and Rediscover could not. The name now follows
+  the count when it changes, at a restart, at the daily check or on
+  Rediscover, with the sensor's history, code and settings kept. A
+  device's cores and memory are also read again at a restart, rather than
+  up to a day after a resize.
+- **Rediscover follows a sensor the agent renumbered** - a disk that
+  moved index at a reboot - where it used to add the disk again as a new
+  row. It runs the same re-pin the daily check runs, first, and names
+  what it followed.
+- **No more "alerts:notify: still running" lines that meant nothing.** The
+  notify pass's own timer and the alert scan's ran in step, so the scan's
+  prompt kick often found the timer's pass a fraction of a second old and
+  logged a skip - 114 on production in a day, every one "began 0.0 s ago".
+  Nothing was lost (the running pass delivered), but the line is meant to
+  name a pass that is stuck. The timer now runs half a scan apart, and a
+  skip means a slow pass again.
+- **The page fits a phone.** The top bar laid out 621 px wide on a 375 px
+  screen and dragged every page sideways with it. Below 640 px it now
+  shows the mark without its name, keeps its labels for screen readers
+  only and leaves out Width (the normal page is already wider than a
+  phone), and fits one row down to 320 px. Wider screens are unchanged.
+- **nodemailer 10.2.1**, from 10.0.12, for three moderate advisories in
+  how it parses an address list (GHSA-8c8m-p3m8-cjg8, GHSA-m943-m63m-w62w,
+  GHSA-85x2-q946-cp5h: a nested comment, a ";" or a ">" in the wrong place
+  could turn display text into a recipient). RSCanvas only mails the
+  addresses an admin sets, so it was not exposed to a stranger's text.
+  Email was smoke-sent through the notifier's own settings before release.
+
+### Upgrading
+
+Two schema changes, both additive and applied by the installer as usual:
+`sql/slice68.sql` (columns on devices, the reachability events and the
+ping history) and `sql/slice69.sql` (a board's shown-by-default fields,
+empty meaning every allowed field, and each device's GPU loads). A device
+with a public address becomes an outside target at its first sweep; mark
+one `no` on its page to keep it on one ping. GPU loads appear from each
+device's first poll after the upgrade.
+
+A CPU named for the count a device had when it was added - "CPU (4 cores)"
+on a machine since given more - takes its count at the device's next
+restart, its daily check, or a press of Rediscover. Every board shows
+what it showed: a board's new GPU field appears only once the board
+allows it, from its grid settings.
 
 ## 0.1.0-alpha.11 - 2026-10-23
 

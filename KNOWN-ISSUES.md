@@ -1,7 +1,7 @@
-# Known issues, as of 0.1.0-alpha.11
+# Known issues, as of 0.1.0-alpha.12
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17, 2026-10-21 and 2026-10-23 for the second to the eleventh. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17, 2026-10-21, 2026-10-23 and 2026-10-25 for the second to the twelfth. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
@@ -105,6 +105,25 @@ what each alpha fixed.
   alphabetically. A board's own groups can be listed in the order wanted -
   the network first on a NOC wall - but a group added later then joins the
   board only when it is added to the list; the other axis has no list.
+- **An internet target's loss is in words, not on its chart**
+  (alpha.12). The latency chart has one axis, in milliseconds, so an outside
+  target's loss is in the chart's heading, the roster pill, the device page
+  and the timeline, not drawn as a line of its own.
+- **A lossy internet target blinks up now and then** (alpha.12). It
+  leaves degraded when the last minute lost under 5% of its pings - at most
+  one of 30 - so a path losing 15% has a lucky minute about twice in a
+  quarter of an hour and reads up for a sweep: two timeline rows, no alert.
+- **A fast transfer can raise a discards alert while losing very little**
+  (alpha.12). The rule counts discards a second, so 300 a second on a
+  port carrying 2.5 Gbit/s - about one packet in 700 - is critical at the
+  default of 50, where the same count on a quiet port would be real
+  trouble. Raise the threshold on a port that routinely carries bulk
+  copies; judging discards as a share of the traffic needs packet
+  counters RSCanvas does not read yet.
+- **A wall's GPU line does not say which card is which** (alpha.12).
+  Loads are drawn busiest first so a tile keeps to one line, and a
+  card's place moves with its load; each card is named on the device
+  page.
 - **The growth estimate needs a little history** (alpha.10). A part's rate
   needs one complete UTC day of it, and the hourly history's three days of
   the month (or of the month before), so a new install reads "too early to

@@ -635,7 +635,7 @@ let notifyChannels: Array<{
 // the rollup - is enforced by guard 5 in the database. A scheduler that
 // enforced it by ordering would be correct only while it kept running.
 
-function every(ms: number, name: string, fn: () => Promise<string>): void {
+function every(ms: number, name: string, fn: () => Promise<string>, phaseMs = 0): void {
     // ANY job on an interval longer than an hour ALSO runs once shortly after
     // boot. setInterval's first firing is one full interval out, and for a
     // long-interval job that gap is a live defect window, not a scheduling
@@ -672,10 +672,16 @@ function every(ms: number, name: string, fn: () => Promise<string>): void {
             if (running) runOnce(name, fn, persist).catch(onAsyncError);
         }, 15_000).unref();
     }
-    const t = setInterval(() => {
-        if (running) runOnce(name, fn, persist).catch(onAsyncError);
-    }, ms);
-    t.unref();
+    // phaseMs starts the interval that much later, so two jobs of one period
+    // need not fire in the same instant (the notify timer below).
+    const start = (): void => {
+        const t = setInterval(() => {
+            if (running) runOnce(name, fn, persist).catch(onAsyncError);
+        }, ms);
+        t.unref();
+    };
+    if (phaseMs > 0) setTimeout(start, phaseMs).unref();
+    else start();
 }
 
 every(CONFIG.rollupIntervalMs, 'rollup', rollup);
@@ -692,7 +698,18 @@ every(CONFIG.alertScanIntervalMs, 'alerts:scan', alertScan);
 // coupled before the split, and a scan refused by its lane also silently
 // stopped all delivery for that tick. runOnce dedupes the timer against the
 // kicks, so at most one pass runs at a time either way.
-every(CONFIG.alertScanIntervalMs, 'alerts:notify', alertNotify);
+//
+// HALF A PERIOD BEHIND THE SCAN (2026-10-25). Created one after the other
+// with one period, the two timers fired in the same instant - the retention
+// jobs' trap again (2026-10-01) - so the notify timer's pass started with
+// the scan, and the scan's kick, landing as the scan finished, found that
+// pass still running whenever it outlasted the scan: "alerts:notify: still
+// running from the last tick, skipping this one". Production logged 114 of
+// them between 10-24 09:51 and 10-25 06:03, every one "began 0.0 s ago" (at
+// most 0.2) - a collision, never a slow pass - in runs of one a tick for
+// forty minutes at a time. Half a period apart, a skip means a pass that
+// really did run long again.
+every(CONFIG.alertScanIntervalMs, 'alerts:notify', alertNotify, CONFIG.alertScanIntervalMs / 2);
 every(CONFIG.retentionIntervalMs, 'retention:alerts', async () => {
     const r = await OPS.pruneClearedAlerts(CONFIG.alertRetentionDays);
     if (!r.ok) throw new Error(`lane refused (${r.reason})`);

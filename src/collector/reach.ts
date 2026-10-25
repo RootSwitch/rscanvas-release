@@ -14,13 +14,20 @@
 //    deliberately shapes the signal is the degraded threshold's hysteresis,
 //    which exists to bound the EVENT VOLUME, not to protect the pager.
 
+import { isPublicAddress } from '../checks/model.ts';
+
 export type ReachState = 'up' | 'degraded' | 'down' | 'unknown';
 
 /** One device's reading from one sweep. null rtt with alive=true cannot
- *  happen from fping's format; it is treated as up at unknown speed. */
+ *  happen from fping's format; it is treated as up at unknown speed.
+ *  `sent` and `answered` are an OUTSIDE target's several pings in one sweep
+ *  (slice 68): alive means any came back, and rttMs is their median. Absent
+ *  for the single ping every other device gets. */
 export interface ProbeReading {
     alive: boolean;
     rttMs: number | null;
+    sent?: number;
+    answered?: number;
 }
 
 /**
@@ -73,6 +80,108 @@ export function step(
     return 'up';
 }
 
+// --- OUTSIDE TARGETS, judged by loss (slice 68) --------------------------------
+//
+// One lost ping is `down` above, and on the LAN that is right: a switch in
+// the next room that drops a ping is news. Across the internet it is the
+// path's weather. Production's two outside targets lost about one ping in
+// six while a model downloaded at 600 Mbit/s (2026-10-23) - replies that
+// came back took 22-105 ms, so lost, not late - and each read down and up
+// dozens of times and sent twelve emails. The question for such a target
+// is HOW MUCH it loses, so it gets several pings a sweep (fping.ts) and:
+//
+//   down      every ping in the sweep lost - a real outage is seen in one
+//             sweep, as fast as before;
+//   degraded  the last minute's pings lost at least LOSS ENTRY percent, held
+//             until under LOSS EXIT (hysteresis, as for latency: it bounds
+//             the event volume); or the latency rule, unchanged;
+//   up        otherwise.
+//
+// NOT a second debouncer, and -r 0 still holds: nothing is retried, and
+// `down` still follows the sweep. A sweep of several pings is a
+// measurement, not a retry.
+
+/** Is this device an outside target? 'auto' decides by its address - a
+ *  public one is outside, the service checks' own rule - and 'yes' or 'no'
+ *  is the operator saying so where the address cannot (a public address
+ *  that is the next room). */
+export function isOutsideTarget(setting: string | null | undefined, host: string): boolean {
+    if (setting === 'yes') return true;
+    if (setting === 'no') return false;
+    return isPublicAddress(host);
+}
+
+/** One sweep of an outside target, for its loss window. */
+export interface LossSample { sent: number; lost: number }
+
+/** What a window holds right after a silent sweep: no pings, a marker. */
+const OUTAGE_MARK: LossSample = Object.freeze({ sent: 0, lost: 0 });
+
+/** Did the last sweep in this window find the target silent? */
+export function followsOutage(window: readonly LossSample[]): boolean {
+    return window.length === 1 && (window[0] as LossSample).sent === 0;
+}
+
+/** The window with this sweep's pings added, the oldest dropped past
+ *  `size`. An unreadable sweep (null) adds nothing: no evidence either way.
+ *
+ *  A SILENT sweep starts the window again. It is an outage - `down`, and
+ *  availability's business - not loss: counted as loss, the minute after a
+ *  path came back read degraded at 93% on the outage's own pings, and the
+ *  ping-loss alert raised as device-down cleared, at 49-65%, on a path that
+ *  was answering everything (the lab drill, 2026-10-23). So loss is "lost
+ *  while it answered", and the minute after an outage is judged on itself. */
+export function pushLossSample(window: readonly LossSample[], reading: ProbeReading | null, size: number): LossSample[] {
+    if (reading === null) return [...window];
+    const sent = reading.sent ?? 1;
+    const answered = reading.answered ?? (reading.alive ? 1 : 0);
+    // The outage's mark: a window holding one empty sample.
+    if (answered === 0) return [OUTAGE_MARK];
+    // The first answer after an outage usually STRADDLES its end - some
+    // pings went out while the path was still dark. Its losses are the
+    // outage's, so a sweep that lost any is left out (the drill's second
+    // run read "degraded 13%" a minute after recovery on just that sweep).
+    if (followsOutage(window) && answered < sent) return [];
+    const next = [...window.filter((s) => s.sent > 0), { sent, lost: Math.max(0, sent - answered) }];
+    return next.length > size ? next.slice(next.length - size) : next;
+}
+
+/**
+ * The window's loss in percent - or NULL until it holds `size` sweeps. A
+ * restart starts the window empty, and one lost ping of the first five is
+ * 20%: judging a part-filled window would mark a target degraded on the
+ * first blip after every restart.
+ */
+export function windowLossPct(window: readonly LossSample[], size: number): number | null {
+    if (window.length < size) return null;
+    let sent = 0, lost = 0;
+    for (const s of window) { sent += s.sent; lost += s.lost; }
+    return sent > 0 ? (lost / sent) * 100 : null;
+}
+
+/** The next state of an outside target: `step`'s rules, with `down` meaning
+ *  every ping lost and loss over the window able to make it degraded. */
+export function stepOutside(
+    prev: ReachState, reading: ProbeReading | null, lossPct: number | null,
+    degradedMs: number, lossEnterPct: number, lossExitPct: number,
+): ReachState {
+    if (reading === null) return 'unknown';
+    if (!reading.alive) return 'down';
+    const slow = reading.rttMs === null
+        ? prev === 'degraded'
+        : reading.rttMs >= degradedMs || (prev === 'degraded' && reading.rttMs >= degradedMs * DEGRADED_EXIT_RATIO);
+    const lossy = lossPct !== null
+        && (lossPct >= lossEnterPct || (prev === 'degraded' && lossPct >= lossExitPct));
+    return slow || lossy ? 'degraded' : 'up';
+}
+
+/** The median of a non-empty list of numbers. */
+function median(xs: readonly number[]): number {
+    const s = [...xs].sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 === 1 ? s[m] as number : ((s[m - 1] as number) + (s[m] as number)) / 2;
+}
+
 /**
  * One line of `fping -C 1 -q` per-target output, which arrives on STDERR:
  *
@@ -103,6 +212,21 @@ export function parseFpingLine(line: string): { host: string; reading: ProbeRead
     if (rest === '-') return { host, reading: { alive: false, rttMs: null } };
     const rtt = Number(rest);
     if (Number.isFinite(rtt)) return { host, reading: { alive: true, rttMs: rtt } };
+    // SEVERAL PINGS (`-C N`, an outside target - slice 68): one value per
+    // ping, a dash for each lost - "203.0.113.4 : 22.10 - 23.40 22.80 -". Every
+    // token must be one or the other; a word means fping is explaining a
+    // failure, as below.
+    const tokens = rest.split(/\s+/);
+    if (tokens.length > 1 && tokens.every((t) => t === '-' || Number.isFinite(Number(t)))) {
+        const rtts = tokens.filter((t) => t !== '-').map(Number);
+        return {
+            host,
+            reading: {
+                alive: rtts.length > 0, rttMs: rtts.length > 0 ? median(rtts) : null,
+                sent: tokens.length, answered: rtts.length,
+            },
+        };
+    }
     // Anything else is fping explaining a per-target failure in words.
     return { host, reading: null };
 }
@@ -140,6 +264,8 @@ export interface ReachDevice {
     id: string;
     host: string;
     prev: ReachState;
+    /** An outside target (slice 68): several pings a sweep, judged by loss. */
+    outside?: boolean;
 }
 
 export interface ReachTransition {
@@ -147,6 +273,9 @@ export interface ReachTransition {
     from: ReachState;
     to: ReachState;
     rttMs: number | null;
+    /** An outside target's loss over its window when the state moved; null
+     *  for every other device, and while the window is filling. */
+    lossPct: number | null;
 }
 
 /**
@@ -233,7 +362,9 @@ export function partitionChecks(devices: readonly CheckedDevice[]): {
                 unsupported.set('tcp (no port)', (unsupported.get('tcp (no port)') ?? 0) + 1);
             }
         } else if (SUPPORTED_CHECKS.includes(d.check)) {
-            probe.push({ id: d.id, host: d.host, prev: d.prev });
+            // The outside verdict rides along to choose the fping run; the
+            // TCP lane above is one connect a sweep either way.
+            probe.push({ id: d.id, host: d.host, prev: d.prev, outside: d.outside === true });
         } else {
             unsupported.set(d.check, (unsupported.get(d.check) ?? 0) + 1);
         }
@@ -260,19 +391,45 @@ export function partitionChecks(devices: readonly CheckedDevice[]): {
  */
 export function applySweep(
     devices: ReachDevice[], readings: Map<string, ProbeReading | null>, degradedMs: number,
-): { transitions: ReachTransition[]; states: Map<string, ReachState> } {
+    loss?: LossJudge,
+): { transitions: ReachTransition[]; states: Map<string, ReachState>; losses: Map<string, number | null> } {
     const transitions: ReachTransition[] = [];
     const states = new Map<string, ReachState>();
+    const losses = new Map<string, number | null>();
     for (const d of devices) {
         const reading = readings.has(d.host) ? (readings.get(d.host) ?? null) : null;
-        const next = step(d.prev, reading, degradedMs);
+        let next: ReachState;
+        let lossPct: number | null = null;
+        if (d.outside === true && loss !== undefined) {
+            const window = pushLossSample(loss.windows.get(d.id) ?? [], reading, loss.size);
+            loss.windows.set(d.id, window);
+            lossPct = windowLossPct(window, loss.size);
+            losses.set(d.id, lossPct);
+            next = stepOutside(d.prev, reading, lossPct, degradedMs, loss.enterPct, loss.exitPct);
+        } else {
+            next = step(d.prev, reading, degradedMs);
+        }
         states.set(d.id, next);
         if (next !== d.prev) {
             transitions.push({
                 id: d.id, from: d.prev, to: next,
                 rttMs: reading === null ? null : reading.rttMs,
+                lossPct,
             });
         }
     }
-    return { transitions, states };
+    return { transitions, states, losses };
+}
+
+/**
+ * How outside targets are judged (slice 68). `windows` is the caller's,
+ * kept across sweeps and MUTATED here - one entry per outside device id,
+ * its last `size` sweeps; the collector drops ids that stop being outside.
+ * A restart starts it empty, and windowLossPct says nothing until it fills.
+ */
+export interface LossJudge {
+    windows: Map<string, LossSample[]>;
+    size: number;
+    enterPct: number;
+    exitPct: number;
 }

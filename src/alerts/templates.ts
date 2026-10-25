@@ -107,6 +107,12 @@ function detailFor(alert: Alert): string {
     if (alert.kind === 'fan-stopped') {
         return 'reading 0 - the fan has stopped turning, or its speed sensor has stopped reporting it';
     }
+    // Slice 68: an outside target losing pings. It still answers - all lost
+    // is device-down - so the news is the path to it, not the target.
+    if (alert.kind === 'ping-loss') {
+        return `${alert.value ?? '?'}% of its pings lost${alert.threshold != null ? ` (warn at ${alert.threshold}%)` : ''}`
+            + ' - the path to it is congested or failing, though it still answers';
+    }
     if (alert.value != null && alert.threshold != null) {
         return `value ${alert.value}${unit} (threshold ${alert.threshold}${unit})`;
     }

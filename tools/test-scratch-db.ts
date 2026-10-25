@@ -61,6 +61,7 @@ import { OPS, closeAll } from '../src/store/index.ts';
 import { changeScan, DEFAULT_RULES } from '../src/alerts/scan.ts';
 import { assertDestructiveTarget } from '../src/safety.ts';
 import { generatedShapes } from '../src/boards/reconcile.ts';
+import { summarizeReadings } from '../src/collector/summary.ts';
 
 process.exitCode = 1;
 let pass = 0, fail = 0;
@@ -520,7 +521,7 @@ console.log('\n15. a restart is recorded by the poll write that stores the uptim
     const mine = due.ok ? due.rows.find((d) => d.id === ID) : undefined;
     eq('duePollTargets hands the collector the last uptime and its age by the database clock',
         mine && [mine.uptime_s, mine.since_seen_s !== null && mine.since_seen_s >= 89 && mine.since_seen_s < 95], [40, true]);
-    const scan = await OPS.alertScanDevices();
+    const scan = await OPS.alertScanDevices(5);
     const s = scan.ok ? scan.rows.find((d) => d.name === DEV) : undefined;
     eq('the scan reads the restart\'s age and its uptime before',
         s && [s.reboot_age_s !== null && s.reboot_age_s < 30, s.reboot_up_before_s, s.reboot_planned], [true, 86_400, false]);
@@ -965,7 +966,7 @@ console.log('\n21. the identity is stored by the poll write, and a change from o
         [true, 2, 'RouterOS 7.24.5 (stable)']);
     await q(`UPDATE devices SET hw_model = 'CRS354-48G-4S+2Q+' WHERE id = $1::bigint`, [ID]);
 
-    const scan = await OPS.alertScanDevices();
+    const scan = await OPS.alertScanDevices(5);
     const s = scan.ok ? scan.rows.find((d) => d.name === DEV) : undefined;
     eq('the scan reads the change\'s age and what changed, in words',
         s && [s.change_age_s !== null && s.change_age_s < 30, s.change_planned, s.change_text],
@@ -1062,6 +1063,21 @@ console.log('\n23. a re-pin plan lands whole - a swap past the unique index - or
         [0, [['/mnt/models', '53', '53'], ['/boot/efi', '52', '52'], ['/', '37', '37']]]);
     const other = await OPS.repinSensors('990008', [{ id: '990403', snmpIndex: '99', extra: fx(99) }].map((m) => ({ ...m, id: '1' })));
     eq('a row of another device is never touched', other.ok && other.rows.length, 0);
+    // The counted CPU (2026-10-25): its name rides the same write, and a move
+    // that names nothing keeps the row's own.
+    const cx = (n: number): string => JSON.stringify({ style: 'gauge-avg',
+        oids: Array.from({ length: n }, (_, i) => `1.3.6.1.2.1.25.3.3.1.2.${196608 + i}`) });
+    await q(`INSERT INTO entities (id, device_id, kind, snmp_index, name, code, tracked, extra)
+             VALUES (990404, 990008, 'cpu', 'cpu', 'CPU (4 cores)', 'SWP4', true, $1::jsonb)`, [cx(10)]);
+    const cpuName = async () => (await q<{ name: string; n: number }>(
+        `SELECT name, jsonb_array_length(extra->'oids') AS n FROM entities WHERE id = 990404`)).map((r) => [r.name, r.n]);
+    const renamed = await OPS.repinSensors('990008', [{ id: '990404', snmpIndex: 'cpu', extra: cx(10), name: 'CPU (10 cores)' }]);
+    eq('a stale count is renamed in the re-pin\'s own write, code and index kept',
+        [renamed.ok && renamed.rows.length, await cpuName(),
+            (await q<{ code: string; snmp_index: string }>(`SELECT code, snmp_index FROM entities WHERE id = 990404`))[0]],
+        [1, [['CPU (10 cores)', 10]], { code: 'SWP4', snmp_index: 'cpu' }]);
+    await OPS.repinSensors('990008', [{ id: '990404', snmpIndex: 'cpu', extra: cx(12) }]);
+    eq('a re-pin that names nothing keeps the name', await cpuName(), [['CPU (10 cores)', 12]]);
     await OPS.deleteDevices([DEV]);
 }
 
@@ -1115,6 +1131,131 @@ console.log('\n25. a team board\'s grid divided by its groups, or by where its d
         [own.ok && own.rows[0]?.section_axis, (await sections())['scratch-srv']], [null, 'Servers']);
     await OPS.deleteBoard(id);
     await OPS.deleteDevices(DEVS);
+}
+
+// --- 26. outside targets measured by loss (sql/slice68.sql) ----------------------------
+console.log('\n26. an outside target: its setting, its loss, its minute rows and their hour:');
+{
+    const DEV = 'scratch-outside';
+    const ID = '990020';
+    // Ping-only, as production's outside targets are: the alert scan reads
+    // a device that is ping-only or has been polled.
+    await q(`INSERT INTO devices (id, name, host, snmp_enabled) VALUES ($1::bigint, $2, '203.0.113.7', false)`, [ID, DEV]);
+    const setting = async () => (await q<{ s: string }>(`SELECT reach_outside AS s FROM devices WHERE id = $1::bigint`, [ID]))[0]?.s;
+    eq('a device starts on auto (by its address)', await setting(), 'auto');
+    const odd = await db.query(`UPDATE devices SET reach_outside = 'maybe' WHERE id = 990020`).then(() => 'stored', (e: { code?: string }) => e.code);
+    eq('anything but auto, yes or no is refused by the column', odd, '23514');
+    const set = await OPS.setDeviceOutside(DEV, 'yes');
+    eq('the setter writes yes', [set.ok && set.rows.length, await setting()], [1, 'yes']);
+
+    const w1 = await OPS.recordPingLoss([ID], [16.7]);
+    const w2 = await OPS.recordPingLoss([ID], [16.71]);
+    const w3 = await OPS.recordPingLoss([ID], [null]);
+    eq('the live loss is written, the same tenth writes nothing, and NULL clears it',
+        [w1.ok && w1.rowCount, w2.ok && w2.rowCount, w3.ok && w3.rowCount], [1, 0, 1]);
+    await OPS.recordPingLoss([ID], [16.7]);
+
+    await OPS.recordReachTransitions([ID], ['degraded'], [31.5], [16.7]);
+    const ev = await q<{ s: string; l: number }>(`SELECT to_state AS s, loss_pct AS l FROM reachability_events WHERE device_id = $1::bigint`, [ID]);
+    eq('the transition carries its loss for the timeline', ev.map((r) => [r.s, Math.round(r.l * 10) / 10]), [['degraded', 16.7]]);
+    const tl = await OPS.deviceTimeline(DEV, 1, false, 50);
+    const reachRow = tl.ok ? tl.rows.find((r) => r.kind === 'reach') : undefined;
+    eq('the timeline row says so', reachRow && Math.round(Number((reachRow.data as { loss: number }).loss) * 10) / 10, 16.7);
+
+    // Four minute rows of 30 pings: the two newest lost 6 each - 12 of 120.
+    await q(`INSERT INTO ping_samples (device_id, ts, rtt_ms, sent, lost)
+             SELECT $1::bigint, now() - make_interval(mins => g), 30, 30, CASE WHEN g <= 2 THEN 6 ELSE 0 END
+               FROM generate_series(1, 4) g`, [ID]);
+    const scan = await OPS.alertScanDevices(5);
+    const mine = scan.ok ? scan.rows.find((r) => r.name === DEV) : undefined;
+    eq('the alert scan reads its loss over five minutes from the rows\' own counts: 10%',
+        mine && Math.round((mine.ping_loss_pct ?? -1) * 10) / 10, 10);
+    const series = await OPS.pingSeries(DEV, 1, 3600);
+    const bucket = series.ok ? series.rows.reduce((a, r) => [a[0]! + (r.sent ?? 0), a[1]! + (r.lost ?? 0)], [0, 0]) : null;
+    eq('the latency chart\'s series carries the counts its loss comes from', bucket, [120, 12]);
+    await OPS.recordPingLoss([ID], [null]);
+    const scan2 = await OPS.alertScanDevices(5);
+    const mine2 = scan2.ok ? scan2.rows.find((r) => r.name === DEV) : undefined;
+    eq('a device with no live loss (not an outside target) reads none', mine2?.ping_loss_pct ?? null, null);
+
+    // The hourly roll-up sums them (roll_up_ping_chunk, sql/slice63.sql).
+    const H = `date_trunc('hour', now()) - interval '4 hours'`;
+    await q(`INSERT INTO ping_samples (device_id, ts, rtt_ms, sent, lost)
+             SELECT $1::bigint, ${H} + make_interval(mins => g), CASE WHEN g = 7 THEN NULL ELSE 30 END,
+                    30, CASE WHEN g = 7 THEN 30 WHEN g < 7 THEN 3 ELSE 0 END
+               FROM generate_series(0, 59) g`, [ID]);
+    await q(`UPDATE job_state SET through_ts = ${H} WHERE job = 'rollup:ping'`);
+    for (let i = 0; i < 10; i++) {
+        const r = await OPS.rollUpPingChunk(24, 5);
+        if (!r.ok || !r.rows[0] || r.rows[0].caught_up) break;
+    }
+    const hour = await q<{ p: number; m: number; s: number; l: number }>(
+        `SELECT probes AS p, misses AS m, sent AS s, lost AS l FROM ping_hourly WHERE device_id = $1::bigint AND hour_ts = ${H}`, [ID]);
+    eq('the hour keeps its pings sent and lost; only the silent minute is a miss for availability',
+        hour.map((r) => [r.p, r.m, r.s, r.l]), [[60, 1, 1800, 51]]);
+    await OPS.deleteDevices([DEV]);
+}
+
+// --- 27. degraded on Device health (2026-10-24) ------------------------------------------
+console.log('\n27. Device health counts the up-but-troubled apart, and the columns add up:');
+{
+    // Ping-only, so reach is the status: clean, alerting, slow ping, down, and transient.
+    await q(`INSERT INTO devices (id, name, host, location, snmp_enabled, reach_state, transient) VALUES
+             (990030, 'scratch-clean',    '192.0.2.30', 'Scratch Bay', false, 'up', false),
+             (990031, 'scratch-alerting', '192.0.2.31', 'Scratch Bay', false, 'up', false),
+             (990032, 'scratch-slow',     '192.0.2.32', 'Scratch Bay', false, 'degraded', false),
+             (990033, 'scratch-down',     '192.0.2.33', 'Scratch Bay', false, 'down', false),
+             (990034, 'scratch-laptop',   '192.0.2.34', 'Scratch Bay', false, 'down', true),
+             (990035, 'scratch-cleared',  '192.0.2.35', 'Scratch Bay', false, 'up', false)`);
+    await q(`INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, raised_ts, last_seen_ts) VALUES
+             ('scratch:a1', 'active', 'warn', 'cpu', 'scratch-alerting', 'cpu', now(), now(), now()),
+             ('scratch:a2', 'active', 'crit', 'disk', 'scratch-alerting', 'disk', now(), now(), now())`);
+    await q(`INSERT INTO alerts (alert_key, state, severity, kind, host, label, first_breach_ts, raised_ts, last_seen_ts, cleared_ts) VALUES
+             ('scratch:a3', 'cleared', 'warn', 'cpu', 'scratch-cleared', 'cpu', now(), now(), now(), now())`);
+    const g = await OPS.groupHealth();
+    const bay = g.ok ? g.rows.find((r) => r.axis === 'location' && r.value === 'Scratch Bay') : undefined;
+    eq('one clean, two degraded (two alerts on one device count it once; a slow ping), one down; a cleared alert and a transient device count nothing',
+        bay && [bay.up, bay.degraded, bay.down, bay.other], [2, 2, 1, 0]);
+    await q(`DELETE FROM alerts WHERE alert_key LIKE 'scratch:a%'`);
+    await OPS.deleteDevices(['scratch-clean', 'scratch-alerting', 'scratch-slow', 'scratch-down', 'scratch-laptop', 'scratch-cleared']);
+}
+
+// --- 28. what a wall shows by default, and GPUs on it (sql/slice69.sql) ------------------
+console.log('\n28. a board\'s shown-by-default fields, and a device\'s GPU loads, through the projection:');
+{
+    const DEV = 'scratch-gpu';
+    const ID = '990040';
+    await q(`INSERT INTO devices (id, name, host) VALUES ($1::bigint, $2, '192.0.2.40')`, [ID, DEV]);
+    const summary = summarizeReadings([], [
+        { kind: 'gauge', name: 'Util: GPU0', v0: 87, v1: null, status: null },
+        { kind: 'gauge', name: 'Util: GPU1', v0: 12.34, v1: null, status: null },
+        { kind: 'gauge', name: 'Util: fan-GPU0', v0: 55, v1: null, status: null },
+    ]);
+    await OPS.recordDevicePoll(ID, true, null, null, null, false, null, null, summary);
+    const stored = await q<{ g: unknown }>(`SELECT gpu_pcts AS g FROM devices WHERE id = $1::bigint`, [ID]);
+    eq('the poll writes each GPU\'s load with the roster summary, a fan left out', stored[0]?.g, [87, 12.3]);
+
+    const made = await OPS.createBoard('scratch-shown', 'wall', null, null, null);
+    const id = made.ok ? String(made.rows[0]?.id) : '0';
+    await OPS.rawSetBoardDoc(id, JSON.stringify({ shapes: generatedShapes([DEV]) }));
+    await OPS.setBoardGrid(id, 0, JSON.stringify(['cpu', 'gpu', 'temp']));
+    const proj = async () => {
+        const p = await OPS.boardProjection(id);
+        const row = p.ok ? p.rows[0] : undefined;
+        const shape = ((row?.shapes ?? []) as Array<{ fields?: Record<string, unknown> }>)[0];
+        return { shown: row?.grid_shown ?? null, gpu: shape?.fields?.gpu ?? null };
+    };
+    eq('a board set without defaults shows everything it allows (NULL), and its tile carries the GPU loads',
+        await proj(), { shown: null, gpu: [87, 12.3] });
+    await OPS.setBoardGrid(id, 0, null, undefined, { json: JSON.stringify(['gpu']) });
+    await OPS.setBoardGrid(id, 0, JSON.stringify(['cpu', 'gpu', 'temp', 'mem']));
+    eq('its defaults are kept, and a later save that does not name them leaves them', (await proj()).shown, ['gpu']);
+    await OPS.setBoardGrid(id, 0, null, undefined, { json: null });
+    eq('null is every allowed field again', (await proj()).shown, null);
+    await q(`UPDATE devices SET last_poll_ts = NULL, status = 'down' WHERE id = $1::bigint`, [ID]);
+    eq('a device that is not up carries no GPU reading on its tile', (await proj()).gpu, null);
+    await OPS.deleteBoard(id);
+    await OPS.deleteDevices([DEV]);
 }
 
 await db.end();

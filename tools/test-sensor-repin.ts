@@ -152,5 +152,44 @@ console.log('\ndisks that trade indexes (2026-10-22):');
     eq('...while a symbolic index still is, whatever its name says', sym.map((u) => u.id), ['c']);
 }
 
+console.log('\na CPU whose count changed (2026-10-25):');
+{
+    // Production's GPU server, 4 vCPUs to 10: the processor list and the counted
+    // name move together.
+    const plan = planSensorRepin(
+        [find('cpu', 'cpu', 'CPU (10 cores)', cpuX(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))],
+        [row('c', 'cpu', 'cpu', 'CPU (4 cores)', cpuX(1, 2, 3, 4))]);
+    eq('more vCPUs: the new processor list and the name with it, from and to',
+        plan.map((u) => [u.id, u.extra.oids?.length, u.rename]),
+        [['c', 10, { from: 'CPU (4 cores)', to: 'CPU (10 cores)' }]]);
+    // What production actually holds: a restart already re-pinned the ten
+    // processors, and the name was left behind. The plan was empty there.
+    const stale = planSensorRepin(
+        [find('cpu', 'cpu', 'CPU (10 cores)', cpuX(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))],
+        [row('c', 'cpu', 'cpu', 'CPU (4 cores)', cpuX(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))]);
+    eq('a current processor list under a stale count is renamed alone',
+        stale.map((u) => u.rename), [{ from: 'CPU (4 cores)', to: 'CPU (10 cores)' }]);
+    eq('one core is "core", and back to many',
+        planSensorRepin([find('cpu', 'cpu', 'CPU (2 cores)', cpuX(1, 2))],
+            [row('c', 'cpu', 'cpu', 'CPU (1 core)', cpuX(1))]).map((u) => u.rename?.to), ['CPU (2 cores)']);
+    eq('a steady CPU plans nothing',
+        planSensorRepin([find('cpu', 'cpu', 'CPU (10 cores)', cpuX(1, 2))],
+            [row('c', 'cpu', 'cpu', 'CPU (10 cores)', cpuX(1, 2))]), []);
+    eq('a vendor CPU ("CPU", no count) keeps its name',
+        planSensorRepin([find('cpu', 'cpu', 'CPU', cpuX(3, 4))],
+            [row('c', 'cpu', 'cpu', 'CPU', cpuX(4, 5))]).map((u) => u.rename), [undefined]);
+    eq('nor is a counted name traded for a vendor one',
+        planSensorRepin([find('cpu', 'cpu', 'CPU', cpuX(1))],
+            [row('c', 'cpu', 'cpu', 'CPU (4 cores)', cpuX(1, 2, 3, 4))]).map((u) => u.rename), [undefined]);
+    // Every other kind's name is identity: a temperature whose label moved
+    // at the same index re-pins its instruction and keeps its name.
+    eq('another kind\'s name never follows',
+        planSensorRepin([find('temp', 'lm-3', 'Temp: Package id 1', cpuX(9))],
+            [row('t', 'temp', 'lm-3', 'Temp: Package id 0', cpuX(8))]).map((u) => u.rename), [undefined]);
+    eq('...and a name change alone moves nothing there',
+        planSensorRepin([find('temp', 'lm-3', 'Temp: Package id 1', cpuX(8))],
+            [row('t', 'temp', 'lm-3', 'Temp: Package id 0', cpuX(8))]), []);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

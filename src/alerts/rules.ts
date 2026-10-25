@@ -124,6 +124,9 @@ export interface RulesConfig {
     /** A device's OS, hardware or boot firmware changed (slice 66). Absent
      *  means DEVICE_CHANGE_DEFAULT: off. */
     deviceChange?: BoolRule;
+    /** An outside target losing pings (slice 68). Absent means
+     *  PING_LOSS_DEFAULT: off. */
+    pingLoss?: BoolRule;
     overrides?: Override[];
 }
 
@@ -148,6 +151,9 @@ export interface ScanDevice {
     changeAgeS?: number | null;
     changeText?: string | null;
     changePlanned?: boolean | null;
+    /** Slice 68: an outside target's loss over the ping-loss alert's window,
+     *  in percent. Absent for every other device. */
+    pingLossPct?: number | null;
 }
 export interface ScanInterface {
     id?: string | null;
@@ -292,7 +298,7 @@ export const IF_RULE_KINDS = ['if-down', 'if-errors', 'if-discards', 'if-util'] 
  *  An ENABLED override of one is how a port alerts under a device-wide mute
  *  (manual link-down, 2026-10-02) - resolveBoolInfo already honoured it. */
 export const BOOL_RULE_KINDS: ReadonlySet<string> = new Set(['if-down', 'device-down', 'svc-down', 'svc-content', 'path-down', 'reboot',
-    'temp-change', 'temp-room', 'fan-stopped', 'device-change']);
+    'temp-change', 'temp-room', 'fan-stopped', 'device-change', 'ping-loss']);
 
 /** The four rules a service check carries (slice 58): two yes/no, two levelled. */
 export const SERVICE_RULE_KINDS = ['svc-down', 'svc-content', 'svc-ms', 'svc-cert'] as const;
@@ -356,6 +362,16 @@ export const FAN_STOPPED_DEFAULT: BoolRule = { enabled: true, severity: 'warn' }
 export const DEVICE_CHANGE_DEFAULT: BoolRule = { enabled: false, severity: 'warn' };
 export const CHANGE_HOLD_S = 30 * 60;
 
+/**
+ * PING LOSS ON AN OUTSIDE TARGET (slice 68) ships OFF, by the operator's
+ * ruling: a download that costs the internet path 15% of its pings is
+ * information, and only the operator knows whether it is worth an email.
+ * The loss is on the roster, the device page and the timeline either way,
+ * and a path that answers nothing is device-down's alert, crit, on. WARN
+ * when on (src/alerts/pingloss.ts).
+ */
+export const PING_LOSS_DEFAULT: BoolRule = { enabled: false, severity: 'warn' };
+
 /** How long a restart alert stays raised: long enough for a wall and the
  *  Alerts page to show it between glances, then it clears without an email
  *  (OPS.settleRestartClears) - nothing recovered, time passed. */
@@ -417,6 +433,10 @@ export function resolveRuleInfo(
     }
     if (kind === 'device-change') {
         const b = resolveBoolInfo(idx, config.deviceChange ?? DEVICE_CHANGE_DEFAULT, code, host, kind);
+        return { source: b.source, muted: b.muted, levels: null };
+    }
+    if (kind === 'ping-loss') {
+        const b = resolveBoolInfo(idx, config.pingLoss ?? PING_LOSS_DEFAULT, code, host, kind);
         return { source: b.source, muted: b.muted, levels: null };
     }
     if (kind === 'svc-ms' || kind === 'svc-cert' || kind === 'path-loss' || kind === 'path-jitter' || kind === 'path-mos'
