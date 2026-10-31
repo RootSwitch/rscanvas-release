@@ -177,12 +177,12 @@
                     <table class="list compact" id="dash-sites">
                         <thead><tr><th>site</th><th>location</th>
                             <th class="num" title="the last voice test's MOS, the worse direction">MOS</th>
-                            <th class="num" title="against the voice test before it">vs prev</th>
+                            <th class="num" title="against the voice test before it">vs before</th>
                             <th class="num" title="the lowest MOS in the last 24 hours">24 h low</th>
                             <th class="num" title="the worse direction of each, from the last voice test">loss / jitter</th>
                             <th class="num" title="when the voice test last ran">voice ran</th>
-                            <th class="num" title="the last throughput test, toward the site and from it">Mbps to / from</th>
-                            <th class="num" title="against the throughput test before it, the direction that moved most">vs prev</th>
+                            <th class="num" title="the last throughput test, toward the site and from it">Mb/s to / from</th>
+                            <th class="num" title="against the throughput test before it, the direction that moved most">vs before</th>
                             <th class="num" title="latency under the throughput test's load, unmarked">loaded ms</th>
                             <th class="num" title="when the bandwidth test last ran">bandwidth ran</th></tr></thead>
                         <tbody></tbody>
@@ -207,12 +207,12 @@
         <div class="panel" data-section="dashboard" id="dash-top-panel">
             <h2>Top 10 <span id="dash-window-sub" class="muted"></span></h2>
             <div class="row">
-                <label for="dash-window" class="small">over</label>
+                <span class="pair"><label for="dash-window" class="small">over</label>
                 <select id="dash-window">
                     <option value="6">6 hours</option>
                     <option value="24" selected>24 hours</option>
                     <option value="168">7 days</option>
-                </select>
+                </select></span>
                 <span id="dash-msg" class="muted small"></span>
             </div>
             <div class="dash-grid">
@@ -281,9 +281,9 @@
         <div class="panel" data-section="reports" id="report-panel">
             <h2>Interface traffic report</h2>
             <div class="row">
-                <label for="report-device" class="small">device</label>
+                <span class="pair"><label for="report-device" class="small">device</label>
                 <input type="text" id="report-device" list="report-devices" placeholder="device name"
-                       autocomplete="off" maxlength="120">
+                       autocomplete="off" maxlength="120"></span>
                 <datalist id="report-devices"></datalist>
                 <input type="text" id="report-filter" placeholder="filter its interfaces" autocomplete="off"
                        class="hidden">
@@ -296,14 +296,14 @@
                 <span id="report-none" class="muted small">none yet - pick a device above and tick its interfaces</span>
             </div>
             <div class="row">
-                <label for="report-period" class="small">period</label>
+                <span class="pair"><label for="report-period" class="small">period</label>
                 <select id="report-period">
                     <option value="this-month" selected>this month so far</option>
                     <option value="last-month">last month</option>
                     <option value="last-7">last 7 days</option>
                     <option value="last-30">last 30 days</option>
                     <option value="custom">from ... to ...</option>
-                </select>
+                </select></span>
                 <input type="date" id="report-from" class="hidden">
                 <input type="date" id="report-to" class="hidden">
                 <button type="button" id="report-run" class="btn-primary">Show report</button>
@@ -330,26 +330,26 @@
         <div class="panel" data-section="reports" id="svc-report-panel">
             <h2>Services report</h2>
             <div class="row">
-                <label for="svc-report-kind" class="small">checks</label>
+                <span class="pair"><label for="svc-report-kind" class="small">checks</label>
                 <select id="svc-report-kind">
                     <option value="voice" selected>voice tests</option>
                     <option value="bandwidth">bandwidth tests</option>
                     <option value="web">web and TCP checks</option>
-                </select>
+                </select></span>
                 <label class="small"><input type="checkbox" id="svc-report-all" checked> all of them</label>
                 <span id="svc-report-pick-msg" class="muted small"></span>
             </div>
             <div id="svc-report-pick" class="report-pick hidden"></div>
             <div class="row">
-                <label for="svc-report-period" class="small">period</label>
+                <span class="pair"><label for="svc-report-period" class="small">period</label>
                 <select id="svc-report-period">
-                    <option value="last-14" selected>last 14 days</option>
-                    <option value="last-7">last 7 days</option>
                     <option value="this-month">this month so far</option>
                     <option value="last-month">last month</option>
+                    <option value="last-7">last 7 days</option>
+                    <option value="last-14" selected>last 14 days</option>
                     <option value="last-30">last 30 days</option>
                     <option value="custom">from ... to ...</option>
-                </select>
+                </select></span>
                 <input type="date" id="svc-report-from" class="hidden">
                 <input type="date" id="svc-report-to" class="hidden">
                 <button type="button" id="svc-report-run" class="btn-primary">Show report</button>
@@ -372,20 +372,20 @@
         <div class="panel" data-section="reports" id="avail-report-panel">
             <h2>Availability report</h2>
             <div class="row">
-                <label for="avail-group" class="small">show</label>
+                <span class="pair"><label for="avail-group" class="small">show</label>
                 <select id="avail-group">
                     <option value="device" selected>every device</option>
                     <option value="location">by location</option>
                     <option value="application">by application</option>
-                </select>
-                <label for="avail-period" class="small">period</label>
+                </select></span>
+                <span class="pair"><label for="avail-period" class="small">period</label>
                 <select id="avail-period">
                     <option value="this-month" selected>this month so far</option>
                     <option value="last-month">last month</option>
                     <option value="last-7">last 7 days</option>
                     <option value="last-30">last 30 days</option>
                     <option value="custom">from ... to ...</option>
-                </select>
+                </select></span>
                 <input type="date" id="avail-from" class="hidden">
                 <input type="date" id="avail-to" class="hidden">
                 <button type="button" id="avail-run" class="btn-primary">Show report</button>
@@ -419,10 +419,10 @@
                 <button type="button" id="grammar-toggle">?</button>
             </form>
             <div class="row hidden" id="custom-window">
-                <label for="from">from</label>
-                <input type="datetime-local" id="from">
-                <label for="to">to</label>
-                <input type="datetime-local" id="to">
+                <span class="pair"><label for="from">from</label>
+                <input type="datetime-local" id="from"></span>
+                <span class="pair"><label for="to">to</label>
+                <input type="datetime-local" id="to"></span>
             </div>
             <div class="row">
                 <button type="button" id="fields-toggle">Filter by field</button>
@@ -430,15 +430,15 @@
             </div>
             <div class="hidden" id="fields">
                 <div class="row">
-                    <label for="f-host">host</label>
-                    <input type="text" id="f-host" placeholder="exact, e.g. sw-0274" autocomplete="off">
-                    <label for="f-ip">source IP</label>
-                    <input type="text" id="f-ip" placeholder="10.0.0. or 10.0.0.0/24" autocomplete="off">
-                    <label for="f-app">app</label>
-                    <input type="text" id="f-app" placeholder="exact, e.g. sshd" autocomplete="off">
+                    <span class="pair"><label for="f-host">host</label>
+                    <input type="text" id="f-host" placeholder="exact, e.g. sw-0274" autocomplete="off"></span>
+                    <span class="pair"><label for="f-ip">source IP</label>
+                    <input type="text" id="f-ip" placeholder="10.0.0. or 10.0.0.0/24" autocomplete="off"></span>
+                    <span class="pair"><label for="f-app">app</label>
+                    <input type="text" id="f-app" placeholder="exact, e.g. sshd" autocomplete="off"></span>
                 </div>
                 <div class="row">
-                    <label for="f-sev">severity at most</label>
+                    <span class="pair"><label for="f-sev">severity at most</label>
                     <select id="f-sev">
                         <option value="">any</option>
                         <option value="0">0 emerg</option>
@@ -449,11 +449,11 @@
                         <option value="5">5 notice</option>
                         <option value="6">6 info</option>
                         <option value="7">7 debug</option>
-                    </select>
-                    <label for="f-fac">facility</label>
-                    <input type="text" id="f-fac" placeholder="number, e.g. 3" autocomplete="off" size="8">
-                    <label for="f-msg">message contains</label>
-                    <input type="text" id="f-msg" class="grow" placeholder="plain substring, no operators" autocomplete="off">
+                    </select></span>
+                    <span class="pair"><label for="f-fac">facility</label>
+                    <input type="text" id="f-fac" placeholder="number, e.g. 3" autocomplete="off" size="8"></span>
+                    <span class="pair"><label for="f-msg">message contains</label>
+                    <input type="text" id="f-msg" class="grow" placeholder="plain substring, no operators" autocomplete="off"></span>
                     <button type="button" id="fields-clear">Clear</button>
                 </div>
             </div>
@@ -624,11 +624,11 @@
                  the only identity it will ever have. A different flow, not a
                  flag on this one. -->
             <div class="row">
-                <label for="ob-monitor">monitor by</label>
+                <span class="pair"><label for="ob-monitor">monitor by</label>
                 <select id="ob-monitor">
                     <option value="snmp" selected>SNMP (probe, then review what answered)</option>
                     <option value="icmp">ping only (no agent - ISPs, the internet, appliances)</option>
-                </select>
+                </select></span>
             </div>
             <div id="ob-ping" class="hidden">
                 <div class="hints">
@@ -639,18 +639,18 @@
                 <textarea id="ob-ping-hosts" rows="4" class="grow"
                           placeholder="8.8.8.8 Internet&#10;198.51.100.1 ISP-A handoff"></textarea>
                 <div class="row">
-                    <label for="ob-ping-location">location</label>
-                    <input type="text" id="ob-ping-location" autocomplete="off" maxlength="120" list="group-values">
-                    <label for="ob-ping-application">application</label>
+                    <span class="pair"><label for="ob-ping-location">location</label>
+                    <input type="text" id="ob-ping-location" autocomplete="off" maxlength="120" list="group-values"></span>
+                    <span class="pair"><label for="ob-ping-application">application</label>
                     <input type="text" id="ob-ping-application" autocomplete="off" maxlength="120"
-                           list="group-values" placeholder="e.g. External">
+                           list="group-values" placeholder="e.g. External"></span>
                     <button type="button" id="ob-ping-add" class="btn-primary">Add these</button>
                     <span id="ob-ping-msg" class="muted small"></span>
                 </div>
             </div>
             <div class="row" id="ob-single-row">
-                <label for="ob-host">address</label>
-                <input type="text" id="ob-host" class="grow" placeholder="IP or hostname" autocomplete="off">
+                <span class="pair"><label for="ob-host">address</label>
+                <input type="text" id="ob-host" class="grow" placeholder="IP address" autocomplete="off"></span>
             </div>
             <div class="row hidden" id="ob-bulk-row">
                 <label for="ob-hosts">hosts</label>
@@ -665,24 +665,24 @@
                     <span id="ob-scan-msg" class="muted small"></span>
                 </div>
                 <textarea id="ob-hosts" rows="4" class="grow"
-                          placeholder="one address or hostname per line - or paste a CSV with an ip / address column - or scan a subnet above"></textarea>
+                          placeholder="one IP address per line - or paste a CSV with an ip / address column - or scan a subnet above"></textarea>
             </div>
             <div class="row" id="ob-snmp-row">
-                <label for="ob-version">SNMP</label>
+                <span class="pair"><label for="ob-version">SNMP</label>
                 <select id="ob-version">
                     <option value="2c" selected>v2c</option>
                     <option value="1">v1</option>
                     <option value="3">v3</option>
-                </select>
-                <label for="ob-port">port</label>
-                <input type="text" id="ob-port" value="161" size="6" autocomplete="off">
+                </select></span>
+                <span class="pair"><label for="ob-port">port</label>
+                <input type="text" id="ob-port" value="161" size="6" autocomplete="off"></span>
                 <!-- LABELLED AS A VARIABLE NAME, not "credential". A tooltip
                      nobody hovers is not a label: an operator with a mixed
                      estate typed the community string in here, it was read as
                      a variable name, and the probe silently fell back to the
                      fleet default. The backend refuses that now; this stops it
                      being an easy mistake to make in the first place. -->
-                <label for="ob-cred">credential</label>
+                <span class="pair"><label for="ob-cred">credential</label>
                 <!-- A PICKER over what exists, not a blank box. The blank box is
                      what got a community string typed into it on 2026-08-16.
                      Options come from /api/credentials: profiles and env names,
@@ -690,10 +690,10 @@
                      works, and an unknown name is refused per host by name. -->
                 <input type="text" id="ob-cred" value="SNMP_COMMUNITY" autocomplete="off" list="ob-cred-list"
                        placeholder="pick a profile or env var"
-                       title="The NAME of a credential profile or of an environment variable - never the community itself. Profiles are managed under System > Credentials.">
+                       title="The NAME of a credential profile or of an environment variable - never the community itself. Profiles are managed under System > Credentials."></span>
                 <datalist id="ob-cred-list"></datalist>
-                <label for="ob-interval">poll every</label>
-                <input type="text" id="ob-interval" value="30" size="5" autocomplete="off">
+                <span class="pair"><label for="ob-interval">poll every</label>
+                <input type="text" id="ob-interval" value="30" size="5" autocomplete="off"></span>
                 <button type="button" id="ob-probe" class="btn-primary">Test &amp; discover</button>
                 <button type="button" id="ob-bulk-toggle">Bulk add...</button>
                 <button type="button" id="ob-cancel">Cancel</button>
@@ -735,23 +735,23 @@
                      port raised a crit on the first scans. Remembered per
                      browser; the server's default is today's behaviour. -->
                 <div class="row">
-                    <label for="ob-track">track</label>
+                    <span class="pair"><label for="ob-track">track</label>
                     <select id="ob-track">
                         <option value="all">all ports</option>
                         <option value="active">active ports only - up now</option>
-                    </select>
-                    <label for="ob-linkdown">link-down alerts</label>
+                    </select></span>
+                    <span class="pair"><label for="ob-linkdown">link-down alerts</label>
                     <select id="ob-linkdown">
                         <option value="on">on for every tracked port</option>
                         <option value="manual">manual - turn ports on from the device page</option>
-                    </select>
+                    </select></span>
                 </div>
                 <div class="muted small">Untracked ports stay on the device page, ready to tick later.<span class="more-text">Untracked ports stay listed on the device page and can be ticked later. Manual mutes link down only - errors, discards and utilization still alert - and each port is switched on from its row (uplinks, host ports). A device added without an answer tracks by the usual rule when it first answers.</span></div>
 
                 <div class="row">
-                    <label for="ob-application">application</label>
+                    <span class="pair"><label for="ob-application">application</label>
                     <input type="text" id="ob-application" class="grow" autocomplete="off" maxlength="120"
-                           list="group-values" placeholder="optional - applies to every device added now, e.g. Guest PCs">
+                           list="group-values" placeholder="optional - applies to every device added now, e.g. Guest PCs"></span>
                 </div>
 
                 <div class="row">
@@ -892,8 +892,8 @@
                  is a fact about ONE device and the page about that device is
                  where an operator has just confirmed which one it is. -->
             <form id="rename-form" class="row" data-can="device.rename">
-                <label for="dev-newname">rename to</label>
-                <input type="text" id="dev-newname" placeholder="new device name" autocomplete="off" maxlength="120">
+                <span class="pair"><label for="dev-newname">rename to</label>
+                <input type="text" id="dev-newname" placeholder="new device name" autocomplete="off" maxlength="120"></span>
                 <button type="submit">Rename</button>
                 <span id="rename-msg" class="muted small"></span>
             </form>
@@ -901,8 +901,8 @@
                  delete and re-add, which threw it away. Polled at the new
                  address on the next tick. -->
             <form id="address-form" class="row" data-can="device.address">
-                <label for="dev-newhost">move to</label>
-                <input type="text" id="dev-newhost" placeholder="IP address" autocomplete="off" maxlength="64">
+                <span class="pair"><label for="dev-newhost">move to</label>
+                <input type="text" id="dev-newhost" placeholder="IP address" autocomplete="off" maxlength="64"></span>
                 <input type="number" id="dev-newport" placeholder="port" min="1" max="65535">
                 <button type="submit">Move</button>
                 <span id="address-msg" class="muted small"></span>
@@ -911,20 +911,20 @@
                  for what no poll can know. Shown to every role on the page
                  above the cards; edited here with the grouping right. -->
             <form id="notes-form" class="row" data-can="device.group">
-                <label for="dev-notes">notes</label>
+                <span class="pair"><label for="dev-notes">notes</label>
                 <textarea id="dev-notes" class="grow notes-edit" rows="4" maxlength="2000"
-                          placeholder="owner, who to call, asset tag, warranty, where it sits - anything worth knowing at 3am"></textarea>
+                          placeholder="owner, who to call, asset tag, warranty, where it sits - anything worth knowing at 3am"></textarea></span>
                 <button type="submit">Save notes</button>
                 <span id="notes-msg" class="muted small"></span>
             </form>
             <h3 class="edit-group" data-can="device.group">Grouping</h3>
             <form id="grouping-form" class="row" data-can="device.group">
-                <label for="dev-location">location</label>
+                <span class="pair"><label for="dev-location">location</label>
                 <input type="text" id="dev-location" placeholder="optional - e.g. HQ / Floor 2 / Rack 4"
-                       autocomplete="off" maxlength="120">
-                <label for="dev-application">application</label>
+                       autocomplete="off" maxlength="120"></span>
+                <span class="pair"><label for="dev-application">application</label>
                 <input type="text" id="dev-application" placeholder="optional - e.g. PAM Prod"
-                       autocomplete="off" maxlength="120">
+                       autocomplete="off" maxlength="120"></span>
                 <button type="submit">Save</button>
                 <span id="grouping-msg" class="muted small"></span>
             </form>
@@ -949,12 +949,12 @@
                  only when every ping is lost, degraded when the last minute's
                  lose too many. -->
             <div class="row" data-can="device.group">
-                <label for="dev-outside" class="small">outside target</label>
+                <span class="pair"><label for="dev-outside" class="small">outside target</label>
                 <select id="dev-outside">
                     <option value="auto">auto - by its address</option>
                     <option value="yes">yes</option>
                     <option value="no">no</option>
-                </select>
+                </select></span>
                 <span id="dev-outside-verdict" class="muted small"></span>
                 <span id="outside-msg" class="small"></span>
             </div>
@@ -977,7 +977,7 @@
             <!-- Or a repeating one (slice 61): the nightly backup, the daily
                  reboot - every occurrence at a local time, for its minutes. -->
             <form id="maint-dev-form" class="row" data-can="alert.suppress">
-                <label for="dev-maint-repeat">maintenance</label>
+                <span class="pair"><label for="dev-maint-repeat">maintenance</label>
                 <select id="dev-maint-repeat">
                     <option value="">once, from now</option>
                     <option value="1,2,3,4,5,6,7">every day</option>
@@ -990,13 +990,13 @@
                     <option value="5">Fridays</option>
                     <option value="6">Saturdays</option>
                     <option value="7">Sundays</option>
-                </select>
+                </select></span>
                 <span id="dev-maint-at-wrap" class="hidden">
-                    <label for="dev-maint-at">at</label>
-                    <input type="time" id="dev-maint-at" value="03:00">
+                    <span class="pair"><label for="dev-maint-at">at</label>
+                    <input type="time" id="dev-maint-at" value="03:00"></span>
                 </span>
-                <label for="dev-maint-min">for</label>
-                <input type="number" id="dev-maint-min" value="120" min="1" max="43200"> minutes
+                <span class="pair"><label for="dev-maint-min">for</label>
+                <input type="number" id="dev-maint-min" value="120" min="1" max="43200"></span> minutes
                 <input type="text" id="dev-maint-note" placeholder="optional note" maxlength="500">
                 <button type="submit" id="dev-maint-go">Start window</button>
                 <span id="maint-dev-msg" class="muted small"></span>
@@ -1145,32 +1145,32 @@
                 <div id="service-cards" class="cards svc-cards"></div>
                 <div id="svc-form" class="svc-form hidden">
                     <div class="form-grid">
-                        <label for="svc-kind">check</label>
+                        <span class="pair"><label for="svc-kind">check</label>
                         <select id="svc-kind">
                             <option value="svc-http" selected>a web page or endpoint (http, https)</option>
                             <option value="svc-tcp">a TCP port</option>
                             <option value="path-voice">a voice path - an iperf3 responder at a site</option>
                             <option value="path-tput">a throughput path - an iperf3 responder at a site</option>
-                        </select>
-                        <label for="svc-name">name</label>
-                        <input type="text" id="svc-name" maxlength="80" autocomplete="off" placeholder="blank: named after its address">
-                        <label for="svc-url" class="svc-http">URL</label>
+                        </select></span>
+                        <span class="pair"><label for="svc-name">name</label>
+                        <input type="text" id="svc-name" maxlength="80" autocomplete="off" placeholder="blank: named after its address"></span>
+                        <span class="pair"><label for="svc-url" class="svc-http">URL</label>
                         <input type="text" id="svc-url" class="svc-http" maxlength="2048" autocomplete="off"
-                               placeholder="https://portal.example.com/health">
+                               placeholder="https://portal.example.com/health"></span>
                         <label for="svc-method" class="svc-http">request</label>
                         <div class="row svc-http">
                             <select id="svc-method">
                                 <option value="GET" selected>GET</option>
                                 <option value="HEAD">HEAD</option>
                             </select>
-                            <label for="svc-expect">expect status</label>
-                            <input type="text" id="svc-expect" size="14" autocomplete="off" placeholder="200-299">
+                            <span class="pair"><label for="svc-expect">expect status</label>
+                            <input type="text" id="svc-expect" size="14" autocomplete="off" placeholder="200-299"></span>
                         </div>
-                        <label for="svc-connect" class="svc-http">connect to</label>
+                        <span class="pair"><label for="svc-connect" class="svc-http">connect to</label>
                         <select id="svc-connect" class="svc-http">
                             <option value="resolve" selected>the address its name resolves to, looked up every run</option>
                             <option value="pin">this device's address, sending the name</option>
-                        </select>
+                        </select></span>
                         <label for="svc-verify" class="svc-http">certificate</label>
                         <label class="svc-http"><input type="checkbox" id="svc-verify" checked> verify it (untick for an internal site's self-signed one)</label>
                         <label for="svc-assert-type" class="svc-http">and check that</label>
@@ -1190,10 +1190,10 @@
                             </select>
                             <input type="text" id="svc-assert-values" class="svc-assert-json hidden" size="18" autocomplete="off" placeholder="ok  (one-of: comma-separated)">
                         </div>
-                        <label for="svc-host" class="svc-target hidden">host</label>
-                        <input type="text" id="svc-host" class="svc-target hidden" autocomplete="off" placeholder="blank: this device's address">
-                        <label for="svc-port" class="svc-target hidden">port</label>
-                        <input type="text" id="svc-port" class="svc-target hidden" size="6" autocomplete="off">
+                        <span class="pair"><label for="svc-host" class="svc-target hidden">host</label>
+                        <input type="text" id="svc-host" class="svc-target hidden" autocomplete="off" placeholder="blank: this device's address"></span>
+                        <span class="pair"><label for="svc-port" class="svc-target hidden">port</label>
+                        <input type="text" id="svc-port" class="svc-target hidden" size="6" autocomplete="off"></span>
                         <!-- A VOICE TEST (slice 60): one G.711-shaped call, 64 kbps both
                              ways at once, against an iperf3 responder - the device the
                              test belongs to, unless a host is given. -->
@@ -1221,7 +1221,7 @@
                                 <option value="max">uncapped - as fast as the link goes</option>
                             </select>
                             <input type="text" id="svc-cap" class="svc-headroom" size="6" autocomplete="off" placeholder="200">
-                            <span class="muted small svc-headroom">Mbps each way - proves the site can still get that much</span>
+                            <span class="muted small svc-headroom">Mb/s each way - proves the site can still get that much</span>
                         </div>
                         <label for="svc-hours" class="svc-max hidden">runs</label>
                         <div class="row svc-max hidden">
@@ -1234,12 +1234,12 @@
                             <input type="text" id="svc-wend" class="svc-window" size="3" autocomplete="off" value="5">
                             <span class="muted small svc-window">:00, this box's time - it fills the link while it runs</span>
                         </div>
-                        <label for="svc-outside" class="svc-service">outside service</label>
+                        <span class="pair"><label for="svc-outside" class="svc-service">outside service</label>
                         <select id="svc-outside" class="svc-service">
                             <option value="auto" selected>decide by the address it reaches - a public one is outside</option>
                             <option value="yes">yes - count it toward the outside services alert</option>
                             <option value="no">no - it is on our network</option>
-                        </select>
+                        </select></span>
                         <label for="svc-interval">every</label>
                         <div class="row">
                             <input type="text" id="svc-interval" size="6" autocomplete="off" value="60">
@@ -1359,11 +1359,11 @@
                     <option value="7">Sundays</option>
                 </select>
                 <span id="maint-at-wrap" class="hidden">
-                    <label for="maint-at">at</label>
-                    <input type="time" id="maint-at" value="03:00">
+                    <span class="pair"><label for="maint-at">at</label>
+                    <input type="time" id="maint-at" value="03:00"></span>
                 </span>
-                <label for="maint-min">for</label>
-                <input type="number" id="maint-min" value="120" min="1" max="43200"> minutes
+                <span class="pair"><label for="maint-min">for</label>
+                <input type="number" id="maint-min" value="120" min="1" max="43200"></span> minutes
                 <input type="text" id="maint-note" placeholder="optional note" maxlength="500">
                 <button type="submit" id="maint-go">Open window</button>
                 <span id="maint-msg" class="muted small"></span>
@@ -1408,12 +1408,12 @@
             <form id="password-form" class="row">
                 <!-- For password managers: which account this form is for. -->
                 <input type="text" id="pw-username" class="hidden" autocomplete="username" readonly tabindex="-1">
-                <label for="pw-current" class="small">current password</label>
-                <input type="password" id="pw-current" autocomplete="current-password" required>
-                <label for="pw-new" class="small">new password</label>
-                <input type="password" id="pw-new" autocomplete="new-password" minlength="8" required>
-                <label for="pw-confirm" class="small">again</label>
-                <input type="password" id="pw-confirm" autocomplete="new-password" minlength="8" required>
+                <span class="pair"><label for="pw-current" class="small">current password</label>
+                <input type="password" id="pw-current" autocomplete="current-password" required></span>
+                <span class="pair"><label for="pw-new" class="small">new password</label>
+                <input type="password" id="pw-new" autocomplete="new-password" minlength="8" required></span>
+                <span class="pair"><label for="pw-confirm" class="small">again</label>
+                <input type="password" id="pw-confirm" autocomplete="new-password" minlength="8" required></span>
                 <button type="submit">Change password</button>
                 <span id="pw-msg" class="small"></span>
             </form>
@@ -1502,10 +1502,10 @@
              message - authoring one is a change to the hot path. -->
         <div class="panel hidden" data-section="system" id="rules-panel" data-can="alertrule.read">
             <h2>Syslog and trap alert rules <span id="rules-sub" class="muted"></span></h2>
-            <p class="muted small">An alert when a syslog message or SNMP trap matches a pattern.<span class="more-text">Raise an alert when an incoming syslog message or SNMP trap matches a pattern - "authentication failure" in a log line, or a linkDown trap's OID. The alert raises the moment a matching message arrives, names the device that sent it, and clears on its own once no matching message has arrived for the "clears after" time. Rules run on every message received, so keep patterns specific.</span></p>
+            <p class="muted small">An alert when a syslog message or SNMP trap matches a pattern.<span class="more-text">Raise an alert when an incoming syslog message or SNMP trap matches a pattern - "authentication failure" in a log line, or a linkDown trap's OID. The alert raises the moment a matching message arrives, names the device that sent it, and clears on its own once no matching message has arrived for the "clears after" time. Rules run on every message received, so keep patterns specific. A rule hears every sender unless it is limited to one device, location or application - known by the address it sends from, or by the host a relayed line names - so "ether1 link down" can mean one switch.</span></p>
             <table class="list" id="rules-table">
                 <thead><tr>
-                    <th>rule</th><th>pattern</th><th>source</th><th>severity</th>
+                    <th>rule</th><th>pattern</th><th>source</th><th>hears</th><th>severity</th>
                     <th class="num">clears after</th><th>enabled</th><th></th>
                 </tr></thead>
                 <tbody></tbody>
@@ -1515,19 +1515,32 @@
                 <input type="text" id="rule-pattern" class="grow" autocomplete="off"
                        placeholder="substring to match - e.g. link state changed, or 1.3.6.1.6.3.1.1.5.3 for linkDown traps">
                 <label><input type="checkbox" id="rule-regex"> regex</label>
-                <label for="rule-source" class="small muted">from</label>
+                <span class="pair"><label for="rule-source" class="small muted">from</label>
                 <select id="rule-source">
                     <option value="any" selected>syslog or trap</option>
                     <option value="syslog">syslog only</option>
                     <option value="trap">traps only</option>
-                </select>
+                </select></span>
+                <!-- A RULE'S SCOPE (slice 70): every sender, or one device or
+                     group - matched by the sender's address, or the host a
+                     relayed line names. -->
+                <span class="pair"><label for="rule-scope" class="small muted">hears</label>
+                <select id="rule-scope">
+                    <option value="" selected>every sender</option>
+                    <option value="device">one device</option>
+                    <option value="location">a location</option>
+                    <option value="application">an application</option>
+                </select></span>
+                <input type="text" id="rule-scope-value" class="hidden" placeholder="name" size="14"
+                       autocomplete="off" maxlength="200" list="rule-scope-targets" aria-label="device or group the rule hears">
+                <datalist id="rule-scope-targets"></datalist>
                 <select id="rule-severity">
                     <option value="warn" selected>warn</option>
                     <option value="crit">crit</option>
                 </select>
-                <label for="rule-ttl" class="small muted">clears after</label>
+                <span class="pair"><label for="rule-ttl" class="small muted">clears after</label>
                 <input type="text" id="rule-ttl" value="300" size="5" autocomplete="off"
-                       title="seconds without a match before the alert clears"> <span class="small muted">s</span>
+                       title="seconds without a match before the alert clears"></span> <span class="small muted">s</span>
                 <button type="button" id="rule-add" class="btn-primary">Add rule</button>
             </div>
             <div id="rules-msg" class="muted small"></div>
@@ -1658,15 +1671,15 @@
                 <div class="row">
                     <strong id="grid-title"></strong>
                     <label class="small"><input type="checkbox" id="grid-auto"> auto columns</label>
-                    <label for="grid-cols">or exactly</label>
-                    <input type="number" id="grid-cols" min="1" max="24" placeholder="off">
+                    <span class="pair"><label for="grid-cols">or exactly</label>
+                    <input type="number" id="grid-cols" min="1" max="24" placeholder="off"></span>
                     <span class="muted small">auto fits each display's screen; a number forces it<span class="more-text">Auto fits the display's own screen - the field set fixes the tile height, so the arithmetic is exact. A number forces that many columns. Both blank: the board is drawn from its coordinates.</span></span></span>
                 </div>
                 <!-- Slice 67: sections by the board's own groups, or by the
                      other axis - a team's applications, divided by where. -->
                 <div class="row">
-                    <label for="grid-section">divide by</label>
-                    <select id="grid-section"></select>
+                    <span class="pair"><label for="grid-section">divide by</label>
+                    <select id="grid-section"></select></span>
                     <span class="muted small">its own groups keep their order; the other axis sorts by name<span class="more-text">the board's own groups keep the order they were declared in; the other axis sorts its sections by name</span></span>
                 </div>
                 <div class="muted small">allowed on its displays<span class="more-text">What any display of
@@ -1691,11 +1704,11 @@
                  boards - is kept behind BOARDS_MANUAL_LAYOUT (config.ts). -->
             <h3>Generate a board from a group</h3>
             <div class="row">
-                <label for="inv-axis">group by</label>
+                <span class="pair"><label for="inv-axis">group by</label>
                 <select id="inv-axis">
                     <option value="location">location</option>
                     <option value="application">application</option>
-                </select>
+                </select></span>
                 <input type="text" id="inv-value" placeholder="a group, or several with commas (a team board)"
                        class="grow" autocomplete="off" list="group-values">
                 <datalist id="group-values"></datalist>
@@ -1715,8 +1728,8 @@
                  RSCanvas never parses .xcanvas and never couples to its file
                  version. -->
             <div class="row manual-layout hidden">
-                <label for="imp-board">import layout into</label>
-                <select id="imp-board"></select>
+                <span class="pair"><label for="imp-board">import layout into</label>
+                <select id="imp-board"></select></span>
                 <input type="file" id="imp-file" accept=".csv,text/csv,text/tab-separated-values">
                 <button type="button" id="imp-go">Import layout</button>
             </div>

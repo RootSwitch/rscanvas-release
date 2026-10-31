@@ -62,6 +62,7 @@ import { changeScan, DEFAULT_RULES } from '../src/alerts/scan.ts';
 import { assertDestructiveTarget } from '../src/safety.ts';
 import { generatedShapes } from '../src/boards/reconcile.ts';
 import { summarizeReadings } from '../src/collector/summary.ts';
+import { planSensorRepin } from '../src/collector/sensors.ts';
 
 process.exitCode = 1;
 let pass = 0, fail = 0;
@@ -1256,6 +1257,118 @@ console.log('\n28. a board\'s shown-by-default fields, and a device\'s GPU loads
     eq('a device that is not up carries no GPU reading on its tile', (await proj()).gpu, null);
     await OPS.deleteBoard(id);
     await OPS.deleteDevices([DEV]);
+}
+
+// --- 29. the near-miss hint looks only where the search index reaches (2026-10-30) ---
+console.log('\n29. a zero-result search\'s "did you mean", against real partitions:');
+{
+    // Today's partition carries both trigram indexes; ten days ago's does not,
+    // and neither does yesterday's, so the indexed run is today alone.
+    const day = (offset: number): string => {
+        const d = new Date(Date.now() + offset * 86_400_000);
+        return d.toISOString().slice(0, 10);
+    };
+    await q(`SELECT ensure_daily_partitions('messages', $1::date, $2::date)`, [day(-10), day(1)]);
+    const today = `messages_${day(0).replace(/-/g, '')}`;
+    for (const col of ['msg', 'host']) {
+        await q(`CREATE INDEX IF NOT EXISTS ${today}_${col}_trgm ON ${today} USING gin (${col} gin_trgm_ops)`);
+    }
+    await q(`INSERT INTO messages (ts, host, app, msg) VALUES
+        (now() - interval '1 minute', 'scratch-core-sw-1', 'scratch-dhcpd', 'today'),
+        (now() - interval '10 days', 'scratch-old-core', 'scratch-dhcpd-old', 'ten days ago')`);
+    const month = new Date(Date.now() - 30 * 86_400_000);
+    const soon = new Date(Date.now() + 60_000);
+    const midnight = `${day(0)}T00:00:00.000Z`;
+    const host = await OPS.uiNearMisses(month, soon, 'core', null);
+    eq('a month-wide host: typo finds today\'s near miss, not the unindexed one ten days back',
+        host.ok ? host.rows.map((r) => r.value) : host, ['scratch-core-sw-1']);
+    eq('and says it looked from the start of the indexed run, midnight UTC',
+        host.ok ? host.rows.map((r) => r.since.toISOString()) : null, [midnight]);
+    const app = await OPS.uiNearMisses(month, soon, null, 'dhcp');
+    eq('app: the same reach - today\'s app, not the old one',
+        app.ok ? app.rows.map((r) => r.value) : app, ['scratch-dhcpd']);
+    const before = await OPS.uiNearMisses(month, new Date(Date.now() - 5 * 86_400_000), 'core', null);
+    eq('a window the index cannot reach answers empty, and ok',
+        before.ok ? before.rows.length : before, 0);
+    await q(`DELETE FROM messages WHERE host LIKE 'scratch-%'`);
+}
+
+// --- 30. a filesystem replaced at its index parks, and frees it (2026-10-30) ----------
+console.log('\n30. a filesystem replaced at its index: parked in the re-pin\'s write, its index free for the newcomer:');
+{
+    const DEV = 'scratch-replaced';
+    await q(`INSERT INTO devices (id, name, host) VALUES (990050, $1, '192.0.2.50')`, [DEV]);
+    const fx = (i: number) => ({ style: 'hr-storage', allocUnits: 4096,
+        usedOid: `1.3.6.1.2.1.25.2.3.1.6.${i}`, sizeOid: `1.3.6.1.2.1.25.2.3.1.5.${i}` });
+    await q(`INSERT INTO entities (id, device_id, kind, snmp_index, name, code, tracked, extra, lv_v0, lv_v1) VALUES
+             (990501, 990050, 'fs', '52', '/mnt/models', 'RPL1', true, $1::jsonb, 1e9, 2e9),
+             (990502, 990050, 'fs', '37', '/', 'RPL2', true, $2::jsonb, 1e9, 2e9)`,
+    [JSON.stringify(fx(52)), JSON.stringify(fx(37))]);
+    const rows = await OPS.sensorRowsForRepin('990050');
+    const plan = planSensorRepin([
+        { kind: 'fs', snmpIndex: '37', name: '/', extra: fx(37) },
+        { kind: 'fs', snmpIndex: '52', name: '/mnt/scratch', extra: fx(52) },
+    ], rows.ok ? rows.rows : []);
+    eq('the planner parks the replaced disk only', plan.map((u) => [u.id, u.snmpIndex, u.park?.by]), [['990501', 'gone-990501', '/mnt/scratch']]);
+    const w = await OPS.repinSensors('990050', plan.map((u) => ({
+        id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra), name: u.rename?.to ?? null, park: u.park !== undefined,
+    })));
+    eq('the write lands', w.ok && w.rows.map((r) => r.id), ['990501']);
+    eq('parked: untracked, index freed, no OIDs, no stale reading, name and code kept',
+        await q(`SELECT name, code, tracked, snmp_index, extra ? 'usedOid' AS has_oid, lv_v0, lv_v1 FROM entities WHERE id = 990501`),
+        [{ name: '/mnt/models', code: 'RPL1', tracked: false, snmp_index: 'gone-990501', has_oid: false, lv_v0: null, lv_v1: null }]);
+    eq('the other disk is untouched',
+        await q(`SELECT tracked, snmp_index, lv_v0 FROM entities WHERE id = 990502`), [{ tracked: true, snmp_index: '37', lv_v0: 1e9 }]);
+    const added = await OPS.insertEntity('990050', 'fs', '52', '/mnt/scratch', null, null, null, 'RPL3', JSON.stringify(fx(52)), true);
+    eq('Rediscover\'s insert of the newcomer lands at the freed index',
+        added.ok && added.rows.length, 1);
+    const again = await OPS.sensorRowsForRepin('990050');
+    eq('the next pass plans nothing: the parked row stays parked, the newcomer is home',
+        planSensorRepin([
+            { kind: 'fs', snmpIndex: '37', name: '/', extra: fx(37) },
+            { kind: 'fs', snmpIndex: '52', name: '/mnt/scratch', extra: fx(52) },
+        ], again.ok ? again.rows : []), []);
+    await OPS.deleteDevices([DEV]);
+}
+
+// --- 31. a log rule limited to one device or group (sql/slice70.sql) ------------------
+console.log('\n31. a log rule\'s scope, resolved to device names when the rules load:');
+{
+    await q(`INSERT INTO devices (id, name, host, location, application) VALUES
+             (990060, 'scratch-crs', '192.0.2.60', 'scratch-HQ', 'scratch-Network'),
+             (990061, 'scratch-crs-b', '192.0.2.61', 'scratch-HQ', NULL),
+             (990062, 'scratch-other', '192.0.2.62', 'scratch-Lab', 'scratch-Network')`);
+    const mk = async (name: string, kind: string | null, value: string | null) => {
+        const r = await OPS.createEventRule(name, 'link down', false, 'any', 'warn', 300, 'scratch', kind, value);
+        return r.ok ? String(r.rows[0]?.id) : `refused: ${r.reason}`;
+    };
+    const ids = [await mk('scratch-open', null, null), await mk('scratch-dev', 'device', 'scratch-crs'),
+        await mk('scratch-loc', 'location', 'scratch-HQ'), await mk('scratch-app', 'application', 'scratch-Network')];
+    const armed = await OPS.eventRules();
+    const scopeOf = (id: string) => (armed.ok ? armed.rows.find((r) => r.id === id)?.scope_devices : 'refused');
+    eq('an unscoped rule loads with no scope - every sender', scopeOf(ids[0]!), null);
+    eq('a device scope resolves to that device', scopeOf(ids[1]!), ['scratch-crs']);
+    eq('a location scope to its devices', scopeOf(ids[2]!), ['scratch-crs', 'scratch-crs-b']);
+    eq('an application scope to its devices', scopeOf(ids[3]!), ['scratch-crs', 'scratch-other']);
+    await q(`UPDATE devices SET location = 'scratch-Lab' WHERE id = 990061`);
+    const moved = await OPS.eventRules();
+    eq('a device leaving the location leaves the scope on the next load',
+        moved.ok ? moved.rows.find((r) => r.id === ids[2])?.scope_devices : null, ['scratch-crs']);
+    await OPS.setEventRuleScope(ids[1]!, null, null);
+    const opened = await OPS.eventRules();
+    eq('setting the scope to everywhere clears both columns',
+        [opened.ok ? opened.rows.find((r) => r.id === ids[1])?.scope_devices : 'x',
+            (await q(`SELECT scope_kind, scope_value FROM event_rules WHERE id = $1::bigint`, [ids[1]]))[0]],
+        [null, { scope_kind: null, scope_value: null }]);
+    const counts = await Promise.all([
+        OPS.eventScopeMembers('device', 'scratch-crs'), OPS.eventScopeMembers('location', 'scratch-Lab'),
+        OPS.eventScopeMembers('device', 'scratch-typo')]);
+    eq('the member count the route refuses a typo by', counts.map((c) => (c.ok ? c.rows[0]?.n : -1)), [1, 2, 0]);
+    let refused = false;
+    try { await q(`INSERT INTO event_rules (name, pattern, severity, scope_kind) VALUES ('scratch-bad', 'x', 'warn', 'device')`); } catch { refused = true; }
+    eq('the schema refuses a kind with no name', refused, true);
+    await q(`DELETE FROM event_rules WHERE name LIKE 'scratch-%'`);
+    await OPS.deleteDevices(['scratch-crs', 'scratch-crs-b', 'scratch-other']);
 }
 
 await db.end();

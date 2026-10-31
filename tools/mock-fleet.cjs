@@ -23,12 +23,24 @@
 //                 numbers mounts in mount order (2026-10-22: a production
 //                 GPU server traded /mnt/models and /boot/efi this way).
 //                 Restart a mock with it to drill the re-pin (default 0)
+//   STORAGE_REPLACE  1 serves the LAST disk's index under a new name,
+//                 /mnt/replaced - a filesystem replaced where another was,
+//                 its old name gone. Restart a mock with it to drill the
+//                 re-pin's parking (2026-10-30, rule 3) (default 0)
 //   CPUS_PER      processors per device       (default 2)
 //   DEAD_PCT      percent of the port range left UNBOUND (default 10)
 //   TICK_MS       counter movement interval   (default 5000)
 //   RENAME_PCT    percent of interfaces whose ifName/ifDescr differ (default 0)
 //   RESPONSE_MS   slowest device's reply time in ms; the fleet is spread
 //                 deterministically across 0..RESPONSE_MS   (default 0 = instant)
+//   STALL_MS      EVERY device answers every request after exactly this long,
+//                 overriding RESPONSE_MS - the broken agent that answers just
+//                 inside the timeout, which the poll's deadline exists for
+//                 (beta list S6, 2026-10-31)                 (default 0 = off)
+//   GROW_EVERY_S / GROW_BY   every GROW_EVERY_S seconds each device serves
+//                 GROW_BY more interfaces at climbing indexes - churning
+//                 tunnels, or an agent that means harm; the device's interface
+//                 cap exists for it (beta list S6)            (default 0 = off)
 //   TEMPS_PER     LM-SENSORS temperature rows per device    (default 0 = none)
 //   SENSOR_MODE   how sensor values move over time         (default 'drift')
 //                   drift  wander inside a band that never crosses a default
@@ -114,11 +126,15 @@ const BASE     = int(process.env.BASE_PORT, 16100);
 const IFACES   = int(process.env.IFACES_PER, 8);
 const STORES   = int(process.env.STORAGE_PER, 3);
 const STORAGE_SWAP = process.env.STORAGE_SWAP === '1';
+const STORAGE_REPLACE = process.env.STORAGE_REPLACE === '1';
 const CPUS     = int(process.env.CPUS_PER, 2);
 const DEAD_PCT = int(process.env.DEAD_PCT, 10);
 const TICK_MS  = int(process.env.TICK_MS, 5000);
 const RENAME_PCT = int(process.env.RENAME_PCT, 0);
 const RESPONSE_MS = int(process.env.RESPONSE_MS, 0);
+const STALL_MS = int(process.env.STALL_MS, 0);
+const GROW_EVERY_S = int(process.env.GROW_EVERY_S, 0);
+const GROW_BY = int(process.env.GROW_BY, 0);
 const SHIFT    = int(process.env.SHIFT_INDEXES, 0);
 const TEMPS    = int(process.env.TEMPS_PER, 0);
 const SENSOR_MODE = (process.env.SENSOR_MODE || 'drift').toLowerCase();
@@ -208,7 +224,8 @@ function buildDevice(i) {
     // it delays the reply while leaving the value the MIB would have returned
     // untouched. All varbinds of one PDU wait in parallel, so a request costs
     // `delay`, not delay x varbinds - which is how a real agent behaves.
-    const devDelayMs = RESPONSE_MS > 0 ? Math.round(RESPONSE_MS * (((i * 37) % 100) + 1) / 100) : 0;
+    const devDelayMs = STALL_MS > 0 ? STALL_MS
+        : RESPONSE_MS > 0 ? Math.round(RESPONSE_MS * (((i * 37) % 100) + 1) / 100) : 0;
     const slow = devDelayMs > 0
         ? { handler: (req) => setTimeout(() => req.done(), devDelayMs) }
         : {};
@@ -293,7 +310,7 @@ function buildDevice(i) {
 
     const ifaces = [];
     const counters = new Map();
-    for (let n = 1; n <= IFACES; n++) {
+    const addIface = (n) => {
         // A tenth of the ports are administratively up but operationally down -
         // exactly the shape that leaves speedBps null, which is the case that
         // caused the un-unmutable-interface bug in AlertCanvas.
@@ -324,7 +341,8 @@ function buildDevice(i) {
         mib.addTableRow('ifTable', [wireIdx, ifDescr, 6,
             Math.min(mbps * 1e6, 4294967295), 1, oper, 0, 0, 0, 0, 0, 0]);
         mib.addTableRow('ifXTable', [wireIdx, ifName, c64(0), c64(0), mbps, ifAlias]);
-    }
+    };
+    for (let n = 1; n <= IFACES; n++) addIface(n);
 
     mib.registerProvider({
         ...slow,
@@ -353,7 +371,10 @@ function buildDevice(i) {
     mib.addTableRow('hrStorageTable', [1, '1.3.6.1.2.1.25.2.1.2', 'Physical memory', 4096, 4194304, 1594884]);
     for (let s = 1; s < STORES; s++) {
         mib.addTableRow('hrStorageTable', [STORAGE_SWAP ? STORES + 2 - s : s + 2, '1.3.6.1.2.1.25.2.1.4',
-            `/mnt/vol${s}`, 4096, 122070312, 20000000 + s * 9000000]);
+            // Used wraps inside the size: past the eighth disk the old 20M + 9M x s
+            // ran over it, and at the 237th over Integer32, which stopped the
+            // device's build halfway (2026-10-31, the S6 drill's 300 disks).
+            STORAGE_REPLACE && s === STORES - 1 ? '/mnt/replaced' : `/mnt/vol${s}`, 4096, 122070312, 20000000 + (s * 9000000) % 90000000]);
     }
 
     // LM-SENSORS temperatures, on the OIDs RSCanvas's discoverSensors walks
@@ -423,7 +444,8 @@ function buildDevice(i) {
         }
     }
 
-    devices.push({ port, mib, ifaces, counters, temps, fans, bootMs: Date.now() - (i * 60000), fleetIndex: i });
+    devices.push({ port, mib, ifaces, counters, temps, fans, bootMs: Date.now() - (i * 60000), fleetIndex: i,
+        addIface, lastIf: IFACES });
 }
 
 let live = 0, dead = 0;
@@ -500,6 +522,14 @@ setInterval(() => {
     }
 }, TICK_MS);
 
+// GROWTH (beta list S6): new interfaces at climbing indexes, every device.
+if (GROW_EVERY_S > 0 && GROW_BY > 0) {
+    setInterval(() => {
+        for (const d of devices) for (let k = 0; k < GROW_BY; k++) d.addIface(++d.lastIf);
+        console.log(`grew: every device now serves ${devices[0]?.lastIf ?? 0} interfaces`);
+    }, GROW_EVERY_S * 1000);
+}
+
 const perDevice = IFACES + STORES + CPUS + TEMPS + FANS;
 console.log(`fleet up: ${live} live agents on udp/${BASE + OFFSET}-${BASE + OFFSET + SIZE - 1}, ${dead} dead ports (timeouts by design)`);
 console.log(`per device: ${IFACES} interfaces + ${STORES} storage + ${CPUS} cpu + ${TEMPS} temps + ${FANS} fans = ~${perDevice} pollable entities`);
@@ -518,5 +548,7 @@ if (TEMPS > 0) {
     if (bad.length > 0) console.log(`misbehaving sensors (${bad.length}, port:index): ${bad.join(' ')}`);
 }
 console.log(`fleet total: ~${live * perDevice} entities if everything is tracked`);
+if (STALL_MS > 0) console.log(`STALL: every request answered after ${STALL_MS} ms`);
+if (GROW_EVERY_S > 0 && GROW_BY > 0) console.log(`GROW: +${GROW_BY} interfaces every ${GROW_EVERY_S} s`);
 if (SHIFT !== 0) console.log(`ifIndex SHIFT: +${SHIFT} (Gi0/1 is ifIndex ${1 + SHIFT}) - a re-enumeration`);
 console.log('community "public"');

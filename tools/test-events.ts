@@ -20,6 +20,7 @@
 import {
     compileRule, matchMessage, eventLabel, MAX_PATTERN_LENGTH, NOTIFIER_APP,
     nestedQuantifier, RULE_BUDGET_MS, searchForm, wildcardRuns, MATCH_TEXT_MAX, keyHost, overflowKey,
+    parseRuleScope, scopeWords,
     type EventRule, type CompiledRule, type PendingEvent, type MessageForMatch,
 } from '../src/alerts/events.ts';
 
@@ -271,6 +272,7 @@ function main(): void {
         const slow: Array<{ name: string; over: boolean }> = [];
         const stall: CompiledRule = {
             rule: redosRule('stand-in'),
+            scope: null,
             risky: true,
             // Stands in for a pathological regex without needing one - the budget
             // is what is under test here, not the engine.
@@ -354,6 +356,42 @@ function main(): void {
         eq('a regex does not see past MATCH_TEXT_MAX', rex.ok && rex.compiled.test(far), false);
         eq('a substring rule does', sub.ok && sub.compiled.test(far), true);
         eq('and within it a regex sees everything', rex.ok && rex.compiled.test('x'.repeat(4000) + ' link down'), true);
+    }
+
+    // A RULE'S SCOPE (slice 70, 2026-10-30, the beta list's N3). "uplink-LAG
+    // link down" from any device raised the operator's uplink rule; a scoped
+    // rule hears only its devices - by the sender's address, or the host a
+    // relayed line names.
+    console.log('\na rule limited to one device or group:');
+    {
+        const base: EventRule = { id: '7', name: 'uplink', pattern: 'uplink-LAG link down', isRegex: false, source: 'any', severity: 'warn' };
+        const scoped = compileRule({ ...base, scopeDevices: ['core-sw'] });
+        const open = compileRule(base);
+        const none = compileRule({ ...base, scopeDevices: [] });
+        const msg = (o: Partial<MessageForMatch>): MessageForMatch => ({
+            msg: 'interface,info uplink-LAG link down', host: null, sourceIp: '192.0.2.10',
+            proto: 'syslog', app: null, ts: new Date(), ...o,
+        });
+        const hits = (c: typeof scoped, m: MessageForMatch): number =>
+            (c.ok ? matchMessage([c.compiled], new Map(), m) : -1);
+        eq('an unscoped rule hears every sender, as before', hits(open, msg({ host: 'other-switch' })), 1);
+        eq('a scoped rule hears its device by the sender\'s address', hits(scoped, msg({ devices: ['core-sw'] })), 1);
+        eq('...or by the host a relayed line names, in any case', hits(scoped, msg({ host: 'CORE-SW' })), 1);
+        eq('...and not another device saying the same words', hits(scoped, msg({ host: 'other-switch', devices: ['other-switch'] })), 0);
+        eq('...nor an address no device has', hits(scoped, msg({ devices: [] })), 0);
+        eq('a scope whose group emptied hears no one - not everyone', hits(none, msg({ host: 'core-sw', devices: ['core-sw'] })), 0);
+        eq('two agents at one address: either name counts', hits(scoped, msg({ devices: ['ups-card', 'core-sw'] })), 1);
+        eq('a request\'s scope: none, "everywhere" and empty are every sender',
+            [parseRuleScope(undefined, 'x'), parseRuleScope('everywhere', 'x'), parseRuleScope('', '')].map((s) => s.ok && s.kind), [null, null, null]);
+        eq('a device scope keeps its name, trimmed',
+            parseRuleScope('device', '  core-sw '), { ok: true, kind: 'device', value: 'core-sw' });
+        eq('an unknown kind is refused, and a kind with no name',
+            [parseRuleScope('vlan', 'x').ok, parseRuleScope('location', '  ').ok], [false, false]);
+        eq('a name past 200 characters is refused', parseRuleScope('application', 'a'.repeat(201)).ok, false);
+        eq('the words the page and audit use', [scopeWords(null, null), scopeWords('location', 'HQ')], ['every sender', 'location HQ']);
+        eq('the scope is checked before the pattern - out of scope never runs it',
+            (() => { let ran = false; const c = scoped.ok ? { ...scoped.compiled, test: () => { ran = true; return true; } } : null;
+                if (c) matchMessage([c], new Map(), msg({ host: 'elsewhere' })); return ran; })(), false);
     }
     console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - ${pass} passed, ${fail} failed`);
     process.exit(fail === 0 ? 0 : 1);

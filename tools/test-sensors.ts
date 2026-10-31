@@ -22,8 +22,8 @@
 // doing the same job as one that corrects the code.
 
 import {
-    matchVendor, pickRamRow, fsTracked, plausibleC, fanTracked, tempNameValid,
-    sensorRaw, sensorSample, VENDORS, decodeExtendName, extendKind,
+    matchVendor, pickRamRow, fsTracked, plausibleC, fanTracked, stateTracked, tempNameValid,
+    sensorRaw, sensorSample, VENDORS, decodeExtendName, extendKind, CISCO_ENVMON_STATE_TEXTS,
     type SensorExtra,
 } from '../src/collector/sensors.ts';
 
@@ -156,6 +156,37 @@ function main(): void {
             sensorSample('state', extra, lookup({ v: 1 })), { v0: null, v1: null, status: null });
         eq('boost/trim/bypass (any non-ok enum) also read as the alarm state',
             sensorSample('state', extra, lookup({ v: 7 })).v0, 1);
+    }
+
+    console.log('\nCisco power supplies and fans (CISCO-ENVMON-MIB state tables)');
+    {
+        const cisco = VENDORS.find((v) => v.key === 'cisco');
+        const psu = cisco?.states?.find((t) => t.what === 'psu');
+        const fan = cisco?.states?.find((t) => t.what === 'fan');
+        eq('the Cisco entry walks the supply table',
+            [psu?.descrOid, psu?.stateOid], ['1.3.6.1.4.1.9.9.13.1.5.1.2', '1.3.6.1.4.1.9.9.13.1.5.1.3']);
+        eq('and the fan table',
+            [fan?.descrOid, fan?.stateOid], ['1.3.6.1.4.1.9.9.13.1.4.1.2', '1.3.6.1.4.1.9.9.13.1.4.1.3']);
+        eq('only normal(1) is well', [psu?.ok, fan?.ok], [[1], [1]]);
+        // The C9300-48H walked (2026-10-30): bay A empty and reported as
+        // shutdown(4), bay B normal. Watching A would page on day one.
+        eq('a supply reading normal at discovery is watched', stateTracked(1, [1]), true);
+        eq('an empty bay reported as shutdown is listed, not watched', stateTracked(4, [1]), false);
+        eq('notPresent is not watched either', stateTracked(5, [1]), false);
+        eq('no answer is not watched', stateTracked(null, [1]), false);
+        const extra: SensorExtra = {
+            style: 'state', valueOid: 'v', okValues: [1], unknownValues: [],
+            okText: 'Normal', alarmText: 'Fault', texts: CISCO_ENVMON_STATE_TEXTS,
+        };
+        eq('normal is 0/ok, and the raw state rides in v1 for the card\'s word',
+            sensorSample('state', extra, lookup({ v: 1 })), { v0: 0, v1: 1, status: 1 });
+        eq('a supply gone to shutdown is the alarm, v1 = 4',
+            sensorSample('state', extra, lookup({ v: 4 })), { v0: 1, v1: 4, status: 2 });
+        eq('a fan at warning is the alarm too - a part the agent flags is one to look at',
+            sensorSample('state', extra, lookup({ v: 2 })).v0, 1);
+        eq('every Cisco state has a word', [1, 2, 3, 4, 5, 6].map((n) => CISCO_ENVMON_STATE_TEXTS[n] !== undefined), [true, true, true, true, true, true]);
+        eq('no answer is still null, no raw value',
+            sensorSample('state', extra, lookup({})), { v0: null, v1: null, status: null });
     }
 
     console.log('\nNET-SNMP-EXTEND: the length-prefixed index and the naming convention');

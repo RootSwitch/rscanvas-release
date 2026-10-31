@@ -60,6 +60,23 @@ export const ASROCK_BMC = {
 export const UPS_OUTPUT_SOURCE = '1.3.6.1.2.1.33.1.4.1.0';
 
 /**
+ * CISCO-ENVMON-MIB's CiscoEnvMonState, the words a power supply or fan row
+ * reports in (2026-10-30, from a C9300-48H walk). Only normal(1) is well:
+ * a supply the agent calls warning is already one a person should look at.
+ *
+ * AN EMPTY BAY IS NOT ALWAYS notPresent. The C9300 walked reports its empty
+ * supply bay A as shutdown(4) - no model, no serial in ENTITY-MIB, source
+ * unknown - so "absent" cannot be told from "dead" by the state alone. That
+ * is why a supply or fan is watched only if it read normal when the device
+ * was discovered (stateTracked below), the stopped-fan rule's order of facts
+ * again: a part that later leaves normal alarms; a bay that never was stays
+ * listed and quiet.
+ */
+export const CISCO_ENVMON_STATE_TEXTS: Readonly<Record<string, string>> = {
+    1: 'Normal', 2: 'Warning', 3: 'Critical', 4: 'Shutdown', 5: 'Not present', 6: 'Not functioning',
+};
+
+/**
  * NET-SNMP-EXTEND row index -> the extend's NAME.
  *
  * The index is the name as a LENGTH-PREFIXED ASCII string: `extend
@@ -135,6 +152,16 @@ export interface VendorMetric {
     unit?: string; max?: number;
     ok?: number[]; unknown?: number[]; okText?: string; alarmText?: string;
 }
+/** A walked table of named parts, each one state row: Cisco's supplies and
+ *  fans. `what` keeps the two apart in the entity index, since both are
+ *  kind 'state' and an older IOS numbers each table from 1. */
+export interface VendorStateTable {
+    what: 'psu' | 'fan';
+    descrOid: string;
+    stateOid: string;
+    ok: number[];
+    texts: Readonly<Record<string, string>>;
+}
 export interface Vendor {
     key: string;
     label: string;
@@ -147,6 +174,7 @@ export interface Vendor {
         | { style: 'walk-descr-value'; descrOid: string; valueOid: string; div: number };
     fan?: { style: 'walk-rpm'; rpmOid: string };
     metrics?: VendorMetric[];
+    states?: VendorStateTable[];
 }
 
 export const VENDORS: Vendor[] = [
@@ -171,6 +199,23 @@ export const VENDORS: Vendor[] = [
             valueOid: '1.3.6.1.4.1.9.9.13.1.3.1.3',
             div: 1,
         },
+        // CISCO-ENVMON-MIB's supply and fan status tables: a state each, no
+        // reading - the C9300 walked serves no fan speed or supply watts in
+        // any table, CISCO-ENTITY-SENSOR-MIB included.
+        states: [
+            {
+                what: 'psu',
+                descrOid: '1.3.6.1.4.1.9.9.13.1.5.1.2',   // ciscoEnvMonSupplyStatusDescr
+                stateOid: '1.3.6.1.4.1.9.9.13.1.5.1.3',   // ciscoEnvMonSupplyState
+                ok: [1], texts: CISCO_ENVMON_STATE_TEXTS,
+            },
+            {
+                what: 'fan',
+                descrOid: '1.3.6.1.4.1.9.9.13.1.4.1.2',   // ciscoEnvMonFanStatusDescr
+                stateOid: '1.3.6.1.4.1.9.9.13.1.4.1.3',   // ciscoEnvMonFanState
+                ok: [1], texts: CISCO_ENVMON_STATE_TEXTS,
+            },
+        ],
     },
     {
         key: 'mikrotik',
@@ -311,6 +356,13 @@ export const plausibleC = (c: number | null): boolean => c !== null && c > 0 && 
 export const fanTracked = (rpm: number | null): boolean =>
     rpm !== null && rpm > 0 && rpm < 60000;
 
+/** A supply or fan state row is watched only if it reads well when
+ *  discovered: an empty bay (which may read shutdown, not notPresent - see
+ *  CISCO_ENVMON_STATE_TEXTS) is listed untracked, one click to enable, and
+ *  a watched part that later leaves the well states raises the state alarm. */
+export const stateTracked = (raw: number | null, ok: readonly number[]): boolean =>
+    raw !== null && ok.includes(raw);
+
 export interface RamRow { idx: string; descr: string; alloc: number; bytes: number }
 
 /**
@@ -346,6 +398,9 @@ export interface SensorExtra {
     /** Display texts for state kinds - the card says "On battery", not ALARM. */
     okText?: string;
     alarmText?: string;
+    /** State kinds with words per raw value (Cisco's supplies and fans): the
+     *  raw value rides in v1 and the card says "Shutdown", not "Fault". */
+    texts?: Readonly<Record<string, string>>;
     /** Meter kinds: unit label and bar scale for the card. */
     unit?: string;
     max?: number;
@@ -431,6 +486,9 @@ export function sensorSample(
         if (raw === null || unknown.includes(raw)) { out.v0 = null; return out; }
         out.v0 = (extra.okValues ?? []).includes(raw) ? 0 : 1;
         out.status = out.v0 === 0 ? 1 : 2;
+        // The agent's own state rides along only where there are words for
+        // it, so a UPS's rows stay exactly what they always were.
+        if (extra.texts !== undefined) out.v1 = raw;
         return out;
     }
     if (extra.style === 'tenthF') {
@@ -486,9 +544,24 @@ export function sensorSample(
 //      moving is fine: two disks trading indexes, or three rotating, move
 //      together (OPS.repinSensors parks them first, in one transaction).
 //
-// NEVER inserts, never deletes, never touches tracked: the discover-if-NONE
-// rule exists so a deleted junk sensor stays deleted, and a repin pass that
-// resurrected it every midnight would be that rule's defeat.
+//   3. A FILESYSTEM REPLACED AT ITS INDEX (2026-10-30, the beta list's R22):
+//      an fs row whose index now holds ANOTHER name, and whose own name the
+//      agent lists nowhere, is not renumbered - it is gone, and rule 1's
+//      skip left it reading the newcomer under the old name, its index
+//      blocking Rediscover from adding the newcomer. It is PARKED: untracked,
+//      its index freed (`gone-<id>`, which no discovery can claim), its
+//      instruction emptied of OIDs so a tick cannot read the newcomer under
+//      its name again, history kept. Rediscover then adds the newcomer at the
+//      freed index. A parked row holds no index, so a renumbered disk can
+//      move onto it in the same plan. The cost, said in KNOWN-ISSUES: a disk
+//      RENAMED in place (a Windows volume relabelled) reads the same way, and
+//      starts a new row. Filesystems only - a device has one picked memory
+//      row, and its name changing is not a replacement.
+//
+// NEVER inserts, never deletes, never TRACKS: the discover-if-NONE rule
+// exists so a deleted junk sensor stays deleted, and a repin pass that
+// resurrected it every midnight would be that rule's defeat. Rule 3
+// untracks; nothing here ever tracks.
 //
 // Renames ONE name (2026-10-25): the HOST-RESOURCES CPU row's, which is the
 // probe's own count ("CPU (4 cores)", probe.ts), not an identity. Production's
@@ -531,7 +604,14 @@ export interface RepinMove {
     id: string; snmpIndex: string; name: string; extra: SensorExtra;
     /** Present only when the row's name changes with it (the counted CPU). */
     rename?: { from: string; to: string };
+    /** Present only for a filesystem replaced at its index (rule 3): the row
+     *  is untracked and parked, `by` names the newcomer there now, and `from`
+     *  is the index it left - a row of this same plan may be moving onto it. */
+    park?: { by: string; from: string };
 }
+
+/** The index prefix of a parked row (rule 3); no agent serves one. */
+export const PARKED_INDEX = 'gone-';
 
 export function planSensorRepin(
     discovered: RepinDiscovered[], existing: RepinExisting[],
@@ -582,13 +662,25 @@ export function planSensorRepin(
         if (row === undefined) continue;
         moves.set(row.id, { row, d });
     }
+    // Rule 3: a filesystem replaced at its index is parked, not followed.
+    const listedNames = new Set(discovered.map((d) => `${d.kind}\u0000${d.name}`));
+    const atIndex = new Map(discovered.map((d) => [`${d.kind}\u0000${d.snmpIndex}`, d]));
+    const parks = new Map<string, { row: RepinExisting; by: string }>();
+    for (const e of restRows) {
+        if (e.kind !== 'fs' || !indexIsVolatile(e) || e.snmp_index === null
+            || e.snmp_index.startsWith(PARKED_INDEX) || moves.has(e.id)) continue;
+        const there = atIndex.get(`${e.kind}\u0000${e.snmp_index}`);
+        if (there === undefined || there.name === e.name) continue;
+        if (listedNames.has(`${e.kind}\u0000${e.name}`)) continue;
+        parks.set(e.id, { row: e, by: there.name });
+    }
     // The renumbered index must be FREE among the rows STAYING PUT - every
-    // row except those moving with this plan. Refusing one move makes its
-    // row stay, which can refuse another, so settle before writing.
+    // row except those moving or parked with this plan. Refusing one move
+    // makes its row stay, which can refuse another, so settle before writing.
     for (let changed = true; changed;) {
         changed = false;
         const held = new Set(existing
-            .filter((e) => !moves.has(e.id) && e.snmp_index !== null)
+            .filter((e) => !moves.has(e.id) && !parks.has(e.id) && e.snmp_index !== null)
             .map((e) => `${e.kind}\u0000${e.snmp_index}`));
         for (const [id, m] of moves) {
             if (held.has(`${m.d.kind}\u0000${m.d.snmpIndex}`)) { moves.delete(id); changed = true; }
@@ -597,6 +689,14 @@ export function planSensorRepin(
     for (const { row, d } of moves.values()) {
         claimedRows.add(row.id);
         out.push({ id: row.id, snmpIndex: d.snmpIndex, name: d.name, extra: d.extra });
+    }
+    for (const { row, by } of parks.values()) {
+        const alloc = row.extra.allocUnits;
+        out.push({
+            id: row.id, snmpIndex: `${PARKED_INDEX}${row.id}`, name: row.name ?? '',
+            extra: { style: 'hr-storage', ...(alloc !== undefined ? { allocUnits: alloc } : {}) },
+            park: { by, from: row.snmp_index as string },
+        });
     }
     return out;
 }

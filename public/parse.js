@@ -35,10 +35,16 @@ export function parseHosts(text) {
 
     let col = 0;
     const head = cells(lines[0]).map((h) => h.toLowerCase().replace(/[^a-z0-9]/g, ''));
-    const looksLikeHeader = head.some((h) => /^(ip|ipaddress|address|host|hostname|mgmtip)$/.test(h));
+    // An address column wins over a name column wherever they sit: devices
+    // are added by address and names are not looked up (2026-10-31), so an
+    // inventory export of "Hostname, IP" must read the IP column.
+    const ADDRESS = /^(ip|ipaddress|address|mgmtip)$/;
+    const NAME = /^(host|hostname)$/;
     let body = lines;
-    if (looksLikeHeader) {
-        col = head.findIndex((h) => /^(ip|ipaddress|address|host|hostname|mgmtip)$/.test(h));
+    const addressCol = head.findIndex((h) => ADDRESS.test(h));
+    const nameCol = head.findIndex((h) => NAME.test(h));
+    if (addressCol !== -1 || nameCol !== -1) {
+        col = addressCol !== -1 ? addressCol : nameCol;
         body = lines.slice(1);
     }
     const out = [];

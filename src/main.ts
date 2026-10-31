@@ -35,7 +35,7 @@ import { mintSecret, hashToken, principalForToken, tokenFromRequest } from './au
 import { channelConfig, isNotifyConfigSane } from './alerts/notify.ts';
 import { csvRow, inventoryHeader, parseCsv, headerIndex } from './export/csv.ts';
 import { planRemoval, gateRemoval, normalizeNames, normalizeMode } from './devices/removal.ts';
-import { compileRule } from './alerts/events.ts';
+import { compileRule, parseRuleScope, scopeWords, type RuleScopeKind } from './alerts/events.ts';
 import {
     suggestLocations, selectForAdd, selectForForce, locationAssignments,
     normalizeProbeRequest, probedName, addOutcome, normalizeExplicitName, probeStanding,
@@ -61,6 +61,7 @@ import { serializeMetrics } from './health/metrics.ts';
 // can actually probe.
 import { SUPPORTED_CHECKS, isOutsideTarget } from './collector/reach.ts';
 import { planSensorRepin, type SensorExtra } from './collector/sensors.ts';
+import { ENTITY_CAPS } from './collector/caps.ts';
 import { PING_LOSS_KIND } from './alerts/pingloss.ts';
 import {
     defaultCheckName, isCheckKind, isPathKind, OUTCOME_TEXT, outcomeName, parseCheckDef, parseCheckName, storedDef,
@@ -739,6 +740,31 @@ function filterParam(params: URLSearchParams, name: string): string | null {
     return v === null || v.trim() === '' ? null : v;
 }
 
+/**
+ * A log rule's scope from a request (slice 70), or null after answering the
+ * refusal: the shape (parseRuleScope), then whether any device answers to
+ * it now - a scope naming no device is a typo, refused here rather than
+ * armed to hear no one.
+ */
+async function ruleScopeOrRefuse(
+    res: http.ServerResponse, kind: unknown, value: unknown,
+): Promise<{ kind: RuleScopeKind | null; value: string | null } | null> {
+    const scope = parseRuleScope(kind, value);
+    if (!scope.ok) { sendJson(res, 400, { ok: false, detail: scope.detail }); return null; }
+    if (scope.kind === null || scope.value === null) return { kind: null, value: null };
+    const members = await OPS.eventScopeMembers(scope.kind, scope.value);
+    if (!members.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${members.reason})` }); return null; }
+    if ((members.rows[0]?.n ?? 0) === 0) {
+        sendJson(res, 400, {
+            ok: false,
+            detail: scope.kind === 'device' ? `no device is named "${scope.value}"`
+                : `no device is in the ${scope.kind} "${scope.value}"`,
+        });
+        return null;
+    }
+    return { kind: scope.kind, value: scope.value };
+}
+
 async function search(res: http.ServerResponse, params: URLSearchParams): Promise<void> {
     const window = parseWindow(params);
     if ('error' in window) {
@@ -834,12 +860,19 @@ async function search(res: http.ServerResponse, params: URLSearchParams): Promis
                     near.rows.filter((r) => r.kind === k).map((r) => r.value);
                 const h = byKind('host');
                 const a = byKind('app');
+                // The hint reaches only as far back as the search index
+                // (ops.ts nearMissFrom), so a wider search says how far it
+                // looked rather than claim the whole window.
+                const since = near.rows[0]?.since;
+                const where = since !== undefined && since.getTime() > filters.from.getTime()
+                    ? `seen since ${since.toISOString().slice(0, 16).replace('T', ' ')} UTC, as far back as the search index reaches,`
+                    : 'in this window';
                 if (h.length > 0) {
-                    hints.push(`no host is exactly "${hostVal}", but ${h.length} in this window `
+                    hints.push(`no host is exactly "${hostVal}", but ${h.length} ${where} `
                         + `contain it (${h.slice(0, 3).join(', ')}) - try host~${hostVal}`);
                 }
                 if (a.length > 0) {
-                    hints.push(`no app is exactly "${appVal}", but ${a.length} in this window `
+                    hints.push(`no app is exactly "${appVal}", but ${a.length} ${where} `
                         + `contain it (${a.slice(0, 3).join(', ')}) - try app~${appVal} with a `
                         + 'host: or ip: filter, which app~ always requires');
                 }
@@ -1287,7 +1320,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                     const orows = await OPS.thresholdOverrides('interactive');
                     if (orows.ok) cfg = mergeOverrides(cfg, orows.rows);
                     const info = resolveRuleInfo(
-                        buildOverrideIndex(cfg.overrides), cfg, a.kind, a.code, a.host);
+                        buildOverrideIndex(cfg.overrides), cfg, a.kind, a.code, a.host, a.entity_name);
                     // THE LAPTOP-OR-UPS HINT, and it is deliberately a HINT.
                     // A state sensor reading 1 raises crit by default, which
                     // is right for a UPS on battery and wrong for a laptop
@@ -2111,9 +2144,14 @@ const server = createWebServer(tlsPair, (req, res) => {
             // rather than discovered per-message on the latency thread.
             const trial = compileRule({ id: '0', name, pattern, isRegex, source, severity });
             if (!trial.ok) { sendJson(res, 400, { ok: false, detail: trial.detail }); return; }
+            // THE SCOPE (slice 70): every sender, or one device, location or
+            // application - refused if no device answers to it, so a typo
+            // cannot arm a rule that hears no one.
+            const scope = await ruleScopeOrRefuse(res, body.scopeKind, body.scopeValue);
+            if (scope === null) return;
             const w = await OPS.createEventRule(
                 name, pattern, isRegex, source, severity, clearAfterS,
-                principal.kind === 'user' ? principal.username : 'unknown');
+                principal.kind === 'user' ? principal.username : 'unknown', scope.kind, scope.value);
             if (!w.ok) {
                 const dup = w.reason.includes('unique') || w.reason.includes('duplicate');
                 sendJson(res, dup ? 409 : 503, {
@@ -2123,7 +2161,8 @@ const server = createWebServer(tlsPair, (req, res) => {
                 return;
             }
             await auth.audit(principal, 'alertrule.create', name,
-                { pattern, isRegex, source, severity, clearAfterS }, inetOrNull(clientIp(req)));
+                { pattern, isRegex, source, severity, clearAfterS, scope: scopeWords(scope.kind, scope.value) },
+                inetOrNull(clientIp(req)));
             eventRulesChanged();
             sendJson(res, 200, { ok: true, id: w.rows[0]?.id });
             return;
@@ -2148,6 +2187,28 @@ const server = createWebServer(tlsPair, (req, res) => {
                 {}, inetOrNull(clientIp(req)));
             eventRulesChanged();
             sendJson(res, 200, { ok: true, deleted: w.rows[0]?.name });
+            return;
+        }
+        if (path === '/api/alert-rules/scope' && method === 'POST') {
+            if (!enforce(res, principal, 'alertrule.write')) return;
+            let body: Record<string, unknown>;
+            try {
+                body = await readJsonBody(req);
+            } catch (err) {
+                sendJson(res, 400, { ok: false, detail: (err as Error).message });
+                return;
+            }
+            const id = String(body.id ?? '');
+            if (!/^\d+$/.test(id)) { sendJson(res, 400, { ok: false, detail: 'id is required' }); return; }
+            const scope = await ruleScopeOrRefuse(res, body.scopeKind, body.scopeValue);
+            if (scope === null) return;
+            const w = await OPS.setEventRuleScope(id, scope.kind, scope.value);
+            if (!w.ok) { sendJson(res, 503, { ok: false, detail: `store refused (${w.reason})` }); return; }
+            if (w.rows.length === 0) { sendJson(res, 404, { ok: false, detail: 'no such rule' }); return; }
+            const words = scopeWords(scope.kind, scope.value);
+            await auth.audit(principal, 'alertrule.scope', w.rows[0]?.name ?? id, { scope: words }, inetOrNull(clientIp(req)));
+            eventRulesChanged();
+            sendJson(res, 200, { ok: true, detail: `${w.rows[0]?.name ?? id} now hears ${words} - live within 30s` });
             return;
         }
         if (path === '/api/alert-rules/enable' && method === 'POST') {
@@ -2384,7 +2445,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                         };
                     }
                     const extras = { ...(change === null ? {} : { change }), ...(stopped === null ? {} : { stopped }) };
-                    const info = resolveRuleInfo(idx, cfg, ek(String(r.kind)), String(r.code), name);
+                    const info = resolveRuleInfo(idx, cfg, ek(String(r.kind)), String(r.code), name, String(r.name ?? ''));
                     if (info.source === 'none') return { ...r, ...extras };
                     return {
                         ...r,
@@ -2701,16 +2762,36 @@ const server = createWebServer(tlsPair, (req, res) => {
                         // nothing.
                         const w = await OPS.repinSensors(d.id, plan.map((u) => ({
                             id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra),
-                            name: u.rename?.to ?? null,
+                            name: u.rename?.to ?? null, park: u.park !== undefined,
                         })));
                         const done = new Set(w.ok ? w.rows.map((x) => x.id) : []);
+                        // A parked filesystem (replaced at its index) frees the
+                        // index BEFORE the inserts below, which add the newcomer.
                         repinned = plan.filter((u) => done.has(u.id))
-                            .map((u) => (u.rename !== undefined ? `${u.rename.from} is now ${u.rename.to}` : u.name));
+                            .map((u) => (u.park !== undefined ? `${u.name}, replaced by ${u.park.by} (no longer watched)`
+                                : u.rename !== undefined ? `${u.rename.from} is now ${u.rename.to}` : u.name));
                     }
                 }
 
+                // THE DEVICE'S CAPS (beta list S6) count the rows it already
+                // has: an agent serving new indexes on every Rediscover must
+                // not grow past them one click at a time. An entity it
+                // already has is no new row, so only new ones are counted.
+                const notes = Array.isArray(r.notes) ? (r.notes as string[]).map(String) : [];
+                const caps = ENTITY_CAPS();
+                // WRITE-IN-LOOP-OK: a READ, one per device an operator named.
+                const keys = await OPS.entityKeysForDevice(d.id);
+                const have = new Set(keys.ok ? keys.rows.map((k) => `${k.kind}|${k.snmp_index ?? ''}`) : []);
+                const count = {
+                    interfaces: keys.ok ? keys.rows.filter((k) => k.kind === 'if').length : 0,
+                    sensors: keys.ok ? keys.rows.filter((k) => k.kind !== 'if').length : 0,
+                };
+                const refused = { interfaces: 0, sensors: 0 };
                 const added: string[] = [];
                 for (const e of ents) {
+                    const cls = String(e.kind ?? 'if') === 'if' ? 'interfaces' as const : 'sensors' as const;
+                    const isNew = !have.has(`${String(e.kind ?? 'if')}|${String(e.snmpIndex)}`);
+                    if (isNew && count[cls] >= caps[cls]) { refused[cls]++; continue; }
                     const code = generateCode(d.name, String(e.name), takenCodes);
                     takenCodes.add(code);
                     // WRITE-IN-LOOP-OK: DISCOVERY, and bounded by one operator
@@ -2726,7 +2807,13 @@ const server = createWebServer(tlsPair, (req, res) => {
                         (e.speedBps ?? null) as number | null, code,
                         e.extra ? JSON.stringify(e.extra) : null, e.tracked === true,
                     );
-                    if (created.ok && created.rows.length > 0) added.push(String(e.name));
+                    if (created.ok && created.rows.length > 0) { added.push(String(e.name)); count[cls]++; }
+                }
+                for (const cls of ['interfaces', 'sensors'] as const) {
+                    if (refused[cls] === 0) continue;
+                    notes.push(`${refused[cls]} new ${cls} not added: the device has ${count[cls]}, `
+                        + `and a device may have ${caps[cls]} (${cls === 'interfaces'
+                            ? 'MAX_INTERFACES_PER_DEVICE' : 'MAX_SENSORS_PER_DEVICE'})`);
                 }
 
                 // SENSORS THE AGENT NO LONGER SERVES (onboard.ts goneSensors):
@@ -2781,6 +2868,7 @@ const server = createWebServer(tlsPair, (req, res) => {
                     goneUntracked,
                     goneAnswering,
                     repinned,
+                    notes,
                 });
                 for (const n of goneUntracked) untrackedGone.push(`${d.name}: ${n}`);
             }
@@ -3377,6 +3465,10 @@ const server = createWebServer(tlsPair, (req, res) => {
                     // made against a number rather than a guess.
                     trackedUp: r.trackedUpCount ?? 0,
                     ...standingFields(probeStanding(probedName(r), String(r.host), port, known.rows)),
+                    // Beta list S6: interfaces or sensors past the device's
+                    // cap, or a sensor discovery cut short - said before the
+                    // add, so nobody learns it from a missing port.
+                    notes: Array.isArray(r.notes) ? r.notes : [],
                     error: r.error,
                     errorKind: r.errorKind,
                 })),

@@ -259,6 +259,30 @@ export const CONFIG = {
      * slot leaked until restart.
      */
     snmpWalkDeadlineMs: num('SNMP_WALK_DEADLINE_MS', 15_000),
+    /**
+     * The ceiling on ONE DEVICE'S WHOLE POLL, and on one probe (beta list S6,
+     * 2026-10-31). Each walk had its deadline and each GET its timeout, but
+     * nothing bounded their SUM: a slow agent with many sensors - every GET
+     * near the timeout, a poisoned chunk retried one OID at a time - held a
+     * poll slot for minutes. At the deadline the session is aborted, so
+     * every request in flight and every later one fails at once
+     * (snmp.ts Session.abort). The interface walks come first and the
+     * optional reads after them (poll.ts says why), so a deadline that
+     * lands in the optional reads cuts them short and keeps the poll.
+     * 60 s against production's slowest poll in three days, 9.3 s - a
+     * restart poll with its identity, inventory and re-pin reads.
+     */
+    pollDeadlineMs: num('POLL_DEADLINE_MS', 60_000),
+    /**
+     * How many interfaces, and how many sensors, one device may have (beta
+     * list S6). Discovery keeps the ones it would watch first and refuses
+     * the rest with a message; the poll adds no interface past the cap. The
+     * largest device on the operator's network has 46 of each; a stacked
+     * access switch has some hundreds of interfaces; an agent past these
+     * numbers is broken, hostile, or a chassis that wants the cap raised.
+     */
+    maxInterfacesPerDevice: num('MAX_INTERFACES_PER_DEVICE', 2000),
+    maxSensorsPerDevice: num('MAX_SENSORS_PER_DEVICE', 500),
     // How many subtree walks one poll fires at one agent AT ONCE. RouterOS
     // silently drops requests past ~8-10 in flight, turning every poll into
     // timeout-plus-retry - see walkMany in snmp.ts for the measurements. 6

@@ -23,7 +23,7 @@
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import {
-    evaluate, detectReboots, LOWER_IS_BAD, METRIC_KINDS,
+    evaluate, detectReboots, LOWER_IS_BAD, METRIC_KINDS, isFanGauge, resolveRuleInfo, buildOverrideIndex,
     type ScanDoc, type RulesConfig, type ScanMetric, type ScanDevice,
 } from '../src/alerts/rules.ts';
 
@@ -231,6 +231,68 @@ console.log('alerting engine\n');
     else bad('uptime is missing from LOWER_IS_BAD');
 }
 
+// --- a sensor alert carries its whole name (2026-10-30) ----------------------
+{
+    // The number is the part that tells two sensors apart: the cut ported
+    // from the parent turned all five of a C9300's supplies and fans into
+    // "Switch", and a CRS317's two fans into "Fan".
+    const cs = evaluate({ metrics: [
+        { code: 'p', host: 'c9300', kind: 'state', value: 1, display: 'Switch 1 - Power Supply B' },
+        { code: 'f', host: 'c9300', kind: 'state', value: 1, display: 'Switch 1 - FAN - T1 2' },
+        { code: 't1', host: 'crs', kind: 'temp', value: 70, display: 'Temp: Sensor 1' },
+        { code: 't2', host: 'crs', kind: 'temp', value: 70, display: 'Temp: Sensor 2' },
+        { code: 'x', host: 'crs', kind: 'temp', value: 70, display: '  ' },
+    ] }, { ...CONFIG, thresholds: { ...CONFIG.thresholds, state: { warn: null, crit: 1 } } });
+    const lab = (code: string): string | undefined => cs.find((c) => c.code === code)?.label;
+    if (lab('p') === 'c9300 Switch 1 - Power Supply B (state)' && lab('f') === 'c9300 Switch 1 - FAN - T1 2 (state)') {
+        ok('a Cisco supply and fan alert under their whole names, apart');
+    } else bad('the supply and fan labels lost their names', `${lab('p')} / ${lab('f')}`);
+    if (lab('t1') === 'crs Temp: Sensor 1' && lab('t2') === 'crs Temp: Sensor 2') {
+        ok('two numbered temperatures stay two');
+    } else bad('numbered temperatures collapsed', `${lab('t1')} / ${lab('t2')}`);
+    if (lab('x') === 'crs temp') ok('a blank name falls back to the kind');
+    else bad('a blank name did not fall back to the kind', String(lab('x')));
+}
+
+// --- a fan gauge is not a load (2026-10-30, the beta list's N4) --------------
+{
+    // `extend util-fan-GPU` - nvidia-smi's fan as a percentage - raised util
+    // alerts on production's GPU server with the fan spun up under load.
+    const names = ['Util: fan-GPU', 'Util: fan-GPU0', 'Util: fan', 'Util: Fans 2', 'Util: GPU fan'];
+    const not = ['Util: GPU', 'Util: GPU0', 'Output load', 'Util: Fantom', 'Util: fanout'];
+    if (names.every((n) => isFanGauge('util', n)) && !not.some((n) => isFanGauge('util', n))) {
+        ok('a fan gauge is told by its name; GPU loads, a UPS load and fan-lookalikes are not');
+    } else bad('the fan-gauge name test is off', JSON.stringify([names.map((n) => isFanGauge('util', n)), not.map((n) => isFanGauge('util', n))]));
+    if (!isFanGauge('fan', 'Fan 1') && !isFanGauge('temp', 'Temp: fan-GPU')) ok('only a util metric can be one');
+    else bad('a non-util metric read as a fan gauge');
+
+    const util = { warn: 70, crit: 90 };
+    const base: RulesConfig = { ...CONFIG, thresholds: { ...CONFIG.thresholds, util } };
+    const doc = (): ScanDoc => ({ metrics: [
+        { code: 'gf', host: 'gpu1', kind: 'util', value: 100, display: 'Util: fan-GPU' },
+        { code: 'gl', host: 'gpu1', kind: 'util', value: 100, display: 'Util: GPU' },
+    ] });
+    const sev = (cfg: RulesConfig, code: string) => evaluate(doc(), cfg).find((c) => c.code === code)?.severity ?? 'none';
+    if (sev(base, 'gf') === 'none' && sev(base, 'gl') === 'crit') ok('the fan at 100% raises nothing; the GPU at 100% is crit');
+    else bad('the fan gauge was judged as a load', `${sev(base, 'gf')} / ${sev(base, 'gl')}`);
+    const kindRow: RulesConfig = { ...base, overrides: [{ scope: 'kind', kind: 'util', warn: 50, crit: 60, enabled: true }] };
+    const hostRow: RulesConfig = { ...base, overrides: [{ scope: 'host-kind', host: 'gpu1', kind: 'util', warn: 50, crit: 60, enabled: true }] };
+    if (sev(kindRow, 'gf') === 'none' && sev(hostRow, 'gf') === 'none' && sev(hostRow, 'gl') === 'crit') {
+        ok('a kind or device row for util does not sweep a fan gauge back in');
+    } else bad('a broad util row judged the fan gauge', `${sev(kindRow, 'gf')} / ${sev(hostRow, 'gf')}`);
+    const own: RulesConfig = { ...base, overrides: [{ scope: 'code', code: 'gf', kind: 'util', warn: 95, crit: 99, enabled: true }] };
+    if (sev(own, 'gf') === 'crit') ok('the sensor\'s own row opts a fan gauge in');
+    else bad('the own row did not opt the fan gauge in', sev(own, 'gf'));
+
+    // The page and the alert detail ask resolveRuleInfo; it must agree.
+    const ri = (cfg: RulesConfig, code: string, name: string) =>
+        resolveRuleInfo(buildOverrideIndex(cfg.overrides), cfg, 'util', code, 'gpu1', name).source;
+    if (ri(base, 'gf', 'Util: fan-GPU') === 'none' && ri(base, 'gl', 'Util: GPU') === 'default'
+        && ri(hostRow, 'gf', 'Util: fan-GPU') === 'none' && ri(own, 'gf', 'Util: fan-GPU') === 'override') {
+        ok('resolveRuleInfo says the same as the scan, given the name');
+    } else bad('resolveRuleInfo disagrees with the scan', [ri(base, 'gf', 'Util: fan-GPU'), ri(hostRow, 'gf', 'Util: fan-GPU'), ri(own, 'gf', 'Util: fan-GPU')].join(' / '));
+}
+
 // --- override precedence ------------------------------------------------------
 {
     const cfg: RulesConfig = { ...CONFIG, overrides: [
@@ -414,7 +476,11 @@ console.log('');
                     kind: pick([...METRIC_KINDS, 'gpu']),   // 'gpu' is an unconfigured kind
                     value: rnd() < 0.15 ? null : rnd() * 120,
                     unit: pick(['%', 'C', '', null]),
-                    display: maybe(`Sensor ${n} 42%`, 0.5),
+                    // No digit, dash or dot after a space: the one shape both
+                    // engines label alike since the fork stopped cutting
+                    // names (2026-10-30) - that divergence is deliberate and
+                    // pinned above, in "a sensor alert carries its whole name".
+                    display: maybe(`Sensor ${'ABCDE'[n]}`, 0.5),
                 })),
             } as ScanDoc;
         };

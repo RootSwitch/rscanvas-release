@@ -20,8 +20,10 @@
 
 import { createSession, get, walk, asString, asNumber, SnmpError, type Target } from './snmp.ts';
 import { SYS, HR, IF, IFX, defaultTracked } from './oids.ts';
+import { capEntities, ENTITY_CAPS } from './caps.ts';
+import { CONFIG } from '../config.ts';
 import {
-    matchVendor, pickRamRow, fsTracked, plausibleC, fanTracked, tempNameValid,
+    matchVendor, pickRamRow, fsTracked, plausibleC, fanTracked, stateTracked, tempNameValid,
     decodeExtendName, extendKind, sensorRaw,
     HR_SENSORS, HR_STORAGE_RAM, HR_STORAGE_FIXEDDISK, LM_TEMP,
     NSEXTEND_OUTPUT, UPS_OUTPUT_SOURCE,
@@ -60,6 +62,10 @@ export interface ProbeResult {
     /** Of the tracked INTERFACES, how many were oper up when probed: what
      *  "active ports only" would keep. */
     trackedUpCount: number;
+    /** What the operator should know about this device's discovery (beta
+     *  list S6): interfaces or sensors past the device's cap, or a sensor
+     *  discovery the probe's deadline cut short. Empty when none. */
+    notes: string[];
     error: string | null;
     errorKind: 'timeout' | 'auth' | 'other' | null;
 }
@@ -275,6 +281,26 @@ export async function discoverSensors(
         }
     }
 
+    // 5b. Vendor state tables: Cisco's power supplies and fans, one state
+    //     row each under the agent's own name. Watched only if well when
+    //     discovered (stateTracked): an empty bay can read shutdown.
+    for (const t of vendor?.states ?? []) {
+        const [names, states] = await Promise.all([
+            boundedWalk(t.descrOid),
+            boundedWalk(t.stateOid),
+        ]);
+        for (const [idx, nameRaw] of names) {
+            const nm = (asString(nameRaw) ?? '').trim();
+            if (nm === '') continue;
+            push('state', `v-${t.what}-${idx}`, nm,
+                stateTracked(asNumber(states.get(idx) ?? null), t.ok), {
+                    style: 'state', valueOid: `${t.stateOid}.${idx}`,
+                    okValues: t.ok, unknownValues: [],
+                    okText: t.texts[String(t.ok[0])], alarmText: 'Fault', texts: t.texts,
+                });
+        }
+    }
+
     // 6. Vendor scalar metrics (battery, runtime, load, voltage, state) -
     //    one GET; a sensor the device lacks reads null and is skipped.
     if (vendor?.metrics !== undefined && vendor.metrics.length > 0) {
@@ -328,9 +354,10 @@ export async function discoverSensors(
     }
 
     // 8. UPS-MIB (RFC 1628) power source: any network-managed UPS answers
-    //    this, vendor entry or not. SKIPPED when a vendor metric already
+    //    this, vendor entry or not. SKIPPED when the vendor already
     //    supplied a state - APC NMCs answer both trees, and two "Power"
-    //    cards saying the same thing is worse than one.
+    //    cards saying the same thing is worse than one; a Cisco's supply
+    //    rows (5b) skip it too, and a switch serves no UPS-MIB anyway.
     if (!out.some((e) => e.kind === 'state')) {
         try {
             const got = await get(session, [UPS_OUTPUT_SOURCE]);
@@ -360,9 +387,16 @@ export async function discoverSensors(
 export async function probeTarget(target: Target): Promise<ProbeResult> {
     const result: ProbeResult = {
         host: target.host, ok: false, sysName: null, sysDescr: null, sysLocation: null,
-        entities: [], trackedCount: 0, trackedUpCount: 0, error: null, errorKind: null,
+        entities: [], trackedCount: 0, trackedUpCount: 0, notes: [], error: null, errorKind: null,
     };
     const session = createSession(target);
+    // The poll's deadline, for one probe too (beta list S6): a batch of
+    // probes shares main's 180 s wait, and one agent that answers every
+    // request just inside the timeout must not spend it for the others.
+    const deadline = setTimeout(() => session.abort(
+        `the probe ran past its ${CONFIG.pollDeadlineMs / 1000} s deadline (POLL_DEADLINE_MS) - `
+        + 'the agent answers too slowly for what it serves'), CONFIG.pollDeadlineMs);
+    deadline.unref();
     try {
         const sys = await get(session, [SYS.sysName, SYS.sysDescr, SYS.sysLocation, SYS.sysObjectID]);
         result.sysName = asString(sys.get(SYS.sysName) ?? null);
@@ -435,8 +469,20 @@ export async function probeTarget(target: Target): Promise<ProbeResult> {
         // fails must not fail the probe - the interfaces are the contract,
         // the sensors are the bonus - so it has its own catch.
         try {
-            result.entities.push(...await discoverSensors(session, sysObjectID, result.sysDescr));
+            const found = await discoverSensors(session, sysObjectID, result.sysDescr);
+            // A discovery the deadline ended is a partial list: none of it,
+            // and said, rather than some sensors and silence about the rest.
+            if (session.aborted === null) result.entities.push(...found);
         } catch { /* sensor walk died; the interface probe stands */ }
+        if (session.aborted !== null) {
+            result.notes.push('sensor discovery ran past the probe\'s deadline, so no sensors are listed - '
+                + 'the agent is slow for its size; Rediscover tries again');
+        }
+
+        // THE DEVICE'S CAPS (beta list S6), before anything counts them.
+        const capped = capEntities(result.entities, ENTITY_CAPS());
+        result.entities = capped.kept;
+        result.notes.push(...capped.notes);
 
         result.trackedCount = result.entities.filter((e) => e.tracked).length;
         result.trackedUpCount = result.entities.filter((e) => e.kind === 'if' && e.tracked && e.operStatus === 1).length;
@@ -458,6 +504,7 @@ export async function probeTarget(target: Target): Promise<ProbeResult> {
             : /timeout|timed out/i.test(m) ? 'timeout'
                 : /auth|community|security|credential/i.test(m) ? 'auth' : 'other';
     } finally {
+        clearTimeout(deadline);
         session.close();
     }
     return result;

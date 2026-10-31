@@ -17,6 +17,8 @@ import { guessStencil } from '../export/stencil.ts';
 import { sensorSample, planSensorRepin, type SensorExtra } from './sensors.ts';
 import { speedTrust } from './speedtrust.ts';
 import { planRekey } from './rekey.ts';
+import { capEntities, ENTITY_CAPS } from './caps.ts';
+import { CONFIG } from '../config.ts';
 import { OPS, storeFailureLane, storeRefusal, type SampleRow } from '../store/index.ts';
 import { inDomain } from '../store/bounds.ts';
 import {
@@ -89,6 +91,13 @@ export interface PollResult {
     /** Slice 66: the OS in words, from this poll's own sysDescr; null on a
      *  failed poll or an agent with no sysDescr. */
     osSummary: string | null;
+    /** Beta list S6: the optional reads the poll's deadline cut short, named
+     *  for the log ("the sensor readings (12 of 800)"); empty when none. The
+     *  poll itself stands - its interfaces were read before them. */
+    cutShort: string[];
+    /** Beta list S6: new interfaces this poll did not add, because the device
+     *  is at CONFIG.maxInterfacesPerDevice. */
+    capRefused: number;
     error: string | null;
     /** store (2026-10-06): the poll failed on OUR database, not on the
      *  device - the caller must not count it against the device. */
@@ -239,8 +248,28 @@ export async function pollDevice(
         ok: false, summary: null, deviceId: device.id, rttMs: 0, samples: [], counters: [], lastValues: [],
         discovered: 0, speedConvictions: [], rekeyed: [], sysName: null, sysDescr: null, sysLocation: null,
         cpuModel: null, uptimeS: null, restart: { kind: 'unknown' }, cpuCores: null, ramKb: null, stencil: null,
-        inventoryTried: false, identity: null, osSummary: null, error: null, errorKind: null,
+        inventoryTried: false, identity: null, osSummary: null, cutShort: [], capRefused: 0,
+        error: null, errorKind: null,
     };
+
+    // THE POLL'S DEADLINE (beta list S6). Every walk had its own and every GET
+    // its timeout, but nothing bounded their sum: a slow agent with many
+    // sensors held a poll slot for minutes. At the deadline the session is
+    // aborted and every SNMP request fails at once (snmp.ts Session.abort).
+    // WHAT IT COSTS depends on where it lands, which is why the order below
+    // is what it is: the identification and the interface walks come first,
+    // and a deadline in them fails the poll - the device could not be read
+    // in time, a timeout like any other. The optional reads come after
+    // (identity, inventory, sensor re-pin, sensor readings), so a deadline
+    // there cuts them short, names them (cutShort), and keeps the poll. A
+    // restart poll that overran therefore still records its uptime, rather
+    // than judging the same restart - and overrunning - on every poll after.
+    const deadlineS = CONFIG.pollDeadlineMs / 1000;
+    const deadline = setTimeout(() => session.abort(
+        `the poll ran past its ${deadlineS} s deadline (POLL_DEADLINE_MS) - the agent answers too slowly `
+        + 'for what it serves'), CONFIG.pollDeadlineMs);
+    deadline.unref();
+    const late = (): boolean => session.aborted !== null;
 
     try {
         // sysUpTime rides the same PDU: one more varbind, no extra round
@@ -259,163 +288,6 @@ export async function pollDevice(
             device.uptime_s,
             device.since_seen_s == null ? null : device.since_seen_s + (performance.now() - t0) / 1000,
             result.uptimeS);
-
-        // THE IDENTITY READ (slice 66): what the device is and runs, from the
-        // vendor's own tree. With the daily inventory; after a restart, or a
-        // description that moved, because that is an upgrade and the record
-        // should not wait a day for it; and once for a device never read,
-        // which is how a fleet gets its identity the day this lands
-        // (identity.ts wantsIdentityRead). Fenced like the inventory:
-        // nothing it fails to read can fail the poll.
-        if (wantsIdentityRead({
-            inventory: wantInventory, neverRead: device.identity_ts == null,
-            restarted: result.restart.kind === 'restarted', storedOs: device.os_summary,
-            osNow: osText(device.sys_object_id ?? null, result.sysDescr, device.os_version ?? null),
-        })) {
-            try {
-                result.identity = await readIdentity(session, result.sysDescr);
-            } catch {
-                // An agent that refuses the tree is the normal case for most
-                // of it; identity_ts is stamped regardless (the write), so
-                // it is asked again tomorrow, not every poll.
-                result.identity = {
-                    sysObjectId: null, osVersion: null, hwModel: null, fwVersion: null, fwUpgrade: null,
-                };
-            }
-        }
-        // The OS in words from THIS poll's sysDescr, with the family and
-        // version the identity read found now or last time - so RouterOS
-        // 7.2x's own version string shows at its first poll after an
-        // upgrade, and an older RouterOS keeps its MIB version between reads.
-        result.osSummary = osText(
-            result.identity?.sysObjectId ?? device.sys_object_id ?? null, result.sysDescr,
-            result.identity?.osVersion ?? device.os_version ?? null);
-
-        // THE INVENTORY READ, and it is deliberately fenced off from the poll.
-        //
-        // Its own try/catch, because a device that does not expose
-        // HOST-RESOURCES must not have its POLL fail - the counters and status
-        // above are the product, and losing them because an optional CPU
-        // string was unavailable would be the tail wagging the dog. The
-        // attempt is recorded either way so the caller can back off.
-        //
-        // Walk the processor table for indices, then read the matching
-        // description. One walk of N cores plus one get, once a day - and
-        // after a restart (2026-10-25), as the identity read and the re-pin
-        // already were: a VM resized is a VM rebooted, and its cores and
-        // memory trailed the resize by up to a day.
-        if (wantInventory || result.restart.kind === 'restarted') {
-            result.inventoryTried = true;
-            try {
-                const procs = await walk(session, HR.hrProcessorLoad);
-                // walk() keys are SUFFIXES - it strips the base OID itself. An
-                // earlier version sliced the base off a second time, producing
-                // a junk index and a GET that could never resolve. It shipped
-                // for a day because no agent in the lab exposes HOST-RESOURCES,
-                // so the read was only ever proven to BACK OFF correctly, never
-                // to return a value. The identical mistake in the probe was
-                // caught within one run, because the mock fleet does have
-                // interfaces.
-                // The rows ARE the cores (hrProcessorTable has one per
-                // logical processor); the walk was already paid for.
-                result.cpuCores = procs.size > 0 ? procs.size : null;
-                const memRes = await get(session, [HR.hrMemorySize]);
-                const kb = asNumber(memRes.get(HR.hrMemorySize) ?? null);
-                result.ramKb = kb !== null && kb > 0 ? kb : null;
-                const idx = [...procs.keys()][0];
-                if (idx !== undefined) {
-                    const d = await get(session, [`${HR.hrDeviceDescr}.${idx}`]);
-                    const raw = asString(d.get(`${HR.hrDeviceDescr}.${idx}`) ?? null);
-                    // "GenuineIntel: Intel(R) N150" - the vendor prefix is
-                    // noise for every purpose this string has.
-                    result.cpuModel = raw === null ? null
-                        : raw.replace(/^[A-Za-z]+Intel:\s*|^AuthenticAMD:\s*/, '').trim() || null;
-                }
-            } catch {
-                // Silent by design: an agent without HOST-RESOURCES is the
-                // normal case for switches and appliances, not an incident.
-                // inventoryTried stays true, so it is asked again tomorrow
-                // rather than on every poll forever.
-            }
-        }
-
-        // THE SENSOR RE-PIN ON A RESTART, as well as daily (2026-10-22): a
-        // reboot is when an agent renumbers hrStorage, and a day of the
-        // wrong disk's readings - a production GPU server's models disk
-        // filing as /boot/efi - is a day too long. Before the sensor read
-        // below, so the restart's own poll already reads the right disks.
-        if (wantInventory || result.restart.kind === 'restarted') {
-            // THE SENSOR BACKFILL AND RE-PIN, at the inventory cadence and on a restart.
-            // Backfill: devices added before the sensors slice grow sensors
-            // without a rediscover button - discover-if-NONE, so an operator
-            // who deleted a junk sensor does not get it back every midnight.
-            // RE-PIN (2026-09-01, the DC investigation): devices that HAVE
-            // sensors get their polling instructions refreshed instead -
-            // extra pins literal OIDs at discovery, Windows renumbers
-            // hrDeviceIndex and hrStorage across reboots, and no other path
-            // could ever heal the pin (backfill never re-runs, rediscover's
-            // ON CONFLICT DO NOTHING keeps the stale row). The planner in
-            // sensors.ts updates instructions on existing rows only: codes,
-            // history, tracked flags and deletions all honoured. Rides here
-            // because the cadence question is already answered: once a day
-            // per device, on the device's own poll slot.
-            try {
-                const sc = await OPS.sensorCountForDevice(device.id);
-                if (sc.ok) {
-                    const so = await get(session, [SYS.sysObjectID]);
-                    const sensors = await discoverSensors(
-                        session, asString(so.get(SYS.sysObjectID) ?? null), result.sysDescr);
-                    if (sc.rows[0]?.n === 0) {
-                        for (const s of sensors) {
-                            const code = generateCode(device.name, s.name, takenCodes);
-                            takenCodes.add(code);
-                            // WRITE-IN-LOOP-OK: DISCOVERY ONLY, once per
-                            // device EVER (the none-gate above), each row
-                            // minting its own collision-checked code - the
-                            // same shape and justification as the
-                            // interface-discovery insert below.
-                            const created = await OPS.insertEntity(
-                                device.id, s.kind, s.snmpIndex, s.name, s.descr,
-                                s.alias, s.speedBps, code,
-                                s.extra !== null ? JSON.stringify(s.extra) : null,
-                                s.tracked);
-                            if (created.ok && created.rows.length > 0) result.discovered++;
-                        }
-                    } else if (sensors.length > 0) {
-                        const rows = await OPS.sensorRowsForRepin(device.id);
-                        if (rows.ok) {
-                            const plan = planSensorRepin(
-                                sensors.flatMap((s) => (s.extra === null ? [] : [{
-                                    kind: s.kind, snmpIndex: s.snmpIndex,
-                                    name: s.name, extra: s.extra,
-                                }])),
-                                rows.rows);
-                            // ONE write for the whole plan (2026-10-22): two
-                            // disks that traded indexes move together or not
-                            // at all (OPS.repinSensors). The steady-state
-                            // plan is empty and writes nothing.
-                            if (plan.length > 0) {
-                                const moves = plan.map((u) => ({
-                                    id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra),
-                                    name: u.rename?.to ?? null,
-                                }));
-                                const w = await OPS.repinSensors(device.id, moves);
-                                const done = new Set(w.ok ? w.rows.map((r) => r.id) : []);
-                                for (const u of plan) {
-                                    if (!done.has(u.id)) continue;
-                                    result.rekeyed.push(u.rename !== undefined
-                                        ? `${u.rename.from} is now ${u.rename.to}: the agent's processor count changed (history kept)`
-                                        : `${u.name}: sensor instruction re-pinned (the agent renumbered; readings resume, history kept)`);
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch {
-                // Sensors are the bonus, the poll is the product - same
-                // reasoning as the probe's own sensor catch.
-            }
-        }
 
         // One walk per column. GetBulk makes each cheap, and the alternative -
         // a GET per interface per column - is the 5,200-queries-per-page-load
@@ -451,32 +323,18 @@ export async function pollDevice(
             IF.ifOutOctets,
         ]);
 
+        // The response time is the conversation up to here: identification and
+        // the interface walks. The optional reads after the interface loop are
+        // not in it (since 2026-10-31; they ran before the walks and made a
+        // restart or inventory poll's time spike).
         const rtt = performance.now() - t0;
         result.rttMs = Number(rtt.toFixed(1));
-
-        // Slice 32: the device-type guess, from the strings this poll just
-        // read. Computed here rather than at discovery because sysDescr
-        // CHANGES - a firmware upgrade can turn "Linux" into a vendor string
-        // that names the model - and an icon that was right in March should
-        // not still be wrong in November. Empty stays empty: guessStencil
-        // returns '' when the evidence is ambiguous, and coalesce keeps the
-        // last confident answer rather than blanking a tile on one odd poll.
-        //
-        // The CPU model falls back to the STORED one (2026-10-08). Only an
-        // inventory poll reads it - about daily - so every other poll guessed
-        // with none, and "no CPU model" is honestly "server": a VM was drawn
-        // as a vm on its inventory poll and back as a server on the next one,
-        // for good. Found by the demo fleet's cloud VMs, which never showed as
-        // vms though their QEMU CPU was stored.
-        const guessed = guessStencil({
-            sysDescr: result.sysDescr, sysName: result.sysName,
-            name: device.name, cpuModel: result.cpuModel ?? device.cpu_model ?? null,
-        });
-        result.stencil = guessed === '' ? null : guessed;
 
         const existing = await OPS.entitiesForDevice(device.id);
         if (!existing.ok) throw storeRefusal('entitiesForDevice', existing);
         const byIndex = new Map(existing.rows.map((r) => [r.snmp_index ?? '', r]));
+        // Every interface row the device has, parked ones too: the cap counts rows.
+        let ifCount = existing.rows.length;
 
         // RE-ENUMERATION, decided from the whole table BEFORE the per-row
         // loop, because "did this entity move" needs to know which indexes
@@ -573,6 +431,14 @@ export async function pollDevice(
             const operStatus = inDomain(asNumber(oper.get(idx) ?? null), 1, 7);
 
             let row = byIndex.get(idx);
+            // THE DEVICE'S INTERFACE CAP (beta list S6): an agent that serves
+            // new indexes poll after poll - churning tunnels, or one that
+            // means harm - otherwise adds rows without end. Counted, and the
+            // collector says so about hourly.
+            if (!row && ifCount >= CONFIG.maxInterfacesPerDevice) {
+                result.capRefused++;
+                continue;
+            }
             if (!row) {
                 const code = generateCode(device.name, name, takenCodes);
                 takenCodes.add(code);
@@ -608,6 +474,7 @@ export async function pollDevice(
                 );
                 if (!created.ok || created.rows.length === 0) continue;
                 result.discovered++;
+                ifCount++;
                 row = {
                     id: created.rows[0]?.id as string, snmp_index: idx, name,
                     code: created.rows[0]?.code ?? code,
@@ -795,6 +662,210 @@ export async function pollDevice(
             });
         }
 
+        // THE IDENTITY READ (slice 66): what the device is and runs, from the
+        // vendor's own tree. With the daily inventory; after a restart, or a
+        // description that moved, because that is an upgrade and the record
+        // should not wait a day for it; and once for a device never read,
+        // which is how a fleet gets its identity the day this lands
+        // (identity.ts wantsIdentityRead). Fenced like the inventory:
+        // nothing it fails to read can fail the poll.
+        //
+        // AFTER THE INTERFACES, with the inventory and the re-pin (beta list
+        // S6): what the poll's deadline cuts short here is named and costs
+        // only itself. A read the deadline ended is stamped like one the
+        // agent refused - asked again tomorrow, not on every poll.
+        const wantIdentity = wantsIdentityRead({
+            inventory: wantInventory, neverRead: device.identity_ts == null,
+            restarted: result.restart.kind === 'restarted', storedOs: device.os_summary,
+            osNow: osText(device.sys_object_id ?? null, result.sysDescr, device.os_version ?? null),
+        });
+        if (wantIdentity && !late()) {
+            try {
+                result.identity = await readIdentity(session, result.sysDescr);
+            } catch {
+                // An agent that refuses the tree is the normal case for most
+                // of it; identity_ts is stamped regardless (the write), so
+                // it is asked again tomorrow, not every poll.
+                result.identity = {
+                    sysObjectId: null, osVersion: null, hwModel: null, fwVersion: null, fwUpgrade: null,
+                };
+            }
+        }
+        if (wantIdentity && late()) result.cutShort.push('the identity read');
+        // The OS in words from THIS poll's sysDescr, with the family and
+        // version the identity read found now or last time - so RouterOS
+        // 7.2x's own version string shows at its first poll after an
+        // upgrade, and an older RouterOS keeps its MIB version between reads.
+        result.osSummary = osText(
+            result.identity?.sysObjectId ?? device.sys_object_id ?? null, result.sysDescr,
+            result.identity?.osVersion ?? device.os_version ?? null);
+
+        // THE INVENTORY READ, and it is deliberately fenced off from the poll.
+        //
+        // Its own try/catch, because a device that does not expose
+        // HOST-RESOURCES must not have its POLL fail - the counters and status
+        // above are the product, and losing them because an optional CPU
+        // string was unavailable would be the tail wagging the dog. The
+        // attempt is recorded either way so the caller can back off.
+        //
+        // Walk the processor table for indices, then read the matching
+        // description. One walk of N cores plus one get, once a day - and
+        // after a restart (2026-10-25), as the identity read and the re-pin
+        // already were: a VM resized is a VM rebooted, and its cores and
+        // memory trailed the resize by up to a day.
+        const wantHeavy = wantInventory || result.restart.kind === 'restarted';
+        if (wantHeavy && !late()) {
+            result.inventoryTried = true;
+            try {
+                const procs = await walk(session, HR.hrProcessorLoad);
+                // walk() keys are SUFFIXES - it strips the base OID itself. An
+                // earlier version sliced the base off a second time, producing
+                // a junk index and a GET that could never resolve. It shipped
+                // for a day because no agent in the lab exposes HOST-RESOURCES,
+                // so the read was only ever proven to BACK OFF correctly, never
+                // to return a value. The identical mistake in the probe was
+                // caught within one run, because the mock fleet does have
+                // interfaces.
+                // The rows ARE the cores (hrProcessorTable has one per
+                // logical processor); the walk was already paid for.
+                result.cpuCores = procs.size > 0 ? procs.size : null;
+                const memRes = await get(session, [HR.hrMemorySize]);
+                const kb = asNumber(memRes.get(HR.hrMemorySize) ?? null);
+                result.ramKb = kb !== null && kb > 0 ? kb : null;
+                const idx = [...procs.keys()][0];
+                if (idx !== undefined) {
+                    const d = await get(session, [`${HR.hrDeviceDescr}.${idx}`]);
+                    const raw = asString(d.get(`${HR.hrDeviceDescr}.${idx}`) ?? null);
+                    // "GenuineIntel: Intel(R) N150" - the vendor prefix is
+                    // noise for every purpose this string has.
+                    result.cpuModel = raw === null ? null
+                        : raw.replace(/^[A-Za-z]+Intel:\s*|^AuthenticAMD:\s*/, '').trim() || null;
+                }
+            } catch {
+                // Silent by design: an agent without HOST-RESOURCES is the
+                // normal case for switches and appliances, not an incident.
+                // inventoryTried stays true, so it is asked again tomorrow
+                // rather than on every poll forever.
+            }
+        }
+        if (wantHeavy && late()) result.cutShort.push('the inventory read');
+
+        // THE SENSOR RE-PIN ON A RESTART, as well as daily (2026-10-22): a
+        // reboot is when an agent renumbers hrStorage, and a day of the
+        // wrong disk's readings - a production GPU server's models disk
+        // filing as /boot/efi - is a day too long. Before the sensor read
+        // below, so the restart's own poll already reads the right disks.
+        if (wantHeavy && !late()) {
+            // THE SENSOR BACKFILL AND RE-PIN, at the inventory cadence and on a restart.
+            // Backfill: devices added before the sensors slice grow sensors
+            // without a rediscover button - discover-if-NONE, so an operator
+            // who deleted a junk sensor does not get it back every midnight.
+            // RE-PIN (2026-09-01, the DC investigation): devices that HAVE
+            // sensors get their polling instructions refreshed instead -
+            // extra pins literal OIDs at discovery, Windows renumbers
+            // hrDeviceIndex and hrStorage across reboots, and no other path
+            // could ever heal the pin (backfill never re-runs, rediscover's
+            // ON CONFLICT DO NOTHING keeps the stale row). The planner in
+            // sensors.ts updates instructions on existing rows only: codes,
+            // history, tracked flags and deletions all honoured. Rides here
+            // because the cadence question is already answered: once a day
+            // per device, on the device's own poll slot.
+            try {
+                const sc = await OPS.sensorCountForDevice(device.id);
+                if (sc.ok) {
+                    const so = await get(session, [SYS.sysObjectID]);
+                    const found = await discoverSensors(
+                        session, asString(so.get(SYS.sysObjectID) ?? null), result.sysDescr);
+                    // A discovery the deadline ended is a partial list, and a
+                    // partial list must not re-pin or backfill anything (the
+                    // planner would read a missing name as a gone one).
+                    const sensors = late() ? [] : found;
+                    if (late()) {
+                        // Named by the line after this block.
+                    } else if (sc.rows[0]?.n === 0) {
+                        // The backfill INSERTS, so it keeps inside the
+                        // device's sensor cap as discovery does; the re-pin
+                        // below writes no new row and reads the whole list.
+                        for (const s of capEntities(sensors, ENTITY_CAPS()).kept) {
+                            const code = generateCode(device.name, s.name, takenCodes);
+                            takenCodes.add(code);
+                            // WRITE-IN-LOOP-OK: DISCOVERY ONLY, once per
+                            // device EVER (the none-gate above), each row
+                            // minting its own collision-checked code - the
+                            // same shape and justification as the
+                            // interface-discovery insert above.
+                            const created = await OPS.insertEntity(
+                                device.id, s.kind, s.snmpIndex, s.name, s.descr,
+                                s.alias, s.speedBps, code,
+                                s.extra !== null ? JSON.stringify(s.extra) : null,
+                                s.tracked);
+                            if (created.ok && created.rows.length > 0) result.discovered++;
+                        }
+                    } else if (sensors.length > 0) {
+                        const rows = await OPS.sensorRowsForRepin(device.id);
+                        if (rows.ok) {
+                            const plan = planSensorRepin(
+                                sensors.flatMap((s) => (s.extra === null ? [] : [{
+                                    kind: s.kind, snmpIndex: s.snmpIndex,
+                                    name: s.name, extra: s.extra,
+                                }])),
+                                rows.rows);
+                            // ONE write for the whole plan (2026-10-22): two
+                            // disks that traded indexes move together or not
+                            // at all (OPS.repinSensors). The steady-state
+                            // plan is empty and writes nothing.
+                            if (plan.length > 0) {
+                                const moves = plan.map((u) => ({
+                                    id: u.id, snmpIndex: u.snmpIndex, extra: JSON.stringify(u.extra),
+                                    name: u.rename?.to ?? null, park: u.park !== undefined,
+                                }));
+                                const w = await OPS.repinSensors(device.id, moves);
+                                const done = new Set(w.ok ? w.rows.map((r) => r.id) : []);
+                                for (const u of plan) {
+                                    if (!done.has(u.id)) continue;
+                                    // The newcomer may be a row of this same
+                                    // plan moving home; only a stranger
+                                    // waits for Rediscover.
+                                    const movedIn = u.park !== undefined
+                                        && plan.some((m) => m.park === undefined && m.snmpIndex === u.park?.from);
+                                    result.rekeyed.push(u.park !== undefined
+                                        ? `${u.name}: no longer served - ${u.park.by} is at its index now; stopped reading it (history kept; `
+                                            + `${movedIn ? `${u.park.by}'s own row moved back there` : `Rediscover adds ${u.park.by}`})`
+                                        : u.rename !== undefined
+                                            ? `${u.rename.from} is now ${u.rename.to}: the agent's processor count changed (history kept)`
+                                            : `${u.name}: sensor instruction re-pinned (the agent renumbered; readings resume, history kept)`);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {
+                // Sensors are the bonus, the poll is the product - same
+                // reasoning as the probe's own sensor catch.
+            }
+        }
+        if (wantHeavy && late()) result.cutShort.push('the sensor re-pin');
+
+        // Slice 32: the device-type guess, from the strings this poll just
+        // read. Computed here rather than at discovery because sysDescr
+        // CHANGES - a firmware upgrade can turn "Linux" into a vendor string
+        // that names the model - and an icon that was right in March should
+        // not still be wrong in November. Empty stays empty: guessStencil
+        // returns '' when the evidence is ambiguous, and coalesce keeps the
+        // last confident answer rather than blanking a tile on one odd poll.
+        //
+        // The CPU model falls back to the STORED one (2026-10-08). Only an
+        // inventory poll reads it - about daily - so every other poll guessed
+        // with none, and "no CPU model" is honestly "server": a VM was drawn
+        // as a vm on its inventory poll and back as a server on the next one,
+        // for good. Found by the demo fleet's cloud VMs, which never showed as
+        // vms though their QEMU CPU was stored.
+        const guessed = guessStencil({
+            sysDescr: result.sysDescr, sysName: result.sysName,
+            name: device.name, cpuModel: result.cpuModel ?? device.cpu_model ?? null,
+        });
+        result.stencil = guessed === '' ? null : guessed;
+
         // --- sensors (the sensors slice) --------------------------------------
         //
         // TRACKED sensors only (the discovery gates exist so junk never
@@ -810,9 +881,17 @@ export async function pollDevice(
         // aggregate.
         //
         // Its own try/catch: sensors are the bonus, the poll is the product.
+        //
+        // AND THE POLL'S DEADLINE STOPS IT (beta list S6): this pass is the
+        // one with no bound of its own - a GET per 30 OIDs, and a failed
+        // chunk retried one OID at a time. A sensor is written only when
+        // every OID it reads was asked before the deadline; the rest keep
+        // their last values, and cutShort says how many were read.
         try {
-            const sensors = await OPS.sensorsForDevice(device.id);
-            if (sensors.ok && sensors.rows.length > 0) {
+            const sensors = late() ? null : await OPS.sensorsForDevice(device.id);
+            if (sensors === null) {
+                result.cutShort.push('the sensor readings');
+            } else if (sensors.ok && sensors.rows.length > 0) {
                 const oidSet = new Set<string>();
                 for (const s of sensors.rows) {
                     const x = s.extra;
@@ -822,14 +901,28 @@ export async function pollDevice(
                     }
                 }
                 const values = new Map<string, unknown>();
+                // The OIDs this pass got an answer about - a value, or the
+                // agent's refusal of that one OID - before any deadline.
+                const asked = new Set<string>();
                 const oids = [...oidSet];
                 // 30 varbinds per PDU: comfortably under every agent's limit,
                 // and a 4-sensor host is one GET.
-                for (let i = 0; i < oids.length; i += 30) {
+                //
+                // FROM A CHUNK CHOSEN AT RANDOM, wrapping round: a poll the
+                // deadline cuts short reads a different stretch of the device's
+                // sensors each time, so every sensor is read every few polls -
+                // starting at the first chunk, the lab's stalling mock had the
+                // same 105 of 238 read on every poll and the rest never
+                // (2026-10-31). A poll that is not cut reads them all either way.
+                const chunks = Math.ceil(oids.length / 30);
+                const first = chunks > 1 ? Math.floor(Math.random() * chunks) : 0;
+                for (let k = 0; k < chunks && !late(); k++) {
+                    const i = ((first + k) % chunks) * 30;
                     const slice = oids.slice(i, i + 30);
                     try {
                         const got = await get(session, slice);
                         for (const [k, v] of got) values.set(k, v);
+                        for (const o of slice) asked.add(o);
                     } catch {
                         // ONE POISONED VARBIND MUST NOT STARVE THE CHUNK. Some
                         // agents (the stock Windows service among them) answer
@@ -843,14 +936,25 @@ export async function pollDevice(
                         // already wrong, and the re-pin pass above removes
                         // the dead pin within an inventory cycle.
                         for (const oid of slice) {
+                            if (late()) break;
                             try {
                                 const got = await get(session, [oid]);
                                 for (const [k, v] of got) values.set(k, v);
-                            } catch { /* that one is dead; sensorSample reads it as absent */ }
+                                asked.add(oid);
+                            } catch {
+                                // That one is dead; sensorSample reads it as
+                                // absent. Unless the deadline ended it.
+                                if (!late()) asked.add(oid);
+                            }
                         }
                     }
                 }
+                let read = 0;
                 for (const s of sensors.rows) {
+                    const x = s.extra;
+                    const its = [...(x.oids ?? []), x.valueOid, x.usedOid, x.freeOid, x.sizeOid];
+                    if (its.some((o) => o !== undefined && !asked.has(o))) continue;
+                    read++;
                     const smp = sensorSample(s.kind, s.extra,
                         (oid) => values.get(oid));
                     const v = [smp.v0, smp.v1, null, null, null, null];
@@ -861,6 +965,9 @@ export async function pollDevice(
                         id: s.id, ts: now, status: smp.status, rttMs: null, v,
                     });
                     sensorReadings.push({ kind: s.kind, name: s.name, v0: smp.v0, v1: smp.v1, status: smp.status });
+                }
+                if (read < sensors.rows.length) {
+                    result.cutShort.push(`the sensor readings (${read} of ${sensors.rows.length} read)`);
                 }
             }
         } catch { /* a failed sensor pass costs one cycle of readings, nothing else */ }
@@ -881,6 +988,7 @@ export async function pollDevice(
             result.error = `${result.error} (session error: ${session.lastError.message})`;
         }
     } finally {
+        clearTimeout(deadline);
         session.close();
     }
 

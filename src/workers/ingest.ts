@@ -218,6 +218,9 @@ function disarmRule(rule: EventRule, ms: number): void {
 // added a moment ago is attributed within 30 s, and until then its messages
 // carry the address alone, as they always did.
 let devicesByAddress = new Map<string, string[]>();
+/** Whether any armed rule is scoped (slice 70): only then does a message
+ *  carry its sender's devices into the matcher. */
+let anyScopedRule = false;
 async function reloadDeviceAddresses(): Promise<void> {
     const res = await OPS.deviceAddresses();
     if (!res.ok) return;   // keep the last good map
@@ -239,6 +242,7 @@ async function reloadEventRules(): Promise<void> {
             isRegex: row.is_regex,
             source: row.source as EventRule['source'],
             severity: row.severity as EventRule['severity'],
+            scopeDevices: row.scope_devices,
         };
         const c = compileRule(rule);
         // A broken rule must not break the others - and it cannot arrive by
@@ -259,6 +263,7 @@ async function reloadEventRules(): Promise<void> {
     eventRuleErrors = broken;
     eventRulesDisarmed = disarmedRuleIds.size;
     compiledEventRules = compiled;
+    anyScopedRule = compiled.some((c) => c.scope !== null);
     log(`event rules armed: ${compiled.length}${broken > 0 ? ` (${broken} refused)` : ''}`);
 }
 
@@ -313,6 +318,10 @@ function enqueue(row: MessageRow): void {
             // never be 'event|N|null', so the last resort is named.
             sourceIp: row.sourceIp ?? 'unknown-source',
             proto: row.proto ?? 'syslog', app: row.app, ts: row.ts,
+            // Every device at the address counts (two agents on one host,
+            // told apart by port); the same prefix rule as deviceForAddress.
+            ...(anyScopedRule && row.sourceIp
+                ? { devices: devicesByAddress.get(row.sourceIp.replace(/^::ffff:/, '')) ?? [] } : {}),
         }, disarmRule, PENDING_EVENTS_MAX);
     }
 

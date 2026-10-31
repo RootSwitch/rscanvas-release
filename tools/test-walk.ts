@@ -36,6 +36,8 @@ function fakeSession(batches: () => Generator<Array<{ oid: string; type: number;
         close: () => { /* nothing to close */ },
         lastError: null,
         v3Level: null,
+        aborted: null,
+        abort: (reason: string) => { session.aborted = reason; },
         inner: {
             subtree: (
                 _oid: string,

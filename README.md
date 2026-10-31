@@ -8,7 +8,7 @@ driven by your own network diagram. Node with TypeScript over PostgreSQL,
 with each concern on its own runtime and its own bounded share of the
 database, so a slow query cannot stall a poll.
 
-**Status: alpha (0.1.0-alpha.12).** It works, and it is getting polished. One
+**Status: alpha (0.1.0-alpha.13).** It works, and it is getting polished. One
 operator has run it for a season on a home network of about forty devices of
 mixed make, and it has been load-tested to 30,000 tracked entities - on a
 12 vCPU virtual machine for two weeks, and on an 8-thread mini PC taking
@@ -164,7 +164,8 @@ schema, hardens the roles, writes the systemd unit and environment file,
 mints a self-signed certificate, and verifies the result. Re-running it is
 safe by design and is how upgrades are applied. `INSTALL.md` has the whole
 procedure, the flags, upgrades, backup and restore, uninstalling, and where
-to look when something is wrong.
+to look when something is wrong; `docs/FIRST-HOUR.md` is the first hour
+after it, from signing in to a wall on a screen.
 
 From source, for development:
 
@@ -178,7 +179,7 @@ from `ADMIN_USERNAME`, default `admin`). Without `COLLECTOR_ENABLED=1`
 nothing is polled and without `JOBS_ENABLED=1` nothing is rolled up or
 expired; retention stays a dry run until `RETENTION_DRY_RUN=0`, and with no
 `RSCANVAS_SECRET` credential profiles are off. The installer sets all four.
-`npm test` runs the offline suite: sixty-two test files, eighteen static
+`npm test` runs the offline suite: eighty-four test files, twenty static
 checkers and a type check, no database needed.
 
 ## Configuration

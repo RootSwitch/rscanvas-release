@@ -267,6 +267,39 @@ function resolveLevels(
     return resolveLevelsInfo(idx, defaults, code, host, kind).levels;
 }
 
+/**
+ * A FAN'S SPEED IN PERCENT IS NOT A LOAD (2026-10-30, the beta list's N4).
+ * nvidia-smi gives a GPU's fan as a percentage, so an agent owner publishes
+ * it as `extend util-fan-GPU` - "Util: fan-GPU" - and the util rule judged
+ * it as a load: production's GPU server raised util alerts with its fan
+ * spun up under an inference run, doing its job, until the operator turned
+ * that sensor's rule off by hand (2026-10-27). A fan gauge takes no part in
+ * the util rule by default, and a device or kind row for util does not sweep
+ * it back in - those speak of loads; only the sensor's OWN row does, which
+ * is how one is opted in. The stopped-fan rule is its own and unaffected.
+ */
+export const FAN_GAUGE_NAME = /(?:^|[\s:_-])fans?(?:$|[\s_\d-])/i;
+
+/** Whether a host metric is a fan's speed in percent, judged by its name. */
+export function isFanGauge(kind: string, name: string | null | undefined): boolean {
+    return kind === 'util' && FAN_GAUGE_NAME.test(String(name ?? ''));
+}
+
+/** The levels a host metric is judged by, and what said so: the ordinary
+ *  resolution, except that a fan gauge answers only to its own row. The ONE
+ *  path for evaluate() and resolveRuleInfo, so the page cannot say a rule
+ *  applies that the scan skips. */
+function resolveMetricInfo(
+    idx: OverrideIndex, config: RulesConfig, kind: string,
+    code: string | null, host: string | null, name: string | null | undefined,
+): { levels: Levels | null; source: string; muted: boolean } {
+    if (isFanGauge(kind, name)) {
+        if (code === null || !idx.byCode.has(`${code}|${kind}`)) return { levels: null, source: 'none', muted: false };
+        return resolveLevelsInfo({ byCode: idx.byCode, byHostKind: new Map(), byKind: new Map() }, null, code, host, kind);
+    }
+    return resolveLevelsInfo(idx, config.thresholds[kind], code, host, kind);
+}
+
 function resolveBoolInfo(
     idx: OverrideIndex, defaults: BoolRule | null | undefined,
     code: string | null, host: string | null, kind: string,
@@ -404,6 +437,8 @@ export interface RuleInfo { source: string; muted: boolean; levels: Levels | nul
  */
 export function resolveRuleInfo(
     idx: OverrideIndex, config: RulesConfig, kind: string, code: string | null, host: string | null,
+    /** The sensor's name, for host metrics: a fan gauge is judged by it (isFanGauge). */
+    name?: string | null,
 ): RuleInfo {
     if (kind === 'if-down' || kind === 'device-down') {
         const b = resolveBoolInfo(idx, kind === 'if-down' ? config.ifRules.down : config.deviceDown, code, host, kind);
@@ -444,13 +479,15 @@ export function resolveRuleInfo(
         const info = resolveLevelsInfo(idx, config.thresholds[kind], code, host, kind);
         return { source: info.source, muted: info.muted, levels: info.levels };
     }
+    if ((METRIC_KINDS as readonly string[]).includes(kind)) {
+        const info = resolveMetricInfo(idx, config, kind, code, host, name);
+        return { source: info.source, muted: info.muted, levels: info.levels };
+    }
     const defaults = kind === 'if-errors' ? config.ifRules.errors
         : kind === 'if-discards' ? config.ifRules.discards
             : kind === 'if-util' ? config.ifRules.util
-                : (METRIC_KINDS as readonly string[]).includes(kind) ? config.thresholds[kind]
-                    : undefined;
-    const known = kind === 'if-errors' || kind === 'if-discards' || kind === 'if-util'
-        || (METRIC_KINDS as readonly string[]).includes(kind);
+                : undefined;
+    const known = kind === 'if-errors' || kind === 'if-discards' || kind === 'if-util';
     if (!known) return { source: 'none', muted: false, levels: null };
     const info = resolveLevelsInfo(idx, defaults, code, host, kind);
     return { source: info.source, muted: info.muted, levels: info.levels };
@@ -472,12 +509,18 @@ function levelSeverity(
 const round2 = (v: number): number => Math.round(v * 100) / 100;
 
 /** "UPS1-Load 5%" -> "UPS1-Load", falling back to the kind. */
+/**
+ * The sensor's WHOLE name (2026-10-30). The parent's display string carried a
+ * reading on its end ("GPU 287 W"), and this cut it at the first space before
+ * a digit, dash or dot; here `display` is the entity's name alone, so the cut
+ * only ever ate the name. A C9300's two supplies and three fans all alerted
+ * as "Switch" ("Switch 1 - Power Supply B"), and production's CRS317 fans
+ * would have as "Fan", its NVMe sensors as "Sensor" - the number is what
+ * tells them apart. Found by the Cisco supply and fan drill on the lab box.
+ */
 function metricName(m: ScanMetric): string {
-    if (m.display) {
-        const cut = String(m.display).replace(/\s+[-\d.].*$/, '').trim();
-        if (cut) return cut;
-    }
-    return m.kind;
+    const name = String(m.display ?? '').replace(/\s+/g, ' ').trim();
+    return name !== '' ? name : m.kind;
 }
 
 /**
@@ -679,7 +722,7 @@ export function evaluate(doc: ScanDoc, config: RulesConfig): Condition[] {
         if (!m || !m.code) continue;                        // no stable key
         if (!(METRIC_KINDS as readonly string[]).includes(m.kind)) continue;  // future kinds: ignore until configured
         if (mutedDevices.has(m.host ?? '')) continue;
-        const levels = resolveLevels(idx, config.thresholds[m.kind], m.code, m.host ?? null, m.kind);
+        const levels = resolveMetricInfo(idx, config, m.kind, m.code, m.host ?? null, m.display).levels;
         if (!levels) continue;
         if (downDevices.has(m.host ?? '')) {
             // Transient-down quiets metrics too, UNIFORMLY with interfaces

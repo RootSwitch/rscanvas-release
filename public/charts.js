@@ -50,7 +50,7 @@ export function fmtValue(v, unit) {
         return `${Math.round(v / 60)}m`;
     }
     if (unit === 'bytes') return fmtSI(v, 1024, ['B', 'KiB', 'MiB', 'GiB', 'TiB']);
-    if (unit === 'bps') return fmtSI(v, 1000, ['bps', 'kbps', 'Mbps', 'Gbps', 'Tbps']);
+    if (unit === 'bps') return fmtSI(v, 1000, ['b/s', 'kb/s', 'Mb/s', 'Gb/s', 'Tb/s']);
     if (unit === 'pps') {
         // Error and discard rates stay FRACTIONAL - the handoff's one-way
         // door, same thresholds as the roster's fmtRate. fmtSI's two decimals

@@ -17,10 +17,46 @@ export interface EventRule {
     isRegex: boolean;
     source: 'any' | 'syslog' | 'trap';
     severity: 'warn' | 'crit';
+    /** The device names a scoped rule listens to (slice 70), resolved from
+     *  its device, location or application when the rules load; null or
+     *  absent for a rule that hears every sender. An empty list hears no
+     *  one - a scope whose group has emptied is not "everywhere". */
+    scopeDevices?: string[] | null;
+}
+
+/** What a rule's scope can name (slice 70). */
+export const RULE_SCOPE_KINDS = ['device', 'location', 'application'] as const;
+export type RuleScopeKind = typeof RULE_SCOPE_KINDS[number];
+
+/**
+ * A scope as a request sends it: no kind (or "everywhere") is every sender;
+ * otherwise a known kind and a non-empty name. Pure - the route then asks
+ * the store whether any device answers to it.
+ */
+export function parseRuleScope(
+    kind: unknown, value: unknown,
+): { ok: true; kind: RuleScopeKind | null; value: string | null } | { ok: false; detail: string } {
+    if (kind === undefined || kind === null || kind === '' || kind === 'everywhere') {
+        return { ok: true, kind: null, value: null };
+    }
+    if (!(RULE_SCOPE_KINDS as readonly unknown[]).includes(kind)) {
+        return { ok: false, detail: 'a rule\'s scope is a device, a location or an application, or everywhere' };
+    }
+    const v = String(value ?? '').trim();
+    if (v === '') return { ok: false, detail: `name the ${String(kind)} the rule listens to` };
+    if (v.length > 200) return { ok: false, detail: 'a scope name is at most 200 characters' };
+    return { ok: true, kind: kind as RuleScopeKind, value: v };
+}
+
+/** The scope in words, for the page and the audit log. */
+export function scopeWords(kind: string | null | undefined, value: string | null | undefined): string {
+    return kind ? `${kind} ${value ?? ''}`.trim() : 'every sender';
 }
 
 export interface CompiledRule {
     rule: EventRule;
+    /** The scope as lower-cased names, or null for every sender. */
+    scope: Set<string> | null;
     /** True when this message text matches. Never throws. */
     test: (msg: string) => boolean;
     /** Can this test backtrack at all? Only regex rules can; a substring
@@ -205,9 +241,10 @@ export function compileRule(rule: EventRule): { ok: true; compiled: CompiledRule
     if (rule.pattern.length > MAX_PATTERN_LENGTH) {
         return { ok: false, detail: `pattern longer than ${MAX_PATTERN_LENGTH} characters` };
     }
+    const scope = rule.scopeDevices == null ? null : new Set(rule.scopeDevices.map((n) => n.toLowerCase()));
     if (!rule.isRegex) {
         const needle = rule.pattern;
-        return { ok: true, compiled: { rule, risky: false, test: (msg) => msg.includes(needle) } };
+        return { ok: true, compiled: { rule, scope, risky: false, test: (msg) => msg.includes(needle) } };
     }
     const nested = nestedQuantifier(rule.pattern);
     if (nested !== null) {
@@ -247,7 +284,7 @@ export function compileRule(rule: EventRule): { ok: true; compiled: CompiledRule
     return {
         ok: true,
         compiled: {
-            rule, risky: true,
+            rule, scope, risky: true,
             test: (msg) => re.test(msg.length > MATCH_TEXT_MAX ? msg.slice(0, MATCH_TEXT_MAX) : msg),
         },
     };
@@ -276,6 +313,22 @@ export interface MessageForMatch {
     proto: string;
     app: string | null;
     ts: Date;
+    /** The devices at the sender's address (the ingest worker's address
+     *  map), for scoped rules; the message's host counts too. */
+    devices?: readonly string[];
+}
+
+/**
+ * IS THIS SENDER IN A RULE'S SCOPE (slice 70)? A device at the source address,
+ * or a device the message's host names - so a line relayed through a syslog
+ * collector still finds its device by name. Case-insensitive, as hostnames
+ * are. A host field is the sender's claim, but a claim can only narrow a
+ * scoped rule to what an unscoped one already heard from everyone.
+ */
+export function inScope(scope: Set<string>, m: MessageForMatch): boolean {
+    if (m.host !== null && scope.has(m.host.toLowerCase())) return true;
+    for (const d of m.devices ?? []) if (scope.has(d.toLowerCase())) return true;
+    return false;
 }
 
 /**
@@ -341,6 +394,8 @@ export function matchMessage(
     let matched = 0;
     for (const c of compiled) {
         if (c.rule.source !== 'any' && c.rule.source !== m.proto) continue;
+        // The scope first: a set lookup is cheaper than the pattern.
+        if (c.scope !== null && !inScope(c.scope, m)) continue;
         // THE BACKSTOP, and it can only ever report a stall that already
         // happened - JavaScript cannot interrupt a regex. Its value is that
         // the SECOND message does not pay it too: the worker disarms the rule

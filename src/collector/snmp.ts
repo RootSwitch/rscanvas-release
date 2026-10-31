@@ -70,6 +70,17 @@ export interface Session {
      *  authPriv it also fits a wrong priv key, because an agent that cannot
      *  decrypt drops the packet instead of reporting (measured). */
     v3Level: 'noAuthNoPriv' | 'authNoPriv' | 'authPriv' | null;
+    /**
+     * Why this session was ended early, or null (beta list S6): the poll's
+     * or the probe's deadline. Set by abort(); get() and walk() then fail
+     * every request with it - the ones in flight when the socket closes,
+     * and any asked after - so the caller's catch reads the deadline, not
+     * "Socket forcibly closed".
+     */
+    aborted: string | null;
+    /** End the session now: in-flight requests fail at once, later ones never
+     *  reach the wire. Idempotent. */
+    abort: (reason: string) => void;
 }
 
 /**
@@ -132,7 +143,16 @@ export function createSession(t: Target): Session {
         inner,
         lastError: null,
         v3Level: t.version === '3' && t.v3 ? t.v3.level : null,
+        aborted: null,
         close: () => { try { (inner as { close: () => void }).close(); } catch { /* already closed */ } },
+        // Closing the socket is what fails the requests in flight: net-snmp's
+        // close handler answers each pending request with an error
+        // (Session.prototype.onClose -> cancelRequests, net-snmp 3.26.3).
+        abort: (reason: string) => {
+            if (session.aborted !== null) return;
+            session.aborted = reason;
+            session.close();
+        },
     };
     inner.on('error', (err: Error) => {
         session.lastError = err instanceof Error ? err : new Error(String(err));
@@ -218,8 +238,10 @@ type NetSnmpSession = {
  */
 export function get(session: Session, oids: string[]): Promise<Map<string, SnmpValue>> {
     return new Promise((resolve, reject) => {
+        if (session.aborted !== null) { reject(new SnmpError(session.aborted, 'timeout')); return; }
         if (oids.length === 0) { resolve(new Map()); return; }
         (session.inner as NetSnmpSession).get(oids, (err, varbinds) => {
+            if (err && session.aborted !== null) { reject(new SnmpError(session.aborted, 'timeout')); return; }
             if (err) { reject(translate(err, session.v3Level)); return; }
             const out = new Map<string, SnmpValue>();
             for (let i = 0; i < varbinds.length; i++) {
@@ -252,6 +274,7 @@ export function walk(
     deadlineMs = CONFIG.snmpWalkDeadlineMs,
 ): Promise<Map<string, SnmpValue>> {
     return new Promise((resolve, reject) => {
+        if (session.aborted !== null) { reject(new SnmpError(session.aborted, 'timeout')); return; }
         const out = new Map<string, SnmpValue>();
         let overflowed = false;
         let stalled = false;
@@ -335,6 +358,7 @@ export function walk(
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
+                if (err && session.aborted !== null) { reject(new SnmpError(session.aborted, 'timeout')); return; }
                 if (err) { reject(translate(err, session.v3Level)); return; }
                 if (overflowed) {
                     // Loud rather than silent: a truncated walk means entities

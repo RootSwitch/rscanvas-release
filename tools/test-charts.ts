@@ -39,7 +39,7 @@ console.log('\nthe other units, pinned');
 eq('percent gets one decimal', fmtValue(85.7333333, 'pct'), '85.7%');
 eq('temperature gets one decimal', fmtValue(45.85, 'degc'), '45.9 C');
 eq('rpm is whole', fmtValue(1234.6, 'rpm'), '1235 rpm');
-eq('bps scales SI decimal', fmtValue(1_500_000, 'bps'), '1.50 Mbps');
+eq('bps scales SI decimal, written as the Top 10 writes it', fmtValue(1_500_000, 'bps'), '1.50 Mb/s');
 eq('bytes scale SI binary', fmtValue(1536, 'bytes'), '1.50 KiB');
 eq('a day-scale duration reads d+h', fmtValue(90_000, 'dur'), '1d 1h');
 eq('an hour-scale duration reads h+m', fmtValue(5400, 'dur'), '1h 30m');

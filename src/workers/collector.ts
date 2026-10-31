@@ -217,7 +217,7 @@ let takenCodes = new Set<string>();
 // gauge (AUDIT-2026-09-01 finding 1, review easy-win E1): every prior
 // instrument reads healthy while a leaked poll slot holds a device forever
 // - the heartbeat is fine, CPU is flat, inFlight is a number with no age -
-// so the age is published and alarmed on. With the walk deadline in place
+// so the age is published and alarmed on. With the poll's deadline in place
 // this should never exceed deadline-plus-noise, which is exactly what makes
 // it the detector: it fires only when the belt above it has failed.
 const polling = new Map<string, { name: string; since: number }>();
@@ -315,6 +315,16 @@ let skippedNoSlot = 0;
 let lastWriteMs = 0;
 /** Last time each failure kind was logged, so a known-dead fleet stays quiet. */
 const failureLog = new Map<string, number>();
+/** Beta list S6: a per-device note told about hourly - true when it is due
+ *  now, and then false for the next hour. Keyed note:deviceId, so it stays
+ *  as small as the fleet. */
+const hourlyNotes = new Map<string, number>();
+function hourlyFor(key: string): boolean {
+    const now = Date.now();
+    if (now - (hourlyNotes.get(key) ?? 0) < 3600_000) return false;
+    hourlyNotes.set(key, now);
+    return true;
+}
 
 function log(...args: unknown[]): void {
     console.log(new Date().toISOString(), '[collector]', ...safeLogArgs(args));
@@ -569,6 +579,19 @@ async function runPoll(device: {
         // before this existed, and an operator who just installed a card
         // wants to see that the tool followed the names.
         for (const line of res.rekeyed) log(`${device.name} re-enumeration: ${line}`);
+        // WHAT THE POLL'S DEADLINE CUT SHORT, and the interfaces the device's
+        // cap refused (beta list S6): told the first time, then about hourly
+        // per device while it lasts - a slow agent overruns on every poll, and
+        // the point is to notice it, not to transcribe it 120 times an hour.
+        if (res.cutShort.length > 0 && hourlyFor(`cut:${device.id}`)) {
+            log(`${device.name}: the poll ran past its ${CONFIG.pollDeadlineMs / 1000} s deadline `
+                + `and cut short ${res.cutShort.join(', ')} - its interfaces were read; the agent answers `
+                + 'too slowly for what it serves [told about hourly while it lasts]');
+        }
+        if (res.capRefused > 0 && hourlyFor(`cap:${device.id}`)) {
+            log(`${device.name}: ${res.capRefused} new interface(s) not added - the device has `
+                + `${CONFIG.maxInterfacesPerDevice}, its cap (MAX_INTERFACES_PER_DEVICE) [told about hourly while it lasts]`);
+        }
         // A restart (slice 62): a line each, like a re-enumeration - rare,
         // and the moment a chart has a blank poll in it for a reason.
         if (res.restart.kind === 'restarted') {
@@ -1240,11 +1263,13 @@ loadProfiles().catch(onAsyncError);
 setInterval(() => { if (running) loadProfiles().catch(onAsyncError); }, 30_000).unref();
 
 /** The oldest in-flight poll's age, and the alarm on it. Null when idle.
- *  The threshold is derived from the walk deadline rather than written
- *  twice: a poll is walks plus GETs, so several deadlines of age means the
- *  belt failed and a slot is leaking - the condition every other instrument
- *  reads as healthy. Rate-limited to once a minute; the gauge itself stays
- *  live in every stats block. */
+ *  The threshold is derived from the poll's deadline rather than written
+ *  twice (since 2026-10-31; four walk deadlines before the poll had one of
+ *  its own): past the deadline every SNMP request fails at once, so what is
+ *  left is the poll's writes, each under the collector lane's 10 s statement
+ *  timeout - 30 s more means the belt failed and a slot is leaking, the
+ *  condition every other instrument reads as healthy. Rate-limited to once a
+ *  minute; the gauge itself stays live in every stats block. */
 function oldestInFlight(): number | null {
     if (polling.size === 0) return null;
     let oldestMs = 0;
@@ -1254,7 +1279,7 @@ function oldestInFlight(): number | null {
         const age = now - p.since;
         if (age > oldestMs) { oldestMs = age; oldestName = p.name; }
     }
-    if (oldestMs > CONFIG.snmpWalkDeadlineMs * 4 && now - lastStuckAlarmMs > 60_000) {
+    if (oldestMs > CONFIG.pollDeadlineMs + 30_000 && now - lastStuckAlarmMs > 60_000) {
         lastStuckAlarmMs = now;
         log(`ALARM a poll of ${oldestName} has been in flight for ${Math.round(oldestMs / 1000)}s `
             + `- past every deadline that should have ended it. Its slot is unusable until it `
@@ -1402,7 +1427,7 @@ parentPort?.on('message', async (msg: {
             if (!cred.ok) {
                 refused.push({
                     host: t.host, ok: false, sysName: null, sysDescr: null, sysLocation: null,
-                    entities: [], trackedCount: 0, trackedUpCount: 0, error: cred.detail, errorKind: 'auth',
+                    entities: [], trackedCount: 0, trackedUpCount: 0, notes: [], error: cred.detail, errorKind: 'auth',
                 });
                 continue;
             }
@@ -1429,7 +1454,7 @@ parentPort?.on('message', async (msg: {
             const detail = (err as Error).message;
             results = targets.map((t: Target) => ({
                 host: t.host, ok: false, sysName: null, sysDescr: null, sysLocation: null,
-                entities: [], trackedCount: 0, trackedUpCount: 0, error: detail, errorKind: 'other' as const,
+                entities: [], trackedCount: 0, trackedUpCount: 0, notes: [], error: detail, errorKind: 'other' as const,
             }));
         }
         parentPort?.postMessage({ type: 'probe-result', id: msg.id, results });

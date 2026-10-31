@@ -406,26 +406,39 @@ function main(): void {
             return r.ok ? r.req : null;
         };
         eq('hosts are trimmed and blanks dropped',
-            req({ hosts: [' 10.0.0.1 ', '', 'sw-2'] })?.hosts, ['10.0.0.1', 'sw-2']);
-        eq('the default version is 2c', req({ hosts: ['h'] })?.version, '2c');
+            req({ hosts: [' 10.0.0.1 ', '', '10.0.0.2'] })?.hosts, ['10.0.0.1', '10.0.0.2']);
+        eq('the default version is 2c', req({ hosts: ['10.0.0.1'] })?.version, '2c');
         eq('an unknown version falls back rather than being passed through',
-            req({ hosts: ['h'], version: '2' })?.version, '2c');
-        eq('v3 is accepted as a version', req({ hosts: ['h'], version: '3' })?.version, '3');
-        eq('port 0 is not a port', req({ hosts: ['h'], port: 0 })?.port, 161);
+            req({ hosts: ['10.0.0.1'], version: '2' })?.version, '2c');
+        eq('v3 is accepted as a version', req({ hosts: ['10.0.0.1'], version: '3' })?.version, '3');
+        eq('port 0 is not a port', req({ hosts: ['10.0.0.1'], port: 0 })?.port, 161);
         eq('an empty list is refused', normalizeProbeRequest({ hosts: [] }, 500).ok, false);
         eq('and the cap refuses rather than truncating',
             normalizeProbeRequest({ hosts: Array.from({ length: 501 }, () => 'h') }, 500).ok,
             false);
         eq('a credential REFERENCE has a default',
-            req({ hosts: ['h'] })?.credentialRef, 'SNMP_COMMUNITY');
+            req({ hosts: ['10.0.0.1'] })?.credentialRef, 'SNMP_COMMUNITY');
         // SECRETS ARE ENV-ONLY BY STANDING DECISION. There is nowhere in the
         // normalized request to put a passphrase, which is how the model stays
         // impossible to misuse rather than merely discouraged.
         const withSecret = req(
-            { hosts: ['h'], community: 'public', authKey: 'hunter2', privKey: 'hunter2' });
+            { hosts: ['10.0.0.1'], community: 'public', authKey: 'hunter2', privKey: 'hunter2' });
         if (withSecret !== null && !JSON.stringify(withSecret).includes('hunter2')) {
             ok('a pasted passphrase has nowhere to land - it is dropped, not carried');
         } else bad('a secret survived normalization', JSON.stringify(withSecret));
+        // ADDRESSES ONLY (N2, 2026-10-31): a name or a host:port reached the
+        // inet cast in the already-known check and the page said "internal
+        // error". Refused here, saying what to give instead.
+        const why = (hosts: string[]) => { const r = normalizeProbeRequest({ hosts }, 500); return r.ok ? null : r.detail; };
+        eq('an IPv6 address is an address', req({ hosts: ['fe80::1', '2001:db8::5'] })?.hosts, ['fe80::1', '2001:db8::5']);
+        eq('a hostname is refused, by name',
+            why(['10.0.0.1', 'sw-2']), '"sw-2" is not an IP address: a device is added by its address, and names are not looked up');
+        eq('the count of the rest is said',
+            why(['sw-1', 'sw-2', 'sw-3']), '"sw-1" (and 2 more) is not an IP address: a device is added by its address, and names are not looked up');
+        eq('a host:port is told where the port goes',
+            why(['198.18.50.2:16100']), '"198.18.50.2:16100" has a port on it: give the address alone and 16100 in the port box - several agents on one address are probed one port at a time');
+        eq('and so is a bracketed IPv6 one',
+            why(['[2001:db8::5]:1161'])?.startsWith('"[2001:db8::5]:1161" has a port on it'), true);
     }
 
     // --- the paste box --------------------------------------------------------
@@ -441,8 +454,10 @@ function main(): void {
         eq('a CSV header picks the address column, and is not itself a host',
             parseHosts('Name,IP Address,Site\ncore-sw,10.0.0.1,HQ\nedge-sw,10.0.0.2,DR'),
             ['10.0.0.1', '10.0.0.2']);
-        eq('hostname is an address column too',
+        eq('with no address column, a hostname column is read - and the probe says names are not looked up',
             parseHosts('Hostname,Vendor\nsw-1,cisco\nsw-2,mikrotik'), ['sw-1', 'sw-2']);
+        eq('an address column wins over a name column before it',
+            parseHosts('Hostname,IP\nsw-1,10.0.0.1\nsw-2,10.0.0.2'), ['10.0.0.1', '10.0.0.2']);
         eq('with no header, the first field is the host',
             parseHosts('10.0.0.1,cisco\n10.0.0.2,mikrotik'), ['10.0.0.1', '10.0.0.2']);
         eq('tab-delimited, which is what a spreadsheet paste actually is',

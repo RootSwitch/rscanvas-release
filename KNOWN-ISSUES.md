@@ -1,13 +1,22 @@
-# Known issues, as of 0.1.0-alpha.12
+# Known issues, as of 0.1.0-alpha.13
 
 Written 2026-09-15 for the first alpha and revised 2026-09-26, 2026-09-28,
-2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17, 2026-10-21, 2026-10-23 and 2026-10-25 for the second to the twelfth. Everything here is
+2026-09-30, 2026-10-01, 2026-10-03, 2026-10-08, 2026-10-17, 2026-10-21, 2026-10-23, 2026-10-25 and 2026-10-31 for the second to the thirteenth. Everything here is
 known, and apart from the section that records what was fixed and measured,
 unbuilt; nothing here is hidden behind a feature that pretends to work. Grouped by
 how much it would cost someone using the software. `CHANGELOG.md` lists
 what each alpha fixed.
 
+On 2026-10-30 every open item was triaged for the first beta, by the
+operator's ruling: each is either **accepted for beta** - it ships as
+documented here - or **to be fixed for beta**, and the few to be fixed are
+marked where they stand.
+
 ## Rough edges you will meet
+
+All accepted for beta (2026-10-30). The one marked to be fixed then - a
+filesystem replaced at its index - is fixed, and what remains of it is
+below.
 
 - **The installer cannot move the database to another disk.** It says
   where PostgreSQL's data is going and how full that disk is, asks once when
@@ -90,15 +99,25 @@ what each alpha fixed.
   while the card is idle. Any other fan built to stop - a zero-RPM case
   fan, a power supply's - raises a warn until it is excluded on its card,
   and so does a graphics card's fan named otherwise.
+- **A Cisco supply or fan is watched only if it was normal when added**
+  (alpha.13). Cisco reports a state for each, no reading, and an empty
+  supply bay can report itself shut down rather than absent - the Catalyst
+  9300 these were built from does - so a part not normal at add time is
+  listed untracked. A supply already dead when the switch was added is not
+  watched until it is ticked on the device page.
 - **A part swapped for an identical-looking one is not a change**
   (alpha.11). A change is recorded when the agent's own report moves - its
   description or object ID - so that better words in a later release are
   not one. A part swapped for one the agent describes the same way, with
   the same object ID, is stored without a record.
-- **A filesystem replaced by another at its index is not followed**
-  (alpha.11). Filesystems are followed by name when the agent renumbers
-  them; one that is gone, with a different one now mounted at its index,
-  has no name to follow, so its row reads the newcomer under the old name.
+- **A filesystem renamed in place starts a new row** (alpha.13).
+  Filesystems are followed by name when the agent renumbers them, and one
+  with another filesystem now at its index and its own name nowhere is
+  taken as replaced: its row stops reading - untracked, history kept - and
+  Rediscover adds what is there now. A disk relabelled in place (a Windows
+  volume's label is part of its name) looks the same, so its history
+  carries on in a new row from the relabel. Until alpha.13 such a row read
+  the newcomer under the old name.
 - **A board of every group sorts its sections by name** (alpha.11). A
   board made from every location or every application, or divided by the
   axis it is not picked by, has no declared order, so its sections run
@@ -113,6 +132,12 @@ what each alpha fixed.
   leaves degraded when the last minute lost under 5% of its pings - at most
   one of 30 - so a path losing 15% has a lucky minute about twice in a
   quarter of an hour and reads up for a sweep: two timeline rows, no alert.
+- **A pause of about twenty seconds can raise a short device-down**
+  (2026-10-28). A host that stops answering for twenty seconds - a virtual
+  machine paused for a backup snapshot, say - reads down from the first
+  missed check until its next good poll, so a pause that straddles two
+  alert scans raises device-down, cleared a minute later. A maintenance
+  window covers a pause that comes at a known time.
 - **A fast transfer can raise a discards alert while losing very little**
   (alpha.12). The rule counts discards a second, so 300 a second on a
   port carrying 2.5 Gbit/s - about one packet in 700 - is critical at the
@@ -124,6 +149,16 @@ what each alpha fixed.
   Loads are drawn busiest first so a tile keeps to one line, and a
   card's place moves with its load; each card is named on the device
   page.
+- **A device is added by its IP address** (alpha.13; accepted for beta).
+  Names are not looked up, when it is added or afterwards; the add form
+  says so when given one. A device that moves gets its new address from
+  Modify on its page.
+- **Alert channels, and who hears them, are set in the environment file**
+  (alpha.13; accepted for beta). Email, ntfy and syslog forwarding take
+  their settings from `/etc/rscanvas/rscanvas.env`, and one email list and
+  one ntfy topic hear every alert; System, Health shows which channels are
+  set. Choosing who hears which location or application, with the
+  destinations set in the page, is planned for after the first beta.
 - **The growth estimate needs a little history** (alpha.10). A part's rate
   needs one complete UTC day of it, and the hourly history's three days of
   the month (or of the month before), so a new install reads "too early to
@@ -137,13 +172,14 @@ what each alpha fixed.
   50-60 ms to build. A view showing one
   refreshes it every 10 seconds, which the health report shows as pauses of
   40-90 ms on that thread, inside its limits. Other views fetch them once a
-  minute, and a tab in the background not at all.
+  minute, and a tab in the background not at all. Accepted for beta
+  (2026-10-30).
 
 ## Security findings still open
 
 From the 2026-09-30 review. The ones a single packet or request could use
-are fixed (`CHANGELOG.md`, 0.1.0-alpha.5); these remain, and each needs a
-decision or a drill before it is changed.
+are fixed (`CHANGELOG.md`, 0.1.0-alpha.5); these remain, and each was
+decided on 2026-10-30 as marked.
 
 - **Database passwords from earlier installs are in the system's logs.**
   Before 0.1.0-alpha.6 the installer put both database passwords on a command
@@ -154,29 +190,28 @@ decision or a drill before it is changed.
   environment, but the lines already written stay until the logs rotate.
   Changing the two passwords after upgrading turns them into dead text:
   `sudo ./rscanvas-setup.sh --rotate-db-passwords` (INSTALL.md, section 4).
+  Accepted for beta (2026-10-30), as documented: an install from alpha.6
+  on never wrote them, and the remedy for an older one is that one step.
 
 - **The service holds the raw-socket capability**, for `fping`. Under the
   unit's `NoNewPrivileges` a program cannot gain a capability its parent
   lacks, so `fping` started by the service cannot use its own; and fping
   5.1's unprivileged mode (`ping_group_range`) receives no replies, measured
   on Ubuntu 24.04. Raw sockets without link-layer access add little to what
-  the service already does on the network.
+  the service already does on the network. Accepted for beta (2026-10-30).
 - **Anyone can keep an account locked** by failing to sign in as it five
   times a minute, by design (2026-10-01): accounts lock as well as
   addresses, and the remedy for a sustained attempt is outside the
-  application - a firewall rule, or a proxy in front of it.
-- **A viewer can hold the database's interactive lane** with a search whose
-  "did you mean" hint scans every retained partition.
+  application - a firewall rule, or a proxy in front of it. Accepted by the
+  operator 2026-10-01, and for beta 2026-10-30.
 - **The hardened database roles limit SQL misuse, not a compromised
   service.** The retention function now enforces its own floors and the
   audit trail is append-only for the application (2026-10-01), but the
   service holds the maintenance role's password, for trigram index upkeep,
   so code running inside it can change the schema; and the rollup's
   progress marker, which retention trusts before dropping raw data, is
-  writable by the application role.
-- **A hostile device can still cost polling time and memory**: there is no
-  per-device cap on interfaces or sensors and no deadline on one device's
-  poll. (Its values no longer reach the database unbounded.)
+  writable by the application role. Accepted for beta (2026-10-30): it is
+  the design's boundary, not a defect.
 
 ## Fixed and measured since the first alpha
 
@@ -205,8 +240,31 @@ decision or a drill before it is changed.
 - **The slower median poll time** seen on a four-core box after an upgrade
   was attributed on two identical boxes: mostly the test fleet sharing the
   poller's CPU, and the rest the sensors and counters the newer build reads.
+- **A slow or broken device can no longer hold a poll slot for minutes, or
+  grow without end** (fixed for beta, 2026-10-31). One device's poll and
+  one probe end at 60 seconds, and a device may have 2,000 interfaces and
+  500 sensors, the rest refused with a message. Drilled on the lab box with
+  a test agent answering every request after 4 seconds: polls of 92 and
+  124 seconds, each setting off the stuck-poll alarm, became 60 seconds
+  with nothing failed; one serving 2,010 interfaces and 521 sensors, adding
+  20 a minute, stayed at 2,000 and 500.
+- **A DNS outage, drilled** (2026-10-31; owed since the operator's second
+  real outage found database connects starving behind unanswered lookups).
+  DNS blocked for 15 minutes at a test machine's own firewall, with four
+  web checks to public names and one check by address: every lookup sent
+  and never answered (one from the shell waited 40 s), and the application
+  restarted five minutes in, so its database connections opened while
+  lookups hung. The checks read as DNS failures, the ones behind an
+  unanswered lookup "not looked up" rather than queued; the check by
+  address passed throughout; outside services sent one message when it
+  formed and one when it cleared, across the restart, and no check sent its
+  own; the database never waited - no poll unrecorded, no connect timed
+  out, no device down, the health report at 44 ms throughout.
 
 ## Decisions deferred, not built
+
+Accepted for beta as they stand (2026-10-30); an authorization header for
+service checks is a feature for after it.
 
 - **Hardening of interface identity** on agents that report no physical
   address.
@@ -245,13 +303,7 @@ decision or a drill before it is changed.
 
 ## Tests and drills owed
 
-- **The lookup ration and the by-address database connects under a real
-  DNS block**. The operator's second real outage (2026-10-06)
-  confirmed the settling window and the DNS naming - two messages for the
-  whole incident, every name-based check reading as a DNS failure - and
-  found database connects starving behind unanswered lookups (CHANGELOG,
-  Fixed). The fix was measured in a process whose DNS never answers, in a
-  private namespace on the lab box; it has not yet met a real outage.
+None for beta: the last, the DNS block, was paid on 2026-10-31 (above).
 
 ## Ideas, not promises
 

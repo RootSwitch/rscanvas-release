@@ -1,8 +1,8 @@
 # What RSCanvas watches, and what can alert
 
 Everything RSCanvas collects or tests, the values it keeps, the alerts each can
-raise and their shipped defaults, as of 0.1.0-alpha.12 (what alpha.12
-added is marked "alpha.12"). Thresholds are changed
+raise and their shipped defaults, as of 0.1.0-alpha.13 (what alpha.13
+added is marked "alpha.13"). Thresholds are changed
 per sensor, per kind on one device, or per kind everywhere - from a sensor
 card's cog, a port's gear, or the Thresholds list on System - and an override
 always beats the default.
@@ -68,11 +68,12 @@ is suspended rather than computed against a number the agent made up.
 | **Temperature** | LM-SENSORS; Cisco ENVMON; MikroTik board and CPU; FS.COM/Ruijie; APC UPS battery and universal I/O probes; NET-SNMP `extend temp-*` | C | temp | **off** (a shipped override row; remove it for warn 45, crit 55 everywhere) | 2 C under |
 | **Fan** | MikroTik; FS.COM/Ruijie; `extend fan-*` | rpm | fan (too fast); **fan stopped** (alpha.10) | fan: none. Fan stopped: warn, on - a tracked fan reading 0, two scans in a row. A graphics card's fan is left out by name, since it stops while the card is idle | fan: 200 rpm under; fan stopped: when it turns again |
 | **Power** | APC rack PDU; `extend power-*` | W | power | none | - |
-| **Load / utilization** | APC UPS output load; `extend util-*` (GPU utilization) | % | util | warn 70, crit 90 | 5 points under |
+| **Load / utilization** | APC UPS output load; `extend util-*` (GPU utilization) | % | util | warn 70, crit 90. A fan's speed in percent (alpha.13) (`extend util-fan-GPU`: a name with "fan" in it) is not a load and is left out; only its own row opts it in | 5 points under |
 | **Battery** | APC UPS charge; `extend batt-*` | % | battery (low is bad) | warn 50, crit 20 | 5 points over |
 | **Runtime** | APC UPS runtime remaining; `extend runtime-*` | s | runtime (low is bad) | warn 600, crit 300 | - |
 | **Voltage** | APC UPS input and output; rack PDU line | V | meter | none | - |
 | **Power source** | APC UPS output status; UPS-MIB (RFC 1628) for any other UPS | online / on battery | state | crit on battery (or boost, trim, bypass) | when online |
+| **Power supplies and fans** (alpha.13) | Cisco ENVMON supply and fan status (a state each - Cisco serves no fan speed or supply watts) | the switch's own word: normal, warning, critical, shutdown, not present, not functioning | state | crit on anything but normal | when normal |
 
 **Your own numbers**: a NET-SNMP `extend` line whose name starts with `temp-`,
 `fan-`, `power-`, `util-`, `batt-` or `runtime-` becomes a sensor of that kind,
@@ -81,7 +82,8 @@ and power are published from `nvidia-smi`.
 
 Sensors that read implausibly at discovery (a temperature of 0 or 110 C and
 over, a fan at 0 rpm) are listed untracked rather than hidden, one click from
-being watched.
+being watched. So is a Cisco supply or fan that is not normal when the device
+is added: an empty supply bay can report itself shut down, not absent.
 
 ## 4. Change from normal (temperatures)
 
@@ -108,7 +110,7 @@ Each runs on its own interval from RSCanvas and is attached to a device.
 | **Web** (http/https) | answer, status code (expected codes configurable), response time, certificate days left; optionally a keyword present or absent, or one JSON field's value | **down** (no answer, refused, DNS, TLS problems, unexpected status) crit; **content** (answered, assertion failed) crit; **response time** warn 2 s, crit 5 s, on two slow runs in a row; **certificate** warn 14 days, crit 7 | all on |
 | **TCP** | whether a port accepts a connection, and how fast | **down** crit; **response time** warn 2 s, crit 5 s, on two slow runs in a row | all on |
 | **Voice** (to a responder) | loss, jitter each way, MOS | **no answer** warn; **loss** warn 1%, crit 3%; **jitter** warn 30 ms, crit 50 ms; **MOS** warn 3.6, crit 3.1 (low is bad) - on the worse direction | all on |
-| **Throughput** (iperf3, to a responder) | Mbps each way | **no answer** warn; **rate** (low is bad) on the slower direction | rate: none until you set one |
+| **Throughput** (iperf3, to a responder) | Mb/s each way | **no answer** warn; **rate** (low is bad) on the slower direction | rate: none until you set one |
 
 A check whose device is down freezes with it; a check with no recent run, or
 whose prober failed, freezes rather than reading as up.
@@ -129,7 +131,9 @@ Syslog (UDP) and SNMP traps (v1 and v2c; standard traps and IPMI
 Platform Event Traps decoded into words) are kept and searchable. They alert
 only through **rules** you write: a text or regular-expression pattern, from
 syslog, traps or either, at warn or crit, cleared automatically after a set time
-with no new match (at least 60 s; 300 s unless set).
+with no new match (at least 60 s; 300 s unless set). A rule hears every sender
+unless it is limited to one device, location or application (alpha.13): a sender is known
+by the address it sends from, or by the host a relayed line names.
 
 ## 8. What decides whether, and when, an alert reaches you
 
@@ -160,4 +164,9 @@ These are not alerts; they shape them.
   exclude it on its card if it is built to stop.
 - **No default for fan, power, voltage or throughput**: only you know what
   those should read, so they alert once you set a level.
+- **A device too slow for its size has its sensors read a stretch at a
+  time** (alpha.13). One poll ends at 60 seconds, its interfaces read first; a sensor
+  the poll did not reach keeps its last reading until a later poll reads
+  it, every few polls. A device past 2,000 interfaces or 500 sensors has the
+  rest left unwatched, and its add says so.
 - **Temperature thresholds ship off**; change from normal is on in their place.

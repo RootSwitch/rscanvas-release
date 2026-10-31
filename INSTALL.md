@@ -98,7 +98,8 @@ Flags worth knowing:
 | `--yes` | no prompts |
 
 Then open `https://<box>:18080`, sign in as `admin` with the printed
-password, and change it.
+password, and change it. `docs/FIRST-HOUR.md` walks through the first hour
+from there: credentials, devices, alert channels, a wall and backups.
 
 **Retention is on.** Raw per-poll samples are kept 14 days and syslog and
 trap messages 30; the hourly rollup behind the charts, the Dashboard and the
@@ -112,7 +113,7 @@ health page says so once the dry run is keeping data past its date.
 
 ## 3. Add devices
 
-Settings holds credential profiles (v2c communities and v3 users, stored
+System, Credentials holds credential profiles (v2c communities and v3 users, stored
 encrypted under `RSCANVAS_SECRET`). Devices are added by address or by
 probing a CIDR range; a device that does not answer can still be added with
 Force Add and will be polled until it does. Interfaces and sensors are
@@ -155,6 +156,16 @@ are back. Hundreds of devices that are gone for good are worth disabling or
 removing. A ping-only device costs almost nothing when it is down.
 `POLL_CONCURRENCY` and `POLL_DOWN_CONCURRENCY` change the split
 (`src/config.ts` says how).
+
+**A slow device's poll ends at 60 seconds, and a device has a size limit.**
+A device that answers, but slowly for what it serves, is polled
+interfaces first; at 60 seconds (`POLL_DEADLINE_MS`) the rest of the poll -
+identity, inventory, sensor readings - is cut short and the log names what
+was. Its sensors are then read a stretch at a time, all of them every few
+polls. A device may have 2,000 interfaces and 500 sensors
+(`MAX_INTERFACES_PER_DEVICE`, `MAX_SENSORS_PER_DEVICE`): adding one that
+serves more keeps the ones discovery would watch, and the add screen says
+how many it left out. A chassis that really has more can raise them.
 
 **Bursts of syslog and traps wait in memory.** Messages are written to the
 database every 0.3 seconds, and the few hundred in between wait in memory.

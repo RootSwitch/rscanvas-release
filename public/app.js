@@ -818,6 +818,7 @@ async function loadEventRules() {
             cell(rule.name),
             cell(rule.pattern + (rule.is_regex ? '  (regex)' : ''), 'muted'),
             cell(rule.source),
+            ruleScopeCell(rule),
             pill(rule.severity, `sev ${rule.severity}`),
             cell(`${rule.clear_after_s}s`, 'num'),
             enCell,
@@ -826,6 +827,91 @@ async function loadEventRules() {
         tbody.appendChild(tr);
     }
 }
+
+/** A scope in words (slice 70): the server's scopeWords, for the page. */
+function ruleScopeWords(kind, value) {
+    return kind ? `${kind} ${value || ''}`.trim() : 'every sender';
+}
+
+/** The names a scope kind can take, into a datalist: the roster's devices,
+ *  or a location's or application's values, as the maintenance form does. */
+function fillRuleScopeTargets(kind, listId) {
+    if (kind === 'location' || kind === 'application') { fillGroupSuggestions(kind, listId); return; }
+    const dl = $(listId);
+    dl.replaceChildren();
+    if (kind !== 'device') return;
+    for (const d of lastDevices) {
+        const o = document.createElement('option');
+        o.value = d.name;
+        dl.appendChild(o);
+    }
+}
+
+/** A select of scope kinds, as the add row's. */
+function ruleScopeSelect(selected) {
+    const sel = document.createElement('select');
+    for (const [v, t] of [['', 'every sender'], ['device', 'one device'], ['location', 'a location'], ['application', 'an application']]) {
+        const o = document.createElement('option');
+        o.value = v;
+        o.textContent = t;
+        if (v === (selected || '')) o.selected = true;
+        sel.appendChild(o);
+    }
+    return sel;
+}
+
+/** The "hears" cell: the scope in words, and for a writer a change that
+ *  edits it in place (POST /api/alert-rules/scope). */
+function ruleScopeCell(rule) {
+    const td = cell(ruleScopeWords(rule.scope_kind, rule.scope_value), rule.scope_kind ? '' : 'muted');
+    if (!can('alertrule.write')) return td;
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'btn-track';
+    edit.textContent = 'change';
+    edit.addEventListener('click', () => {
+        const kind = ruleScopeSelect(rule.scope_kind);
+        const val = document.createElement('input');
+        val.type = 'text';
+        val.size = 14;
+        val.maxLength = 200;
+        val.autocomplete = 'off';
+        val.placeholder = 'name';
+        val.value = rule.scope_value || '';
+        val.setAttribute('list', 'rule-scope-targets'); // DOM-SINK-OK: a literal datalist id; `list` has no writable property
+        val.setAttribute('aria-label', 'device or group the rule hears');
+        const sync = () => { val.classList.toggle('hidden', kind.value === ''); fillRuleScopeTargets(kind.value, 'rule-scope-targets'); };
+        kind.addEventListener('change', sync);
+        val.addEventListener('focus', () => fillRuleScopeTargets(kind.value, 'rule-scope-targets'));
+        const save = document.createElement('button');
+        save.type = 'button';
+        save.textContent = 'save';
+        save.addEventListener('click', async () => {
+            const res = await api('/api/alert-rules/scope', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ id: rule.id, scopeKind: kind.value || null, scopeValue: val.value }),
+            });
+            $('rules-msg').textContent = res.ok ? res.detail : (res.detail || 'refused');
+            if (res.ok) loadEventRules();
+        });
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.textContent = 'cancel';
+        cancel.addEventListener('click', () => loadEventRules());
+        td.replaceChildren(kind, document.createTextNode(' '), val, document.createTextNode(' '), save, document.createTextNode(' '), cancel);
+        sync();
+    });
+    td.append(' ', edit);
+    return td;
+}
+
+$('rule-scope').addEventListener('change', () => {
+    const kind = $('rule-scope').value;
+    $('rule-scope-value').classList.toggle('hidden', kind === '');
+    fillRuleScopeTargets(kind, 'rule-scope-targets');
+});
+$('rule-scope-value').addEventListener('focus', () => fillRuleScopeTargets($('rule-scope').value, 'rule-scope-targets'));
 
 $('rule-add').addEventListener('click', async () => {
     const r = await api('/api/alert-rules', {
@@ -838,6 +924,8 @@ $('rule-add').addEventListener('click', async () => {
             source: $('rule-source').value,
             severity: $('rule-severity').value,
             clearAfterS: Number($('rule-ttl').value) || 300,
+            scopeKind: $('rule-scope').value || null,
+            scopeValue: $('rule-scope-value').value,
         }),
     });
     // The server's refusal is the message - a broken regex comes back with
@@ -1172,6 +1260,9 @@ async function rediscoverSelected(retrack) {
         if (d.repinned?.length) {
             bits.push(`followed where the agent moved them (history kept): ${d.repinned.slice(0, 8).join(', ')}`);
         }
+        // Past the device's caps, or a sensor discovery the probe's deadline
+        // cut short (beta list S6): each said in full.
+        for (const n of d.notes || []) bits.push(n);
         gate.appendChild(factLine(d.name, bits.join(' - ')));
     }
     for (const m of r.missing || []) gate.appendChild(factLine(m, 'no such device'));
@@ -1323,7 +1414,7 @@ let deviceSort = null;      // null = use the scope selector's ordering
 // and a column that needs a new aggregate is a server slice first
 // (SLICE-ROSTER-COLUMNS-PLAN.md), never a client-side fetch per row.
 const ROSTER_COLS = [
-    { key: 'host', label: 'address', sort: 'host', on: true, cell: (d) => cell(d.host) },
+    { key: 'host', label: 'address', sort: 'host', on: true, cell: (d) => cell(pollAddress(d)) },
     { key: 'status', label: 'status', th: 'mid', sort: 'status', on: true, cell: (d) => {
         // NEVER POLLED IS NOT UP. devices.status defaults to 'up' in the
         // schema, so a device added a second ago claims a state nothing has
@@ -1560,6 +1651,12 @@ function clipCell(text, cls) {
     if (text) c.title = text;
     return c;
 }
+/** A dim cell saying a short thing, the long one on hover. */
+function titledCell(text, title) {
+    const c = cell(text, 'muted');
+    c.title = title;
+    return c;
+}
 
 // The preference: an ORDERED list of every registry key plus the hidden set.
 // Keys the registry no longer has are dropped; keys it gained since the
@@ -1784,8 +1881,12 @@ function renderDevices(data) {
     // disguise.
     const loaded = deviceCapped ? ` - the server sent the first ${all.length} of `
         + `${deviceTotal}, so this list and its filter are incomplete` : '';
+    // The filter's own words, as typed: `q` here was the Logs search box
+    // itself (an element id is a global) from 2026-09-28 until N1 found it.
+    const typed = $('device-filter').value.trim();
     const msg = (rows.length === 0
-        ? (q === '' ? 'no devices match this view' : `nothing matches "${q}"`)
+        ? (all.length === 0 && !deviceCapped ? 'no devices yet - add the first with + Add device, above'
+            : typed === '' ? 'no devices match this view' : `nothing matches "${typed}"`)
         : shown.length < rows.length
             ? `showing ${shown.length} of ${rows.length} - narrow the filter to see the rest`
             : rows.length < all.length ? `${rows.length} of ${all.length} devices` : '') + loaded;
@@ -1795,6 +1896,17 @@ function renderDevices(data) {
 }
 
 // --- the device drill-down ----------------------------------------------------
+
+/**
+ * The address a device is polled and pinged at (2026-10-16): the port only
+ * when SNMP is on and it is not 161 - several agents behind one address are
+ * several devices that differ by port alone. The device list says it the
+ * same way as the device page (2026-10-31, N1: the list showed two devices
+ * at one address as the same address twice).
+ */
+function pollAddress(d) {
+    return d.snmp_enabled !== false && d.snmp_port && d.snmp_port !== 161 ? `${d.host}:${d.snmp_port}` : d.host;
+}
 
 let currentDevice = null;
 let lastEntities = [];
@@ -1984,7 +2096,7 @@ function chartSpec(e) {
         // kept. Latency under load is on its card.
         case 'path-tput': return {
             unit: '',
-            series: [{ label: 'Mbps toward the site', cls: 'a', i: 0 }, { label: 'Mbps from it', cls: 'b', i: 1 }],
+            series: [{ label: 'Mb/s toward the site', cls: 'a', i: 0 }, { label: 'Mb/s from it', cls: 'b', i: 1 }],
         };
         case 'path-voice': return {
             unit: 'pct',
@@ -2277,11 +2389,15 @@ function sensorPresentation(e) {
                 value: none ? '-' : `${fmtRate(v0)}${x.unit ? ` ${x.unit}` : ''}`,
                 pct: !none && x.max ? 100 * v0 / x.max : null,
             };
-        case 'state':
+        case 'state': {
             if (none) return { value: 'unknown', sub: 'no data is not ok and not alarm' };
+            // The agent's own word for the state when the row carries words
+            // (Cisco's supplies and fans: "Shutdown" says more than "Fault").
+            const said = x.texts && e.lv_v1 !== null && e.lv_v1 !== undefined ? x.texts[String(e.lv_v1)] : undefined;
             return v0 === 0
-                ? { value: String(x.okText || 'OK') }
-                : { value: String(x.alarmText || 'ALARM'), alarm: true };
+                ? { value: String(said || x.okText || 'OK') }
+                : { value: String(said || x.alarmText || 'ALARM'), alarm: true };
+        }
         default:
             return { value: none ? '-' : fmtRate(v0) };
     }
@@ -2728,7 +2844,7 @@ function svcTarget(e) {
     const x = e.extra || {};
     if (e.kind === 'path-tput') {
         return `throughput to ${x.host || 'this device'}:${x.port}, ${x.durationS} s each way, `
-            + (x.mode !== 'max' ? `capped at ${x.capMbps} Mbps`
+            + (x.mode !== 'max' ? `capped at ${x.capMbps} Mb/s`
                 : x.windowStart === 0 && x.windowEnd === 24 ? 'uncapped, any hour'
                 : `uncapped, only ${x.windowStart}:00 to ${x.windowEnd}:00`);
     }
@@ -2775,7 +2891,7 @@ function svcLines(e) {
     const x = e.extra || {};
     const ok = e.tracked && e.check?.outcome === 'ok';
     if (e.kind === 'path-tput') {
-        const how = x.mode === 'max' ? `max, ${svcHours(x)}` : `capped ${x.capMbps} Mbps`;
+        const how = x.mode === 'max' ? `max, ${svcHours(x)}` : `capped ${x.capMbps} Mb/s`;
         if (!ok) return [`throughput, ${how}`];
         return [`to / from the site · ${how}`,
             `ms: ${svcNum(e.lv_v4)} idle · ${svcNum(e.lv_v2)} loaded · ${svcNum(e.lv_v3)} EF`];
@@ -2789,7 +2905,7 @@ function svcLines(e) {
     const flags = [];
     if (e.kind === 'svc-http' && e.lv_v2 !== null && e.lv_v2 !== undefined) {
         const d = Number(e.lv_v2);
-        flags.push(d < 0 ? `cert EXPIRED ${Math.round(-d)} d ago` : `cert ${Math.floor(d)} d`);
+        flags.push(d < 0 ? `cert EXPIRED ${Math.round(-d)}d ago` : `cert ${Math.floor(d)}d`);
     }
     if (e.outside === true) flags.push('outside');
     const what = e.kind === 'svc-tcp' ? `tcp ${x.host || 'this device'}:${x.port}`
@@ -2814,7 +2930,7 @@ function svcDetail(e) {
         if (e.lv_v4 !== null && e.lv_v4 !== undefined) lines.push(`MOS ${Number(e.lv_v4).toFixed(2)} (the worse direction)`);
     }
     if (e.kind === 'path-tput' && ok) {
-        lines.push(`${svcNum(e.lv_v0)} Mbps toward the site, ${svcNum(e.lv_v1)} Mbps from it`);
+        lines.push(`${svcNum(e.lv_v0)} Mb/s toward the site, ${svcNum(e.lv_v1)} Mb/s from it`);
         const ms = (v) => (v === null || v === undefined ? '-' : `${svcNum(v)} ms`);
         lines.push(`latency ${ms(e.lv_v4)} idle, ${ms(e.lv_v2)} under load, ${ms(e.lv_v3)} under load marked EF`);
     }
@@ -2838,7 +2954,7 @@ function svcPresentation(e) {
     if (e.kind === 'path-tput') {
         // Both directions in the headline: which way is short is the
         // question a throughput test answers.
-        if (c.outcome === 'ok') return { cls: '', value: `${svcNum(e.lv_v0)} / ${svcNum(e.lv_v1)} Mbps` };
+        if (c.outcome === 'ok') return { cls: '', value: `${svcNum(e.lv_v0)} / ${svcNum(e.lv_v1)} Mb/s` };
         if (c.outcome === 'busy') return { cls: 'svc-stale', value: 'responder busy' };
         return { cls: 'svc-warn', value: c.text || 'no verdict' };
     }
@@ -3626,15 +3742,26 @@ function renderEntities(data) {
         };
         // The name cell carries the rule badge: which alerts are muted on
         // this interface, or that its thresholds differ from the default.
+        // ONE LINE AN INTERFACE (operator, 2026-10-30): the name is cut in
+        // its own span, so a long Windows name ("Microsoft IP-HTTPS Platform
+        // Interface") ends in an ellipsis and the badge after it still shows;
+        // the description is cut the same way. Both whole on hover.
         const nameCell = () => {
-            const c = cell(e.name);
+            const c = document.createElement('td');
+            c.className = 'ifname';
+            const n = document.createElement('span');
+            n.className = 'ifname-text';
+            n.textContent = e.name ?? '';
+            if (e.name) n.title = e.name;
+            c.appendChild(n);
             const b = ifRuleBadge(e);
             if (b) c.append(' ', b);
             return c;
         };
+        const descCell = () => clipCell(e.alias || e.descr, 'muted ifdesc');
         const tr = rowEl(e.tracked ? [
             nameCell(),
-            cell(e.alias || e.descr, 'muted'),
+            descCell(),
             speedCell(e),
             stale ? stalePill()
                 : pill(state, `badge ${state === 'up' ? 'ok' : state === 'down' ? 'fail' : ''}`),
@@ -3647,7 +3774,7 @@ function renderEntities(data) {
                 : cell(fmtAgo(e.lv_ts)),
         ] : [
             nameCell(),
-            cell(e.alias || e.descr, 'muted'),
+            descCell(),
             speedCell(e),
             // An untracked STALE row wears the stale pill too: "untracked"
             // is already the whole row's rendering (dim, no readings, the
@@ -3657,9 +3784,12 @@ function renderEntities(data) {
             // the live untracked rows they hide between.
             stale ? stalePill() : pill('untracked', 'badge'),
             cell('', 'num'), cell('', 'num'), cell('', 'num'), cell('', 'num'),
+            // A short line, the explanation on hover: these sentences were
+            // what stretched an untracked row to two and three lines.
             stale
-                ? cell(`not watched - no reading since ${fmtAgo(e.lv_stale_since)}, cleanup removes it after a week if a live duplicate exists; otherwise remove it`, 'muted')
-                : cell('not watched - no alerts, no new readings', 'muted'),
+                ? titledCell(`not watched - gone ${fmtAgo(e.lv_stale_since)}`,
+                    `not watched, and no reading since ${fmtAgo(e.lv_stale_since)}: cleanup removes it after a week if a live duplicate exists; otherwise remove it`)
+                : titledCell('not watched', 'not watched - no alerts, no new readings'),
         ]);
         tr.appendChild(trackTd);
         if (stale && e.code && can('device.delete')) trackTd.appendChild(removeInterfaceButton(e));
@@ -3933,12 +4063,8 @@ function renderDeviceHeader() {
         m.title = 'alerts muted: down, interfaces and sensors raise nothing on this device - its syslog and trap rules still alert';
         badges.appendChild(m);
     }
-    // The address it is polled and pinged at (2026-10-16): the port only
-    // when SNMP is on and it is not 161 - the lab's mock fleets share one
-    // address and differ by port alone.
     const addr = $('device-address');
-    addr.textContent = !d?.host ? ''
-        : d.snmp_enabled !== false && d.snmp_port && d.snmp_port !== 161 ? `${d.host}:${d.snmp_port}` : d.host;
+    addr.textContent = !d?.host ? '' : pollAddress(d);
     addr.title = d?.snmp_enabled === false ? 'the address RSCanvas pings (SNMP is off for this device)'
         : 'the address RSCanvas polls and pings';
     $('device-logs').classList.toggle('hidden', !d?.host || !can('syslog.read'));
@@ -5116,13 +5242,40 @@ function renderHealth(h) {
     // only witness is a log line per miss. trailing_failures counts failures
     // since the last delivery, so 0 reads as healthy and anything else says
     // exactly how long the silence has been.
+    //
+    // WHO IS TOLD, ALWAYS SAID (2026-10-31, N2). The section appeared only
+    // once a channel had sent something, so a fresh install - where nothing is
+    // set - showed nothing at all, and alerts raised on the page reached no
+    // one with no word of it anywhere but a startup line in the journal. The
+    // channels that are set come from the health report (`notifications`,
+    // read from the environment); the delivery record below them from jobs.
     const nh = $('notify-health');
     nh.replaceChildren();
     const channels = h.jobs?.notifyChannels ?? [];
-    if (channels.length > 0) {
-        const head = document.createElement('h3');
-        head.textContent = 'Notification channels';
-        nh.appendChild(head);
+    const set = h.notifications?.enabled ?? [];
+    const half = Object.entries(h.notifications?.incomplete ?? {});
+    const head = document.createElement('h3');
+    head.textContent = 'Notification channels';
+    nh.appendChild(head);
+    if (set.length === 0 && half.length === 0) {
+        const d = document.createElement('div');
+        d.className = 'cell-warn';
+        d.textContent = 'none set - alerts are raised and shown here, and nobody is told. Email needs ALERT_SMTP_HOST, '
+            + 'ALERT_SMTP_FROM and ALERT_SMTP_TO; ntfy needs ALERT_NTFY_SERVER and ALERT_NTFY_TOPIC; syslog needs '
+            + 'ALERT_SYSLOG_HOST - in /etc/rscanvas/rscanvas.env, then restart the service.';
+        nh.appendChild(d);
+    }
+    for (const [ch, missing] of half) {
+        const d = document.createElement('div');
+        d.className = 'error-text';
+        d.textContent = `${ch}: half set - ${missing.join(' and ')} not set, so it sends nothing`;
+        nh.appendChild(d);
+    }
+    for (const ch of set.filter((x) => !channels.some((c) => c.channel === x))) {
+        const d = document.createElement('div');
+        d.className = 'muted';
+        d.textContent = `${ch}: set - nothing sent yet`;
+        nh.appendChild(d);
     }
     for (const c of channels) {
         const d = document.createElement('div');
@@ -5138,7 +5291,7 @@ function renderHealth(h) {
         }
         nh.appendChild(d);
     }
-    nh.classList.toggle('hidden', channels.length === 0);
+    nh.classList.remove('hidden');
 
     // Slowest agents (easy-win E9), from the roster already fetched - no new
     // endpoint, no new query. snmp_rtt_ms is blanked server-side unless the
@@ -5842,6 +5995,15 @@ function renderProbe(r) {
             why.textContent = d.error;
             oc.appendChild(why);
         }
+        // What the add will leave out (beta list S6): interfaces or sensors
+        // past the device's cap, or sensors the probe ran out of time for -
+        // said before the add, not discovered later as a missing port.
+        for (const n of d.ok ? d.notes || [] : []) {
+            const why = document.createElement('div');
+            why.className = 'muted small';
+            why.textContent = n;
+            oc.appendChild(why);
+        }
         // A TAKEN NAME IS NOT "ALREADY KNOWN": another address, or another
         // port on this one, already uses the name this device reports. The
         // way out is a name of its own, typed here and sent as the add's
@@ -6425,12 +6587,25 @@ async function loadDashBoards() {
         a.rel = 'noopener';
         a.textContent = b.name;
         a.title = 'open its display in a new tab';
-        const what = document.createElement('span');
-        what.className = 'muted small';
-        what.textContent = b.source_axis === null ? ' drawn by hand'
-            : ` ${Array.isArray(b.source_values) ? b.source_values.join(', ') : `every ${b.source_axis}`}`
-                + (b.section_axis ? `, by ${b.section_axis}` : '');
-        li.append(a, what);
+        // What the board holds, in a few words: a long list of groups would
+        // widen the line past the room beside the checks' counts and drop
+        // the whole list below them (2026-10-25, the demo's board of nine
+        // applications), so past three it names two and counts the rest,
+        // the whole list on hover. A board of one group named for it says
+        // nothing more ("HQ HQ").
+        const values = Array.isArray(b.source_values) ? b.source_values : null;
+        const full = b.source_axis === null ? 'drawn by hand'
+            : (values ? values.join(', ') : `every ${b.source_axis}`) + (b.section_axis ? `, by ${b.section_axis}` : '');
+        const short = b.source_axis === null || !values || values.length <= 3 ? full
+            : `${values.slice(0, 2).join(', ')} and ${values.length - 2} more` + (b.section_axis ? `, by ${b.section_axis}` : '');
+        li.append(a);
+        if (full !== b.name) {
+            const what = document.createElement('span');
+            what.className = 'muted small';
+            what.textContent = ` ${short}`;
+            what.title = full;
+            li.append(what);
+        }
         list.appendChild(li);
     }
     $('dash-boards').classList.toggle('hidden', walls.length === 0);
@@ -6527,7 +6702,7 @@ function renderDashServices(checks) {
             : cell(v.low24.toFixed(2), `num ${v.low24 < 3.1 ? 'cell-crit' : v.low24 < 3.6 ? 'cell-warn' : ''}`);
         low.title = 'the lowest MOS in the last 24 hours - amber under 3.6, red under 3.1, the ITU-T G.109 bands';
         const lj = !v || v.loss === null ? cell('', 'num muted')
-            : cell(`${svcNum(v.loss)} % / ${svcNum(v.jitter)} ms`,
+            : cell(`${svcNum(v.loss)}% / ${svcNum(v.jitter)} ms`,
                 `num ${v.alertKinds.has('path-loss') || v.alertKinds.has('path-jitter') ? SVC_CELL[v.state] : ''}`);
         if (v && v.loss !== null) lj.title = `loss worse ${v.lossDir === 'from' ? 'from' : 'toward'} the site, jitter worse ${v.jitterDir === 'from' ? 'from' : 'toward'} it`;
         const mbps = !t ? cell('-', 'num muted')
@@ -6568,7 +6743,7 @@ function renderDashServices(checks) {
             : cell(r.availability >= 99.95 ? '100%' : `${r.availability.toFixed(1)}%`, 'num');
         if (r.availability !== null) avail.title = `${r.runs} runs in the last 24 hours`;
         const cert = r.certDays === null ? cell('', 'num muted')
-            : cell(r.certDays < 0 ? 'EXPIRED' : `${Math.floor(r.certDays)} d`, `num ${r.certDays < 0 ? 'cell-crit' : ''}`);
+            : cell(r.certDays < 0 ? 'EXPIRED' : `${Math.floor(r.certDays)}d`, `num ${r.certDays < 0 ? 'cell-crit' : ''}`);
         const tr = rowEl([
             dotCell(r.name, SVC_DOT[r.state]), cell(r.device), cell(result, SVC_CELL[r.state]), avail, cert,
             cell(r.lastTs ? fmtAgo(r.lastTs) : '-', 'num muted small'),
@@ -7190,8 +7365,12 @@ function renderRetention(d) {
         tbody.appendChild(rowEl([
             cell(x.partition_name),
             cell(x.parent, 'muted'),
-            cell(Number(x.est_rows).toLocaleString(), 'num'),
-            cell(x.pretty, 'num'),
+            // -1 is PostgreSQL's "never counted" (a partition not yet
+            // analysed), and the size reads as the growth lines above do -
+            // pg_size_pretty mixed "7208 kB", "11 MB" and "8192 bytes"
+            // (2026-10-31, N1).
+            cell(Number(x.est_rows) < 0 ? '-' : Number(x.est_rows).toLocaleString(), 'num'),
+            cell(fmtBytes(x.bytes), 'num'),
             idx,
         ]));
     }
@@ -7411,8 +7590,12 @@ function renderAudit(rows) {
     const tbody = $('audit').querySelector('tbody');
     tbody.replaceChildren();
     for (const a of rows) {
+        // One line, the exact time on hover, as the other lists' times are
+        // (2026-10-31, N1: "13m ago" wrapped to two lines beside the detail).
+        const when = cell(fmtAgo(a.ts), 'ts');
+        when.title = new Date(a.ts).toLocaleString();
         tbody.appendChild(rowEl([
-            cell(fmtAgo(a.ts)),
+            when,
             cell(a.actor),
             cell(a.action),
             cell(a.target || '', 'muted'),
@@ -8150,9 +8333,26 @@ function renderThresholds(data) {
     d.replaceChildren();
     for (const [kind, lv] of Object.entries(data.defaults || {})) {
         if (!lv || (lv.warn == null && lv.crit == null)) continue;
-        d.appendChild(factLine(kind, `warn ${lv.warn ?? '-'} / crit ${lv.crit ?? '-'}`));
+        const [word, unit] = DEFAULT_WORDS[kind] ?? [kind, ''];
+        const level = (v) => (v == null ? '-' : `${v}${unit}`);
+        // A state's level is a code, not a reading: say what it means.
+        d.appendChild(factLine(word, kind === 'state' ? 'crit on anything but normal (a UPS on battery, a failed supply or fan)'
+            : `warn ${level(lv.warn)} / crit ${level(lv.crit)}`));
     }
 }
+
+/**
+ * The defaults list in words and units (2026-10-31, N1): it read
+ * "svc-ms: warn 2000 / crit 5000" and "state: warn - / crit 1" - the rule
+ * codes, with nothing to say 2000 of what. WHAT-IT-WATCHES says the same
+ * levels this way.
+ */
+const DEFAULT_WORDS = {
+    cpu: ['cpu', '%'], mem: ['memory', '%'], disk: ['filesystem', '%'], temp: ['temperature', ' C'],
+    util: ['load / utilization', '%'], battery: ['battery (low is bad)', '%'], runtime: ['runtime (low is bad)', ' s'],
+    state: ['power and supply states', ''], 'svc-ms': ['response time', ' ms'], 'svc-cert': ['certificate (days left)', 'd'],
+    'path-loss': ['voice loss', '%'], 'path-jitter': ['voice jitter', ' ms'], 'path-mos': ['MOS (low is bad)', ''],
+};
 
 async function saveThreshold(body) {
     const r = await api('/api/thresholds', {

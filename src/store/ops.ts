@@ -247,7 +247,7 @@ export async function exportProbe(
         try {
             await client.query(
                 `DECLARE export_probe NO SCROLL CURSOR FOR
-                 SELECT id, ts, msg_ts, source_ip, facility, severity, host, app, proto, msg
+                 SELECT id, ts, msg_ts, host(source_ip) AS source_ip, facility, severity, host, app, proto, msg
                    FROM messages
                   WHERE ${built.conditions.join('\n                    AND ')}
                   ORDER BY ts DESC`,
@@ -355,7 +355,7 @@ export async function streamExportCsv(
         try {
             await client.query(
                 `DECLARE export_cursor NO SCROLL CURSOR FOR
-                 SELECT id, ts, msg_ts, source_ip, proto, facility, severity, host, app, procid, msg, raw
+                 SELECT id, ts, msg_ts, host(source_ip) AS source_ip, proto, facility, severity, host, app, procid, msg, raw
                    FROM messages
                   WHERE ${built.conditions.join('\n                    AND ')}
                   ORDER BY ts DESC`,
@@ -488,6 +488,76 @@ const trgmCoverage = async (
     }
     return r.rows;
 };
+
+/**
+ * THE NEAR-MISS HINT'S REACH (2026-10-30, the beta list's S4). The hint
+ * (uiNearMisses) used to run over the whole window searched, which for a
+ * month-wide search meant `host ILIKE` and `app ILIKE` across every retained
+ * partition - seq scans past the trigram window, app's on every day since
+ * app has no index at all - so a viewer could hold an interactive connection
+ * for its whole statement timeout per search, as often as they searched
+ * (the 2026-09-30 review). It now looks only as far back as the search index
+ * reaches: the newest unbroken run of covered days ending today (UTC), read
+ * from the same catalog fact search admission uses, never from
+ * TRGM_RECENT_DAYS arithmetic. Null - no hint - when today is not covered or
+ * the window ends before the run begins.
+ */
+export function nearMissFrom(coverage: TrgmCoverageDay[], from: Date, to: Date, now: Date): Date | null {
+    const covered = new Set(coverage.filter((c) => c.covered).map((c) => c.day));
+    const key = (d: Date): string => d.toISOString().slice(0, 10).replace(/-/g, '');
+    const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    if (!covered.has(key(day))) return null;
+    for (;;) {
+        const prev = new Date(day.getTime() - 86_400_000);
+        if (!covered.has(key(prev))) break;
+        day.setTime(prev.getTime());
+    }
+    const start = new Date(Math.max(from.getTime(), day.getTime()));
+    return start.getTime() < to.getTime() ? start : null;
+}
+
+/** The hint's own statement timeout: it is garnish on a zero-result page,
+ *  and app's substring has no index even inside the trigram window. */
+export const NEAR_MISS_MS = 500;
+
+export type NearMissRow = { kind: string; value: string; since: Date };
+
+/**
+ * The hint's database work, on one client of the interactive lane: coverage,
+ * then the two substring probes from nearMissFrom's start under
+ * NEAR_MISS_MS. A probe that times out is NO HINT, not a failure - it must
+ * not read as the lane failing - so 57014 rolls back and answers empty.
+ * Takes the client so the timeout path is testable without a database.
+ */
+export async function nearMissWork(
+    client: { query: (text: string, values?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number | null }> },
+    from: Date, to: Date, host: string | null, app: string | null, now: Date,
+): Promise<{ rows: NearMissRow[]; rowCount: number }> {
+    const cov = await client.query(TRGM_COVERAGE_SQL);
+    const since = nearMissFrom(cov.rows as TrgmCoverageDay[], from, to, now);
+    if (since === null) return { rows: [], rowCount: 0 };
+    await client.query('BEGIN');
+    try {
+        await client.query(`SET LOCAL statement_timeout = ${NEAR_MISS_MS}`);
+        const r = await client.query(`
+        (SELECT 'host' AS kind, host AS value FROM messages
+          WHERE ts >= $1 AND ts < $2 AND $3::text IS NOT NULL
+            AND host ILIKE '%' || $3 || '%' AND host <> $3
+          GROUP BY host LIMIT 5)
+        UNION ALL
+        (SELECT 'app' AS kind, app AS value FROM messages
+          WHERE ts >= $1 AND ts < $2 AND $4::text IS NOT NULL
+            AND app ILIKE '%' || $4 || '%' AND app <> $4
+          GROUP BY app LIMIT 5)`, [since, to, host, app]);
+        await client.query('COMMIT');
+        const rows = (r.rows as Array<{ kind: string; value: string }>).map((x) => ({ ...x, since }));
+        return { rows, rowCount: rows.length };
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        if ((err as { code?: string }).code === '57014') return { rows: [], rowCount: 0 };
+        throw err;
+    }
+}
 
 export interface MessageHit {
     id: string;
@@ -1063,7 +1133,9 @@ export const OPS = {
         );
         const values = [...built.values, limit];
         return laneQuery<MessageHit>('heavy', `
-            SELECT id::text AS id, ts, msg_ts, source_ip::text AS source_ip,
+            -- host(), not ::text: the stored address carries its /32, and
+            -- the page and the CSV read "198.18.50.2/32" (2026-10-31, N2).
+            SELECT id::text AS id, ts, msg_ts, host(source_ip) AS source_ip,
                    facility, severity, host, app, procid, proto, msg
               FROM messages
              WHERE ${built.conditions.join('\n               AND ')}
@@ -2116,23 +2188,29 @@ export const OPS = {
      * `name` is set only where the planner renames (the counted CPU row,
      * 2026-10-25); absent or null keeps the row's own.
      */
-    repinSensors: (deviceId: string, moves: Array<{ id: string; snmpIndex: string; extra: string; name?: string | null }>) =>
+    repinSensors: (deviceId: string, moves: Array<{ id: string; snmpIndex: string; extra: string; name?: string | null; park?: boolean }>) =>
         onLane<{ id: string }>('collector', async (client) => {
             const ids = moves.map((m) => m.id);
             await client.query('BEGIN');
             try {
                 await client.query(`UPDATE entities SET snmp_index = NULL
                                      WHERE device_id = $1::bigint AND id = ANY($2::bigint[])`, [deviceId, ids]);
+                // A PARKED row (sensors.ts rule 3, a filesystem replaced at
+                // its index) is untracked in the same write, and its last
+                // reading - the newcomer's, under the old name - cleared.
                 const pinned = await client.query<{ id: string }>(`
-                    UPDATE entities e SET snmp_index = u.idx, extra = u.extra::jsonb, name = coalesce(u.nm, e.name)
-                      FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[]) AS u(id, idx, extra, nm)
+                    UPDATE entities e SET snmp_index = u.idx, extra = u.extra::jsonb, name = coalesce(u.nm, e.name),
+                           tracked = CASE WHEN u.park THEN false ELSE e.tracked END,
+                           lv_v0 = CASE WHEN u.park THEN NULL ELSE e.lv_v0 END,
+                           lv_v1 = CASE WHEN u.park THEN NULL ELSE e.lv_v1 END
+                      FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::boolean[]) AS u(id, idx, extra, nm, park)
                      WHERE e.id = u.id AND e.device_id = $1::bigint
                        AND NOT EXISTS (SELECT 1 FROM entities o
                                         WHERE o.device_id = e.device_id AND o.kind = e.kind
                                           AND o.snmp_index = u.idx AND o.id <> e.id)
                  RETURNING e.id::text AS id`,
                 [deviceId, ids, moves.map((m) => m.snmpIndex), moves.map((m) => m.extra),
-                    moves.map((m) => m.name ?? null)]);
+                    moves.map((m) => m.name ?? null), moves.map((m) => m.park === true)]);
                 if (pinned.rows.length !== moves.length) {
                     await client.query('ROLLBACK');
                     return { rows: [], rowCount: 0 };
@@ -2600,8 +2678,10 @@ export const OPS = {
         id: string; ts: Date; actor_username: string; action: string;
         target: string | null; detail: unknown; source_ip: string | null;
     }>('interactive',
+        // host(), not ::text: an inet cast to text keeps its netmask, and the
+        // audit list read "10.50.200.200/32" (2026-10-31, N1).
         `SELECT id::text AS id, ts, actor_username, action, target, detail,
-                source_ip::text AS source_ip
+                host(source_ip) AS source_ip
            FROM audit ORDER BY ts DESC, id DESC LIMIT $1`, [limit]),
 
     // --- maintenance and health ---------------------------------------------
@@ -3037,6 +3117,13 @@ export const OPS = {
      *  (onboard.ts goneSensors): identity, tracked, and whether the poll
      *  has a reading now. SNMP sensors only: the agent's walk is the only
      *  witness Rediscover has, and it can say nothing about a probe. */
+    /** Beta list S6: every row a device has, by kind and index, so Rediscover
+     *  can tell a new entity from one its insert would skip and keep the
+     *  device inside its caps (src/collector/caps.ts). */
+    entityKeysForDevice: (deviceId: string) => laneQuery<{ kind: string; snmp_index: string | null }>('collector', `
+        SELECT kind, snmp_index FROM entities
+         WHERE device_id = $1::bigint AND source = 'snmp'`, [deviceId]),
+
     deviceSensorsForRediscover: (deviceId: string) => laneQuery<{
         code: string; name: string; kind: string; snmp_index: string | null;
         tracked: boolean; lv_v0: number | null;
@@ -4765,12 +4852,24 @@ export const OPS = {
         SELECT host(host) AS address, array_agg(name ORDER BY name) AS names
           FROM devices GROUP BY 1`),
 
+    /**
+     * The armed rules, each scoped one (slice 70) with its scope resolved to
+     * device names here - so a device joining a location re-arms the rules
+     * scoped to it on the next 30 s reload, the row signature having changed.
+     */
     eventRules: () => laneQuery<{
         id: string; name: string; pattern: string; is_regex: boolean;
-        source: string; severity: string;
+        source: string; severity: string; scope_devices: string[] | null;
     }>('ingest', `
-        SELECT id::text AS id, name, pattern, is_regex, source, severity
-          FROM event_rules WHERE enabled = true ORDER BY id`),
+        SELECT r.id::text AS id, r.name, r.pattern, r.is_regex, r.source, r.severity,
+               CASE WHEN r.scope_kind IS NULL THEN NULL ELSE
+                   (SELECT coalesce(array_agg(d.name ORDER BY d.name), '{}')
+                      FROM devices d
+                     WHERE (r.scope_kind = 'device' AND d.name = r.scope_value)
+                        OR (r.scope_kind = 'location' AND d.location = r.scope_value)
+                        OR (r.scope_kind = 'application' AND d.application = r.scope_value))
+               END AS scope_devices
+          FROM event_rules r WHERE r.enabled = true ORDER BY r.id`),
 
     /**
      * One flush's accumulated matches, one statement. The upsert IS the rate
@@ -4902,20 +5001,36 @@ export const OPS = {
         id: string; name: string; pattern: string; is_regex: boolean;
         source: string; severity: string; clear_after_s: number;
         enabled: boolean; created_ts: Date; created_by: string | null;
+        scope_kind: string | null; scope_value: string | null;
     }>('interactive', `
         SELECT id::text AS id, name, pattern, is_regex, source, severity,
-               clear_after_s, enabled, created_ts, created_by
+               clear_after_s, enabled, created_ts, created_by, scope_kind, scope_value
           FROM event_rules ORDER BY name`),
 
     createEventRule: (
         name: string, pattern: string, isRegex: boolean, source: string,
         severity: string, clearAfterS: number, createdBy: string,
+        scopeKind: string | null = null, scopeValue: string | null = null,
     ) => laneQuery<{ id: string }>('interactive', `
         INSERT INTO event_rules (name, pattern, is_regex, source, severity,
-                                 clear_after_s, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                 clear_after_s, created_by, scope_kind, scope_value)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id::text AS id`,
-        [name, pattern, isRegex, source, severity, clearAfterS, createdBy]),
+        [name, pattern, isRegex, source, severity, clearAfterS, createdBy, scopeKind, scopeValue]),
+
+    /** A rule's scope (slice 70): NULL kind and value hear every sender. */
+    setEventRuleScope: (id: string, scopeKind: string | null, scopeValue: string | null) =>
+        laneQuery<{ name: string }>('interactive', `
+        UPDATE event_rules SET scope_kind = $2, scope_value = $3
+         WHERE id = $1::bigint RETURNING name`, [id, scopeKind, scopeValue]),
+
+    /** How many devices a scope names now - a scope naming none is a typo
+     *  to refuse, not a rule to arm deaf. */
+    eventScopeMembers: (scopeKind: string, scopeValue: string) => laneQuery<{ n: number }>('interactive', `
+        SELECT count(*)::int AS n FROM devices
+         WHERE ($1 = 'device' AND name = $2)
+            OR ($1 = 'location' AND location = $2)
+            OR ($1 = 'application' AND application = $2)`, [scopeKind, scopeValue]),
 
     deleteEventRule: (id: string) => laneQuery<{ name: string }>('interactive', `
         DELETE FROM event_rules WHERE id = $1::bigint RETURNING name`, [id]),
@@ -5438,20 +5553,16 @@ export const OPS = {
      * is a substring of a host or app that DOES exist in the window, say so and
      * name the operator that would have found it.
      *
-     * Bounded three ways: the window, a LIKE on an indexed column, and LIMIT 5.
-     * It runs at most once per zero-result search, on the interactive lane.
+     * Bounded by reach and by time (2026-10-30): only the days the search
+     * index covers (nearMissFrom), and NEAR_MISS_MS of statement time, past
+     * which there is simply no hint. It used to say "bounded three ways: the
+     * window, a LIKE on an indexed column, and LIMIT 5" - none of which held:
+     * the window was the whole search, app has no index, and LIMIT comes
+     * after GROUP BY has read every row. It runs at most once per zero-result
+     * search, on the interactive lane.
      */
     uiNearMisses: (from: Date, to: Date, host: string | null, app: string | null) =>
-        laneQuery<{ kind: string; value: string }>('interactive', `
-        (SELECT 'host' AS kind, host AS value FROM messages
-          WHERE ts >= $1 AND ts < $2 AND $3::text IS NOT NULL
-            AND host ILIKE '%' || $3 || '%' AND host <> $3
-          GROUP BY host LIMIT 5)
-        UNION ALL
-        (SELECT 'app' AS kind, app AS value FROM messages
-          WHERE ts >= $1 AND ts < $2 AND $4::text IS NOT NULL
-            AND app ILIKE '%' || $4 || '%' AND app <> $4
-          GROUP BY app LIMIT 5)`, [from, to, host, app]),
+        onLane<NearMissRow>('interactive', (client) => nearMissWork(client, from, to, host, app, new Date())),
 
     // --- the UI's reads, on the INTERACTIVE lane ---------------------------------
     //
@@ -5508,12 +5619,15 @@ export const OPS = {
      * screen, or the operator's click lands on an error at exactly the
      * moment the thing they were watching resolved.
      */
-    uiAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean; settling: boolean }>('interactive', `
+    uiAlert: (id: string) => laneQuery<AlertRecord & { in_maintenance: boolean; under_policy: boolean; in_group: boolean; settling: boolean; entity_name: string | null }>('interactive', `
         SELECT ${ALERT_COLUMNS},
                ${ALERT_IN_MAINTENANCE} AS in_maintenance,
                ${ALERT_UNDER_POLICY} AS under_policy,
                ${ALERT_IN_GROUP_OUTAGE} AS in_group,
-               ${ALERT_OUTSIDE_SETTLING} AS settling
+               ${ALERT_OUTSIDE_SETTLING} AS settling,
+               -- The sensor's own name, for the provenance line: a fan gauge
+               -- is judged by it (rules.ts isFanGauge).
+               (SELECT e.name FROM entities e WHERE e.code = alerts.code) AS entity_name
           FROM alerts WHERE id = $1::bigint`, [id]),
 
     /**

@@ -1,5 +1,195 @@
 # Changelog
 
+## 0.1.0-alpha.13 - 2026-10-31
+
+The release that clears the beta list. Everything the triage of
+2026-10-30 marked to be fixed for the first beta is in it: a deadline on
+one device's poll and caps on what a device may have; the search's "did
+you mean" bounded; a filesystem replaced at its index no longer read under
+the old name; a log rule limited to one device or group; a GPU's fan
+gauge out of the utilization rule; a DNS outage drilled; a walkthrough of
+the first hour; and a pass over every page at a phone's width and the
+normal one. Walking a fresh install found an empty device list quoting the
+wrong box and a hostname answering "internal error"; both are fixed, and a
+new check keeps the first kind out. A Cisco's power supplies and fans are
+watched in its own words. Built from the public tree on a fresh Linux
+clone, and an alpha.12 install upgraded to it in one step.
+
+### Added
+
+- **A syslog or trap rule can be limited to one device or group.** A rule
+  matched its words from any sender, so "uplink-LAG link down" or "ether1
+  link down" meant every switch that logs them. A rule now hears every
+  sender, one device, a location or an application - set when it is added,
+  or changed later from the rule's row. A sender is known by the address it
+  sends from, or by the host a relayed line names; a device that joins a
+  location joins the rules scoped to it within 30 seconds. A scope that
+  names no device is refused, so a typo cannot arm a rule that hears no
+  one. Upgrading adds two columns to the rules (sql/slice70.sql); every
+  existing rule keeps hearing every sender.
+- **A Cisco's power supplies and fans.** Each supply and fan the switch's
+  environment table lists becomes a card in its own words - Normal,
+  Warning, Critical, Shutdown, Not present, Not functioning - and anything
+  but normal raises the state alert, crit. Cisco serves states only, no fan
+  speed or supply watts, so these are cards, not charts of readings. A part
+  is watched only if it read normal when the device was added: the
+  Catalyst 9300 this was built from reports its empty supply bay as shut
+  down, which would otherwise page on the first scan; it is listed, one
+  tick from being watched. A Cisco device added before gets them with
+  Rediscover.
+- **A deadline on one device's poll, and a cap on what a device may have.**
+  Each walk had its own limit and each request its timeout, but nothing
+  bounded their sum: on the lab, an agent that answered every request
+  after 4 seconds, with 238 disks, held its poll slot for 92 seconds every
+  poll and 124 on a restart. And nothing bounded what discovery made of an
+  agent's tables: 5,000 interfaces became 5,000 rows, and an agent that
+  served new ones poll after poll grew without end.
+  - A poll, and a probe, now ends at 60 seconds (`POLL_DEADLINE_MS`). The
+    interfaces are read first, then the optional reads - identity,
+    inventory, the sensor re-pin, the sensor readings - so a deadline
+    there cuts them short and the poll stands; the log names what was cut,
+    about hourly while it lasts. A sensor pass cut short starts at a
+    different place each poll, so every sensor is read every few polls.
+    The same agent now polls in 60 seconds, its interfaces and about 105 of
+    its 238 sensors each time, and every one of them read within five
+    minutes.
+  - A device may have 2,000 interfaces and 500 sensors
+    (`MAX_INTERFACES_PER_DEVICE`, `MAX_SENSORS_PER_DEVICE`). Discovery keeps
+    the ones it would watch first and says what it left out, on the add
+    screen and in Rediscover's report; Rediscover and the poll add nothing
+    past them, and the poll says so about hourly.
+- **The first hour, written down.** `docs/FIRST-HOUR.md` takes a new
+  install from signing in to devices watched, alerts reaching someone, a
+  wall on a screen and a daily backup, step by step, with where each thing
+  is on the page. It was walked on a fresh install, which is where the
+  fixes below marked "found on a fresh install" came from.
+- **System, Health always says who is told.** The notification channels
+  appeared there only once one had sent something, so on a new install,
+  where none is set, alerts were raised on the page and reached nobody
+  with no word of it but a line in the journal at startup. The section now
+  always shows: "none set", with the variables each channel needs; each
+  channel that is set, and "nothing sent yet" until it has; and one with
+  some of its lines missing as half set.
+
+### Changed
+
+- **A fan's speed in percent is not judged as a load.** A GPU's fan comes
+  from `nvidia-smi` as a percentage, so it is published as
+  `extend util-fan-GPU`, and the utilization rule raised alerts whenever the
+  fan spun up under work - doing its job. A utilization gauge whose name
+  says fan now takes no part in the rule; a device-wide or fleet-wide
+  utilization row does not sweep it back in, and only a row of its own on
+  its card opts it in. The sensor card, the alert detail and the scan
+  answer from one rule.
+- **A device's response time is its identification and interface walks.**
+  The identity, inventory and sensor re-pin reads now come after the
+  interfaces rather than before them (the poll's deadline, above), so a
+  restart or the daily inventory no longer shows as a spike in the
+  device's response time.
+- **One line an interface** on a device's page. The interface table let
+  its cells wrap, so rows ran two and three lines tall - every row of the
+  demo's switches and servers at the normal page width, and more on a
+  Windows host, whose interfaces carry names like "Microsoft IP-HTTPS
+  Platform Interface". No cell wraps now: a name is cut past 24
+  characters and a description past 36, each whole on hover, with a
+  name's rule badge kept in view; an untracked row says "not watched",
+  the explanation on hover; the "hide untracked" tick takes two lines in
+  the heading so the rows fit without scrolling sideways.
+- **A consistency pass over every page**, at the normal width and a
+  phone's, on a fresh install and on the demo network:
+  - one unit for a rate, Mb/s and Gb/s - the traffic charts' axis and the
+    service checks said Mbps beside the Top 10's Mb/s; a wall card's rate
+    is a whole number from 10 up, so "13.6 M..." no longer loses its unit
+    to the card's edge;
+  - a device's address in the device list carries its port when it is not
+    161, as its page does - two agents on one address read as one address
+    twice;
+  - a label stays beside its box when a form wraps: on a phone "again" ended
+    one line and its password box began the next, and the same for others;
+  - the threshold defaults on System read in words and units ("response
+    time: warn 2000 ms / crit 5000 ms") rather than rule codes;
+  - smaller things: a sub-heading's counts in plain case, not capitals; "vs
+    before" for every comparison column; a certificate's days as "84d", like
+    every other age; a loss as "0.20%", like every other share; the
+    Services report's periods in the same order as the other reports';
+    partition sizes as the growth lines above them write sizes, and "-"
+    for a partition not yet counted; the audit list's times on one line.
+
+### Fixed
+
+- **An empty device list said `nothing matches "[object HTMLInputElement]"`**
+  (found on a fresh install). The message quoted the filter by a name the
+  code had dropped in a September rewrite, and a browser makes every
+  element with an id a global of that name - so it quoted the Logs tab's
+  search box instead. Every filter that matched nothing said the same. A
+  new install's list now says how to add the first device, and a filter
+  that matches nothing quotes what was typed. A new check in the test suite
+  refuses any name the page's scripts use and never declare.
+- **A hostname, or an address with a port on it, in the add form answered
+  "internal error"** (found on a fresh install). A device is kept by its
+  address and nothing looks names up, but the form asked for "IP or
+  hostname"; the name reached the database as an address and failed there.
+  The probe now refuses it with the reason - "is not an IP address", or for
+  `10.0.0.5:1161` to give the port in the port box - and the form asks for
+  an IP address. A pasted inventory with both a hostname and an address
+  column now reads the address column.
+- **Addresses read as `10.0.0.5/32`** in the audit list, the log search's
+  rows and the log export; they read as plain addresses, as everywhere
+  else.
+- **A filesystem replaced at its index stops reading under the old name.**
+  Filesystems were followed by name when an agent renumbered them, but one
+  gone with another now mounted at its index had no name to follow: its
+  row went on reading the newcomer under the old name, and held the index,
+  so Rediscover could not add the newcomer either. Now, at the daily
+  inventory or a restart, such a row is parked - no longer watched, its
+  history kept, its last reading cleared - and Rediscover adds the
+  filesystem that is there now. A disk renamed in place reads the same
+  way and starts a new row (KNOWN-ISSUES).
+- **A search that finds nothing no longer holds a database connection
+  looking for what you meant.** An exact `host:` or `app:` that matched
+  nothing ran a "did you mean" over the whole window searched - for a month
+  that meant scanning every retained day, and `app` has no index at all -
+  so one viewer could hold an interactive connection for its whole
+  two-second limit, every search (the 2026-09-30 review). The hint now
+  looks only as far back as the search index reaches, under a half-second
+  limit of its own past which there is simply no hint; when that is less
+  than the window, it says from when it looked.
+- **A sensor's alert carries its whole name.** An alert's name was cut at
+  the first space before a digit, dash or dot - a rule ported from a parent
+  whose sensor names had their reading on the end - so numbered sensors on
+  one device alerted under one name: a CRS317's "Fan 1" and "Fan 2" as
+  "Fan", NVMe "Sensor 1" and "Sensor 2" as "Sensor", and a Catalyst's
+  "Switch 1 - Power Supply B" and three fans all as "Switch". None of
+  production's numbered sensors had alerted yet; the Cisco supply and fan
+  drill on the lab box found it.
+- **The Dashboard's boards stay beside the checks' counts.** Each board's
+  line spelled out every group it holds and never wrapped, so a board of
+  many - the demo's of nine applications - widened the list past the room
+  beside the Service health counts, and at the normal page width the whole
+  list dropped below them. A board of more than three groups now names two
+  and counts the rest, the whole list on hover; a line still too long is
+  cut at its edge; and a board of one group named for it no longer says
+  its name twice.
+
+### Upgrading
+
+One schema change, additive and applied by the installer as usual:
+`sql/slice70.sql`, a scope on syslog and trap rules. Every existing rule
+keeps hearing every sender.
+
+Three new settings, whose defaults need no change: `POLL_DEADLINE_MS`
+(60 seconds), `MAX_INTERFACES_PER_DEVICE` (2,000) and
+`MAX_SENSORS_PER_DEVICE` (500). A device already past a cap keeps what
+it has; nothing past it is added.
+
+A GPU fan published in percent (`extend util-fan-*`) is no longer judged
+as a load: a utilization row for its device or for everything no longer
+reaches it, and a row on its own card brings it back. A filesystem
+replaced at its index is set aside at the device's next daily check or
+restart, and Rediscover then adds the one there now. The add form takes
+an IP address, as the database always required; a name is refused with
+the reason rather than an internal error.
+
 ## 0.1.0-alpha.12 - 2026-10-25
 
 A release shaped by using the demo and by the author's own internet line.

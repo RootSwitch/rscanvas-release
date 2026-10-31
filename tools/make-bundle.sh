@@ -52,6 +52,10 @@ PAYLOAD=(
     README.md INSTALL.md TESTING.md KNOWN-ISSUES.md CHANGELOG.md LICENSE NOTICE-ICONS.md
     # CHANGELOG.md since 0.1.0-alpha.2: the README tells a reader it "says what
     # changed", and a bundle that ships the README without it sends them looking.
+    # The two documents INSTALL and the README send a reader to, for the same
+    # reason (2026-10-31): the first hour after the installer, and what is
+    # watched. Not the rest of docs/ - the README's pictures and their source.
+    docs/FIRST-HOUR.md docs/WHAT-IT-WATCHES.md
     # The installer travels WITH the code it installs, because the sequence it
     # encodes is version-specific: the slice list, the build-then-harden order
     # and the role split all belong to this commit. An installer fetched

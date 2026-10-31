@@ -365,18 +365,25 @@ function fmtGpu(v) {
     return `${shown.join(' / ')}%${loads.length > 4 ? ` +${loads.length - 4}` : ''}`;
 }
 
+/** A rate on a card: whole numbers from 10 up, one decimal below - the
+ *  busiest port's "13.6 Mb/s" lost its unit to the card's ellipsis while
+ *  the bandwidth field beside it read "48 Mb/s" (2026-10-31, N1). */
+function cardRate(x, unit) {
+    return `${x >= 10 ? Math.round(x) : x.toFixed(1)} ${unit}`;
+}
+
 function fmtMbps(v) {
     const n = Number(v);
     if (!Number.isFinite(n)) return '';
-    return n >= 1000 ? `${(n / 1000).toFixed(2)} Gb/s` : `${n >= 10 ? Math.round(n) : n.toFixed(1)} Mb/s`;
+    return n >= 1000 ? cardRate(n / 1000, 'Gb/s') : cardRate(n, 'Mb/s');
 }
 
 function fmtBps(v) {
     if (v === null || v === undefined || !Number.isFinite(Number(v))) return '';
     const n = Number(v);
-    if (n >= 1e9) return `${(n / 1e9).toFixed(1)} Gb/s`;
-    if (n >= 1e6) return `${(n / 1e6).toFixed(1)} Mb/s`;
-    if (n >= 1e3) return `${(n / 1e3).toFixed(0)} kb/s`;
+    if (n >= 1e9) return cardRate(n / 1e9, 'Gb/s');
+    if (n >= 1e6) return cardRate(n / 1e6, 'Mb/s');
+    if (n >= 1e3) return `${Math.round(n / 1e3)} kb/s`;
     return `${Math.round(n)} b/s`;
 }
 

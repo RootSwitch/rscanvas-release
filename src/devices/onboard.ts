@@ -12,6 +12,8 @@
 // answer, which is this module's. The token half needs a live server. This
 // half does not, and it is the half that decides.
 
+import { isIP } from 'node:net';
+
 /**
  * The fields onboarding reads off a probe result.
  *
@@ -365,6 +367,25 @@ export function normalizeProbeRequest(
     if (hosts.length === 0) return { ok: false, detail: 'hosts is required' };
     if (hosts.length > cap) {
         return { ok: false, detail: `probe at most ${cap} hosts at a time` };
+    }
+    // ADDRESSES ONLY (2026-10-31, found walking a fresh install for N2). A
+    // device is kept by its address - devices.host is inet - and nothing here
+    // looks a name up, so a hostname went on to the already-known check as an
+    // inet cast and came back "internal error"; the form had invited one. A
+    // pasted host:port did the same. Refused here instead, saying what to
+    // give: the port belongs in the port box, and several agents on one
+    // address are probed one port at a time (INSTALL section 3).
+    const notAddress = hosts.filter((h) => isIP(h) === 0);
+    if (notAddress.length > 0) {
+        const first = notAddress[0];
+        const more = notAddress.length > 1 ? ` (and ${notAddress.length - 1} more)` : '';
+        const port = /^\[?([0-9A-Fa-f:.]+?)\]?:(\d{1,5})$/.exec(first);
+        if (port !== null && isIP(port[1]) !== 0) {
+            return { ok: false, detail: `"${first}"${more} has a port on it: give the address alone and `
+                + `${port[2]} in the port box - several agents on one address are probed one port at a time` };
+        }
+        return { ok: false, detail: `"${first}"${more} is not an IP address: a device is added by its `
+            + `address, and names are not looked up` };
     }
     return {
         ok: true,

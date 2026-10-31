@@ -97,6 +97,9 @@ a:hover { text-decoration: underline; }
 .table-scroll { overflow-x: auto; }
 .panel h2 { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
 .panel h2 .muted { font-weight: normal; font-size: 12px; }
+/* A sub-heading's own counts read as words, as a panel title's do
+   (2026-10-31, N1): "WHAT ANSWERED 1 NEW, 0 ALREADY KNOWN" shouted. */
+.panel h3 .muted { text-transform: none; letter-spacing: normal; font-weight: normal; }
 .panel h3 {
     font-size: 11px;
     font-weight: 600;
@@ -426,6 +429,9 @@ tr.maint-row td { opacity: .82; }
 /* ===== Search ===== */
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1; min-width: 220px; }
+/* A label and its control wrap as one (2026-10-31, N1): on a phone "again"
+   ended one line and its password box began the next. */
+.pair { display: inline-flex; gap: 8px; align-items: center; }
 #search-form { margin-bottom: 4px; }
 
 /* Guidance, not an error: a zero-result search whose value is a substring of
@@ -531,6 +537,19 @@ table.list td.clip { max-width: 190px; overflow: hidden; text-overflow: ellipsis
    and a row too wide for the window scrolls in its frame. */
 #devices td { white-space: nowrap; }
 #devices td.devname { max-width: 32ch; overflow: hidden; text-overflow: ellipsis; }
+/* ONE LINE AN INTERFACE (operator, 2026-10-30): the device page's
+   interface table the same way. A Windows host's names and descriptions
+   ("Local Area Connection* 8-WFP Native MAC Layer LightWeight Filter") made
+   its rows two and three lines tall. The name is cut past 24 characters in
+   its own span, so the rule badge after it stays in view; the description
+   past 36; both whole on hover. */
+#entities td { white-space: nowrap; }
+#entities .ifname-text { display: inline-block; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+#entities td.ifdesc { max-width: 36ch; }
+/* The "hide untracked" tick heads the buttons column and set its width at
+   twice what the buttons need; it may take two lines so the rows fit a
+   normal-width page without scrolling sideways. */
+#entities thead th:last-child { white-space: normal; width: 1%; }
 #cols-list { display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 8px; align-items: center; margin-bottom: 8px; }
 #cols-list button { font-size: 11px; padding: 0 6px; }
 #cols-list .col-off { opacity: 0.55; }
@@ -712,9 +731,15 @@ table.resp-table.clickable { cursor: pointer; }
 /* The Dashboard's boards (2026-10-24), in the space beside the checks'
    counts that was always empty. */
 .dash-svc-top { display: flex; flex-wrap: wrap; gap: 8px 28px; align-items: flex-start; }
+/* The list may shrink into what the row has left, and a line still too
+   long is cut at its edge, whole on hover - rather than the list dropping
+   below the counts it was put beside. */
+.dash-boards { flex: 1 1 240px; min-width: 0; }
 .dash-boards h3 { margin: 0 0 4px; }
-.dash-boards ul { margin: 0; padding-left: 18px; }
-.dash-boards li { margin: 2px 0; white-space: nowrap; }
+.dash-boards ul { margin: 0; padding-left: 4px; }
+/* The bullet inside the line: a line cut at its edge clips everything
+   outside its box, and an outside bullet is. */
+.dash-boards li { margin: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; list-style-position: inside; }
 
 /* A phone's top bar (2026-10-24): the bar's eight controls laid out 621 px
    wide on a 375 px screen and dragged the whole page sideways. Below 640 px

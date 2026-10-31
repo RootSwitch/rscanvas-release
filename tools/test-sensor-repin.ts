@@ -84,13 +84,25 @@ console.log('\nwhat must NOT move:');
     eq('an ambiguous name is refused, not guessed', plan, []);
 }
 {
-    // The target index is still held by another row whose own match failed:
-    // moving there would trip the unique key, so the planner refuses rather
-    // than queueing a write the store must reject every midnight.
+    // The target index is still held by another row whose own match failed
+    // and which is not gone (its name is listed, ambiguously): moving there
+    // would trip the unique key, so the planner refuses rather than queueing
+    // a write the store must reject every midnight.
+    const plan = planSensorRepin(
+        [find('fs', '2', 'C:\\', fsX(2)), find('fs', '4', 'X', fsX(4)), find('fs', '5', 'X', fsX(5))],
+        [row('e1', 'fs', '1', 'C:\\', fsX(1)), row('e2', 'fs', '2', 'X', fsX(2))]);
+    eq('a target index another row still holds is refused', plan, []);
+}
+{
+    // ...but a holder that is GONE (rule 3, 2026-10-30) parks, freeing the
+    // index: before, "old and gone" read C:\'s readings under its own name
+    // and C:\ could not follow its name to index 2.
     const plan = planSensorRepin(
         [find('fs', '2', 'C:\\', fsX(2))],
         [row('e1', 'fs', '1', 'C:\\', fsX(1)), row('e2', 'fs', '2', 'old and gone', fsX(2))]);
-    eq('a target index another row still holds is refused', plan, []);
+    eq('a target index held by a replaced disk is freed: it parks and the renumbered one moves in',
+        plan.map((u) => [u.id, u.snmpIndex, u.park?.by ?? null]),
+        [['e1', '2', null], ['e2', 'gone-e2', 'C:\\']]);
 }
 {
     // Kinds never cross: a mem row cannot claim an fs discovery even with
@@ -133,13 +145,43 @@ console.log('\ndisks that trade indexes (2026-10-22):');
     eq('three rotating: all three move', plan.map((u) => [u.id, u.snmpIndex]).sort(), [['a', '2'], ['b', '3'], ['c', '1']]);
 }
 {
-    // /a wants 2, /b wants 3 - but 3 is held by /gone, whose disk is not
-    // there to follow. /gone stays put, so /b cannot move, so /a cannot.
+    // /a wants 2, /b wants 3 - but 3 is held by /stay, whose name is listed
+    // twice elsewhere (a guess, so it neither moves nor parks). /stay stays
+    // put, so /b cannot move, so /a cannot.
     const plan = planSensorRepin(
-        [find('fs', '2', '/a', fsX(2)), find('fs', '3', '/b', fsX(3))],
-        [row('a', 'fs', '1', '/a', fsX(1)), row('b', 'fs', '2', '/b', fsX(2)), row('gone', 'fs', '3', '/gone', fsX(3))]);
+        [find('fs', '2', '/a', fsX(2)), find('fs', '3', '/b', fsX(3)), find('fs', '4', '/stay', fsX(4)), find('fs', '5', '/stay', fsX(5))],
+        [row('a', 'fs', '1', '/a', fsX(1)), row('b', 'fs', '2', '/b', fsX(2)), row('stay', 'fs', '3', '/stay', fsX(3))]);
     eq('a move blocked by a row staying put blocks the move that needed its index - settled, not half-written',
         plan, []);
+    // The same chain with a holder that is gone: it parks and the chain moves.
+    const gone = planSensorRepin(
+        [find('fs', '2', '/a', fsX(2)), find('fs', '3', '/b', fsX(3))],
+        [row('a', 'fs', '1', '/a', fsX(1)), row('b', 'fs', '2', '/b', fsX(2)), row('gone', 'fs', '3', '/gone', fsX(3))]);
+    eq('...and when the holder is gone it parks and the chain moves',
+        gone.map((u) => [u.id, u.snmpIndex]).sort(), [['a', '2'], ['b', '3'], ['gone', 'gone-gone']]);
+}
+
+console.log('\na filesystem replaced at its index (rule 3, 2026-10-30):');
+{
+    const plan = planSensorRepin(
+        [find('fs', '37', '/', fsX(37)), find('fs', '52', '/mnt/scratch', fsX(52))],
+        [row('root', 'fs', '37', '/', fsX(37)), row('m', 'fs', '52', '/mnt/models', fsX(52))]);
+    eq('another disk at its index, its own name nowhere: parked under its name, index freed, OIDs gone',
+        plan, [{ id: 'm', snmpIndex: 'gone-m', name: '/mnt/models',
+            extra: { style: 'hr-storage', allocUnits: 4096 }, park: { by: '/mnt/scratch', from: '52' } }]);
+    eq('a renumbered disk whose index someone else took follows its name instead',
+        planSensorRepin([find('fs', '52', '/mnt/new', fsX(52)), find('fs', '60', '/mnt/models', fsX(60))],
+            [row('m', 'fs', '52', '/mnt/models', fsX(52))]).map((u) => [u.id, u.snmpIndex, u.park ?? null]),
+        [['m', '60', null]]);
+    eq('a disk gone with NOTHING at its index is not parked - absence is the gone-sensor check\'s, with two witnesses',
+        planSensorRepin([find('fs', '37', '/', fsX(37))],
+            [row('root', 'fs', '37', '/', fsX(37)), row('m', 'fs', '52', '/mnt/models', fsX(52))]), []);
+    eq('a row already parked is left alone',
+        planSensorRepin([find('fs', '52', '/mnt/scratch', fsX(52))],
+            [row('m', 'fs', 'gone-m', '/mnt/models', { style: 'hr-storage', allocUnits: 4096 })]), []);
+    eq('a memory row is never parked (one picked row a device; a new name is not a replacement)',
+        planSensorRepin([find('mem', '6', 'Memory: Physical memory', fsX(6))],
+            [row('mm', 'mem', '6', 'Memory: Swap space', fsX(6))]), []);
 }
 {
     const plan = planSensorRepin(
