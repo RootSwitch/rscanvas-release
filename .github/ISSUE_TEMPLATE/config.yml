@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: The live demo
+    url: https://rootswitch.github.io/rscanvas-demo/
+    about: Two weeks of a small company's network, replayed in your browser - a look before you install.

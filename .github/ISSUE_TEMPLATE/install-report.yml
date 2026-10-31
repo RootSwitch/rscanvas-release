@@ -1,0 +1,59 @@
+name: Install report
+description: You installed RSCanvas - tell us how it went, good or bad.
+title: "Install report: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for trying RSCanvas. Every install so far has been the author's, so what slowed you down is the most useful thing you can send. A few minutes is plenty, and every field is optional.
+
+        **This page is public.** Do not paste SNMP communities, v3 keys, passwords, `RSCANVAS_SECRET`, the contents of `/etc/rscanvas/rscanvas.env`, or addresses and names you would rather keep to yourself - replace them with `x`.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`grep '\"version\"' /opt/rscanvas/package.json`, or the release you downloaded."
+      placeholder: 0.1.0-alpha.13
+  - type: input
+    id: machine
+    attributes:
+      label: The machine
+      description: Distribution and version, virtual or physical, processors and memory.
+      placeholder: Ubuntu 24.04 VM on Proxmox, 4 vCPUs, 4 GB
+  - type: dropdown
+    id: how-far
+    attributes:
+      label: How far did you get?
+      options:
+        - The installer stopped
+        - Installed, but could not sign in or add a device
+        - Devices added and polling
+        - Through the whole first hour (docs/FIRST-HOUR.md)
+        - Running it for a while now
+  - type: textarea
+    id: stuck
+    attributes:
+      label: Where you got stuck or slowed down
+      description: The step, what you expected, and what happened. A screenshot helps.
+  - type: textarea
+    id: confusing
+    attributes:
+      label: Anything that read wrong or was hard to follow
+      description: In INSTALL.md, the first-hour walkthrough, or on the page.
+  - type: textarea
+    id: devices
+    attributes:
+      label: What you pointed it at
+      description: Makes and models are enough.
+      placeholder: MikroTik CRS326, two UniFi access points, a Synology NAS, three Proxmox hosts
+  - type: textarea
+    id: errors
+    attributes:
+      label: Errors
+      description: Lines from the installer or `journalctl -u rscanvas`, if any. Read them for secrets first.
+      render: text
+  - type: textarea
+    id: else
+    attributes:
+      label: Anything else
+      description: What worked, what you missed, whether you would keep it running.

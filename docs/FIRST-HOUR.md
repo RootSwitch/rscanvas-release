@@ -180,3 +180,6 @@ the box to wherever your other secrets live.
 
 That is the hour. KNOWN-ISSUES.md says what is known not to work yet, and
 INSTALL.md section 7 where to look when something is wrong.
+
+If you are not the author, [tell us how the hour went](https://github.com/RootSwitch/rscanvas-release/issues/new?template=install-report.yml) - what
+slowed you down is what this page is for.

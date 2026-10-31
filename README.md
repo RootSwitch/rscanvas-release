@@ -39,6 +39,11 @@ Dashboard, every device and chart, the alerts, logs and reports, and four
 NOC boards all work; nothing is being monitored, and nothing you change is
 saved.
 
+**Installed it?** Every install so far has been the author's, so yours is
+the most useful report there is - where it slowed you down, what read
+wrong, what gear you pointed it at. [Tell us how it went](https://github.com/RootSwitch/rscanvas-release/issues/new?template=install-report.yml): a few
+minutes, and the form says what not to paste.
+
 ## What it looks like
 
 ![The Dashboard: one open alert, a label printer down; every location and application with its devices up and down; then service health, and the three sites' voice and bandwidth side by side](docs/images/dashboard.png)
